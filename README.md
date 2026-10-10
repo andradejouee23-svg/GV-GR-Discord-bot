@@ -35,7 +35,7 @@ To copy IDs in Discord, open **User Settings → Advanced → Developer Mode**. 
 
 Create text channels for staff activity/logs, reports, sessions, events, and announcements. Set channel permission overrides so `@everyone` cannot view the private reports channel and only trusted staff (plus the bot) can view it. Apply the same restriction to any channel where staff logs should remain private. The bot needs to view and send messages in each channel it uses. The staff activity channel is also where `/staff-panel` posts its reusable panel.
 
-After first setup, a configured Owner or Co-Owner can update channels and role groups using `/staffconfig channel` and `/staffconfig role`. These overrides are saved in SQLite. The initial Owner role still needs to be set in `config.js` so someone can run that command.
+After first setup, open `/owner-dashboard` → **Server Settings** to select staff channels, replace Staff/Management/Owner role groups, and set the server timezone (an IANA name such as `America/Chicago`). These changes are saved in SQLite and audited. `/staffconfig channel` and `/staffconfig role` remain available. The initial Owner role still needs to be set in `config.js` so someone can open the panel.
 
 ## 3. Enable Intents and Invite the Bot
 
@@ -80,6 +80,19 @@ npm test
 - Weekly-goal reminders are optional and off by default. Set `WEEKLY_GOAL_REMINDER_ENABLED: true` in `config.js` to enable them. `WEEKLY_GOAL_REMINDER_DAY_UTC` and `WEEKLY_GOAL_REMINDER_HOUR_UTC` control when they run (Sunday at 18:00 UTC by default). Each staff member is reminded at most once per week.
 - The Owner Dashboard has an audited **Enable/Disable Delete Logs** button. Deletion logs contain the message author, channel, and time; message contents and the deleting person's identity are not recorded.
 
+### Events and RP Sessions
+
+- Open `/staff-center` and click **Events** to create an event, review upcoming events, or open Management-only edit, cancel, host, attendance, and history actions.
+- The event form uses date and ordinary time text (for example, `October 6, 2026` and `6:30 PM`), followed by event-type and description forms and Discord channel pickers. Entered times use the Owner-configured server IANA timezone; stored timestamps are UTC, and DST gaps are rejected rather than silently shifted. Ambiguous fall-back times choose the earlier occurrence. Announcements display the event's saved timezone and include a generated type-themed PNG, permanent `GV-EV-####` ID, Going/Can't Go RSVP buttons, and private Event Details.
+- Event reminders are sent near 1 hour and 15 minutes before the start and at the scheduled start. The scheduler checks every minute, allows a short delivery grace period, retries failed delivery safely, and ignores cancelled/completed events.
+- Click **Start RP Session** in `/staff-center` to fill out the session form, choose its type and voice channel, then publish to the configured RP Session channel. If the entered server-local time has passed today, the start is scheduled for the next local day. Staff can join or leave from the public post; the host and Management can use private session controls.
+- **RP Controls** provides host/Management controls. **RP History** shows completed sessions and their host, type, duration, participant count, and permanent `GV-RP-####` ID. Scheduled sessions activate at their time and automatically close at their expected duration; pauses are excluded from active duration.
+- Event and session records, IDs, RSVPs, participants, reminder attempts, and event edit history use the existing `database.sqlite`; migrations add columns/tables without replacing existing records.
+
+### Public Release Status
+
+This workspace is still configured for one server: `SERVER_ID`, the default channels, and initial roles are in `config.js`, and runtime settings are stored in one SQLite database. Do not invite this build to unrelated public servers yet; per-guild data scoping and first-run setup must be implemented and tested before multi-server release. Railway/24-7 deployment, automated backups/restore, tickets, advanced announcement templates, and automoderation are also not included in this milestone.
+
 ## 5. Test the Clock System
 
 1. Confirm that `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `SERVER_ID`, and at least one staff role ID are set.
@@ -110,7 +123,8 @@ npm test
 - `src/commands/definitions.js`: Slash-command definitions registered in your server.
 - `src/commands/clock.js`: Staff panel, clock buttons, status, activity, and leaderboard.
 - `src/commands/staff.js`: Warnings, private notes/history, announcements, and owner configuration.
-- `src/commands/operations.js`: RP sessions and scheduled events.
+- `src/commands/operations.js`: Legacy RP-session and event slash commands.
+- `src/commands/events.js` and `src/services/operations.js`: Staff Center event/session UI, persistent IDs, RSVP/participant tracking, type-themed PNGs, reminder scheduling, lifecycle controls, and history.
 - `src/commands/safety.js`: Player reports and moderation commands.
 - `src/buttons/index.js`: Dispatches panel, session, and report buttons.
 - `src/events/messageDelete.js`: Logs message author, channel, and time when deletion logging is enabled.

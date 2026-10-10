@@ -2,8 +2,13 @@ const { handleClockButton } = require('../commands/clock');
 const { handleSessionJoin } = require('../commands/operations');
 const { updateReport } = require('../commands/safety');
 const { handleDailyReportReminder, handleStaffCenterButton, handleShiftReminder } = require('../commands/staffCenter');
+const { handleOperationButton } = require('../commands/events');
 
 async function handleButton(interaction, ctx) {
+  if (interaction.customId.startsWith('gv:event:') || interaction.customId.startsWith('gv:rp:')) {
+    return handleOperationButton(interaction, ctx);
+  }
+
   if (interaction.customId.startsWith('gv:daily:remind:')) {
     return handleDailyReportReminder(interaction, ctx);
   }

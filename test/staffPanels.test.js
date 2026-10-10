@@ -7,7 +7,12 @@ const config = require('../config');
 const { createDatabase } = require('../src/database');
 const { canRefreshStaffPanel } = require('../src/commands/clock');
 const { isManagement, isOwner, isStaff } = require('../src/commands/staffCenter');
-const { handleManagementButton, handleOwnerButton } = require('../src/commands/staffManagement');
+const {
+  handleManagementButton,
+  handleOwnerButton,
+  handleOwnerSettingsModal,
+  handleOwnerSettingsSelect,
+} = require('../src/commands/staffManagement');
 const { handleButton } = require('../src/buttons');
 const { logMessageDeletion } = require('../src/events/messageDelete');
 const {
@@ -116,6 +121,10 @@ test('Staff Center buttons and report reminder open the expected private flows',
     'gv:center:weekly',
     'gv:center:streak',
     'gv:center:reports:0',
+    'gv:center:events',
+    'gv:center:rp:start',
+    'gv:center:rp:controls',
+    'gv:center:rp:history',
   ]);
   assert.ok(buttonIds.every((customId) => customId.startsWith('gv:center:')));
 
@@ -214,4 +223,62 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
   assert.match(sent[0].embeds[0].data.description, /\*\*User:\*\* <@message-author>/);
   assert.doesNotMatch(JSON.stringify(sent[0]), /message contents are not logged/);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action = 'message_delete_logging_toggle'").get().count, 2);
+});
+
+test('Owner Settings updates channels, role groups, and timezone with audit records; Management is denied', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-owner-settings-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const owner = member('configured-owner', config.OWNER_ROLE_IDS);
+  const managerRole = '1556064708795306157';
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRole]));
+  const manager = member('manager-user', [managerRole]);
+  const guild = { id: 'guild-1', ownerId: 'actual-server-owner' };
+  let lastReply;
+  const interaction = (customId, actingMember, values = []) => ({
+    customId,
+    guild,
+    member: actingMember,
+    user: { id: actingMember.id, username: actingMember.id },
+    values,
+    fields: { getTextInputValue: () => 'America/Chicago' },
+    isStringSelectMenu: () => customId === 'owner:settings:channel' || customId === 'owner:settings:roles',
+    isChannelSelectMenu: () => customId.startsWith('owner:settings:setchannel:'),
+    isRoleSelectMenu: () => customId.startsWith('owner:settings:saveroles:'),
+    update: async (payload) => payload,
+    reply: async (payload) => { lastReply = payload; return payload; },
+  });
+
+  const settingsPanel = await handleOwnerButton(interaction('owner:settings', owner), { db });
+  assert.match(settingsPanel.embeds[0].data.title, /SERVER SETTINGS/);
+  assert.equal(settingsPanel.components.length, 3);
+
+  await handleOwnerSettingsSelect(interaction('owner:settings:channel', manager, ['EVENT_CHANNEL_ID']), { db });
+  assert.match(lastReply.content, /Only the server owner or a configured Owner role/);
+
+  const chooseChannel = await handleOwnerSettingsSelect(interaction('owner:settings:channel', owner, ['EVENT_CHANNEL_ID']), { db });
+  assert.equal(chooseChannel.components[0].components[0].data.custom_id, 'owner:settings:setchannel:EVENT_CHANNEL_ID');
+  const saveChannel = await handleOwnerSettingsSelect(interaction('owner:settings:setchannel:EVENT_CHANNEL_ID', owner, ['423456789012345678']), { db });
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'EVENT_CHANNEL_ID'").get().value), '423456789012345678');
+  assert.match(saveChannel.embeds[0].data.description, /<#423456789012345678>/);
+
+  const chooseRoles = await handleOwnerSettingsSelect(interaction('owner:settings:roles', owner, ['management']), { db });
+  assert.equal(chooseRoles.components[0].components[0].data.custom_id, 'owner:settings:saveroles:management');
+  await handleOwnerSettingsSelect(interaction('owner:settings:saveroles:management', owner, ['523456789012345678']), { db });
+  assert.deepEqual(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'role_management'").get().value), ['523456789012345678']);
+
+  await handleOwnerSettingsModal(interaction('owner:settings:timezone_modal', owner), { db });
+  assert.equal(lastReply.ephemeral, true);
+  assert.match(lastReply.embeds[0].data.description, /America\/Chicago/);
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'TIME_ZONE'").get().value), 'America/Chicago');
+  await handleOwnerSettingsModal({
+    ...interaction('owner:settings:timezone_modal', owner),
+    fields: { getTextInputValue: () => 'Not/A_Real_Zone' },
+  }, { db });
+  assert.match(lastReply.content, /timezone is not valid/i);
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'TIME_ZONE'").get().value), 'America/Chicago');
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action IN ('configuration_change', 'permission_change')").get().count, 3);
 });

@@ -2,6 +2,7 @@ module.exports = {
   BOT_NAME: 'GV GR Staff Bot',
   SERVER_ID: '1551269087492047058',
   DATABASE_PATH: './database.sqlite',
+  TIME_ZONE: 'UTC',
   WEEKLY_GOAL_HOURS: 5,
   STREAK_MIN_SHIFT_MINUTES: 30,
   SHIFT_REMINDER_HOURS: 6,

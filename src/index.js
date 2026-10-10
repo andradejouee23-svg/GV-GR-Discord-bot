@@ -17,6 +17,12 @@ const { handleOperationsCommand, submitSessionModal } = require('./commands/oper
 const { handleSafetyCommand, submitReport } = require('./commands/safety');
 const { handleStaffCommand } = require('./commands/staff');
 const {
+  handleOperationButton,
+  handleOperationModal,
+  handleOperationSelect,
+  processEventTasks,
+} = require('./commands/events');
+const {
   handleStaffCenterCommand,
   handleDailyReportSelect,
   handleDailyReportModal,
@@ -37,6 +43,8 @@ const {
   handleOwnerButton,
   handleOwnerConfirm,
   handleOwnerHistorySelect,
+  handleOwnerSettingsModal,
+  handleOwnerSettingsSelect,
 } = require('./commands/staffManagement');
 const { logMessageDeletion } = require('./events/messageDelete');
 
@@ -55,10 +63,6 @@ function requireSetup() {
 
 if (requireSetup()) {
   const db = createDatabase(config.DATABASE_PATH);
-  const completePastEvents = () => {
-    db.prepare("UPDATE events SET status = 'completed' WHERE status = 'scheduled' AND starts_at <= ?")
-      .run(new Date().toISOString());
-  };
   const runStaffTasks = async () => {
     try {
       await processShiftReminders(client, db);
@@ -69,9 +73,13 @@ if (requireSetup()) {
       console.error('Staff background task failed:', error);
     }
   };
-  completePastEvents();
-  const eventStatusTimer = setInterval(completePastEvents, 60_000);
-  eventStatusTimer.unref();
+  const runEventTasks = async () => {
+    try {
+      await processEventTasks(client, db);
+    } catch (error) {
+      console.error('Event/session background task failed:', error);
+    }
+  };
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -85,13 +93,14 @@ if (requireSetup()) {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   let isClosing = false;
   let staffTaskTimer;
+  let eventTaskTimer;
 
   async function closeBot() {
     if (isClosing) return;
     isClosing = true;
     try {
-      clearInterval(eventStatusTimer);
       if (staffTaskTimer) clearInterval(staffTaskTimer);
+      if (eventTaskTimer) clearInterval(eventTaskTimer);
       client.destroy();
       db.close();
     } catch (error) {
@@ -103,8 +112,11 @@ if (requireSetup()) {
   client.once(Events.ClientReady, async (readyClient) => {
     console.log(`${config.BOT_NAME} connected as ${readyClient.user.tag}.`);
     await runStaffTasks();
+    await runEventTasks();
     staffTaskTimer = setInterval(runStaffTasks, 15 * 60 * 1000);
     staffTaskTimer.unref();
+    eventTaskTimer = setInterval(runEventTasks, 60_000);
+    eventTaskTimer.unref();
     try {
       await rest.put(
         Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, config.SERVER_ID),
@@ -147,7 +159,16 @@ if (requireSetup()) {
           return handleOwnerConfirm(interaction, context);
         }
         if (interaction.customId.startsWith('owner:')) return handleOwnerButton(interaction, context);
+        if (interaction.customId.startsWith('gv:event:') || interaction.customId.startsWith('gv:rp:')) {
+          return handleOperationButton(interaction, context);
+        }
         return handleButton(interaction, context);
+      }
+      if (interaction.isChannelSelectMenu()) {
+        if (interaction.customId.startsWith('owner:settings:')) return handleOwnerSettingsSelect(interaction, context);
+        if (interaction.customId.startsWith('gv:event:channel:') || interaction.customId.startsWith('gv:rp:channel:')) {
+          return handleOperationSelect(interaction, context);
+        }
       }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:daily:rating:')) {
         return handleDailyReportSelect(interaction, context);
@@ -155,14 +176,25 @@ if (requireSetup()) {
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('owner:action:')) {
         return handleOwnerActionSelect(interaction, context);
       }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('owner:settings:')) {
+        return handleOwnerSettingsSelect(interaction, context);
+      }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('mgmt:shift_action:')) {
         return handleManagementShiftActionSelect(interaction, context);
       }
       if (interaction.isUserSelectMenu()) {
+        if (interaction.customId.startsWith('gv:event:host_select:')) return handleOperationSelect(interaction, context);
         if (interaction.customId === 'mgmt:staff_history') return handleManagementSelect(interaction, context);
         if (interaction.customId === 'owner:select_staff') return handleOwnerHistorySelect(interaction, context);
       }
+      if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('owner:settings:')) {
+        return handleOwnerSettingsSelect(interaction, context);
+      }
       if (interaction.isModalSubmit()) {
+        if (interaction.customId === 'owner:settings:timezone_modal') return handleOwnerSettingsModal(interaction, context);
+        if (interaction.customId.startsWith('gv:event:') || interaction.customId.startsWith('gv:rp:create:')) {
+          return handleOperationModal(interaction, context);
+        }
         if (interaction.customId === 'gv:report_submit') return submitReport(interaction, context);
         if (interaction.customId.startsWith('gv:daily:submit:')) return handleDailyReportModal(interaction, context);
         if (interaction.customId.startsWith('gv:session_start:')) return submitSessionModal(interaction, context);

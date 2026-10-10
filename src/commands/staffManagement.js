@@ -3,12 +3,16 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelSelectMenuBuilder,
+  ChannelType,
   ModalBuilder,
+  RoleSelectMenuBuilder,
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
   UserSelectMenuBuilder,
 } = require('discord.js');
+const { DateTime } = require('luxon');
 const config = require('../../config');
 const {
   addStaffNote,
@@ -94,7 +98,69 @@ function ownerComponents(db) {
     new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId('owner:select_staff').setPlaceholder('Select a staff member for owner actions'),
     ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('owner:settings').setLabel('Server Settings').setEmoji('⚙️').setStyle(ButtonStyle.Primary),
+    ),
   ];
+}
+
+const ownerChannelSettings = {
+  STAFF_ACTIVITY_CHANNEL_ID: 'Staff activity and panel',
+  STAFF_ANNOUNCEMENT_CHANNEL_ID: 'Staff announcements',
+  STAFF_LOG_CHANNEL_ID: 'Staff audit/activity logs',
+  REPORT_CHANNEL_ID: 'Private player reports',
+  SESSION_CHANNEL_ID: 'RP session announcements',
+  EVENT_CHANNEL_ID: 'Event announcements',
+};
+
+const ownerRoleGroups = {
+  staff: 'Staff roles',
+  management: 'Management roles',
+  owners: 'Owner roles',
+};
+
+function ownerSettingsEmbed(db) {
+  const channelLines = Object.entries(ownerChannelSettings).map(([key, label]) => {
+    const channelId = getConfigValue(db, key);
+    return `**${label}:** ${/^\d{17,20}$/.test(channelId ?? '') ? `<#${channelId}>` : 'Not configured'}`;
+  });
+  const roleLines = Object.entries(ownerRoleGroups).map(([group, label]) => {
+    const roleIds = getConfigValue(db, `role_${group}`) ?? getConfigValue(db, {
+      staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS',
+    }[group]) ?? [];
+    return `**${label}:** ${roleIds.length ? roleIds.map((roleId) => `<@&${roleId}>`).join(', ') : 'None configured'}`;
+  });
+  const zone = getConfigValue(db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
+  return makeEmbed(config.EMBED_COLORS.management, '⚙️ GV GR SERVER SETTINGS',
+    `**Timezone:** \`${zone}\`\n\n${channelLines.join('\n')}\n\n${roleLines.join('\n')}\n\n**Message deletion logs:** ${getConfigValue(db, 'MESSAGE_DELETE_LOGGING_ENABLED') ? 'Enabled' : 'Disabled'}`)
+    .setFooter({ text: 'Changes are saved to SQLite and audited.' });
+}
+
+function ownerSettingsComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('owner:settings:channel')
+        .setPlaceholder('Choose a channel setting to update')
+        .addOptions(Object.entries(ownerChannelSettings).map(([value, label]) => ({ label, value }))),
+    ),
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('owner:settings:roles')
+        .setPlaceholder('Choose a role group to update')
+        .addOptions(Object.entries(ownerRoleGroups).map(([value, label]) => ({ label, value }))),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('owner:settings:timezone').setLabel('Set Timezone').setEmoji('🕒').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('owner:overview').setLabel('Back to Owner Dashboard').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+function createOwnerTimezoneModal(currentTimezone) {
+  return new ModalBuilder().setCustomId('owner:settings:timezone_modal').setTitle('Set Server Timezone')
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder()
+      .setCustomId('timezone').setLabel('IANA timezone (example: America/Chicago)')
+      .setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true)
+      .setValue(currentTimezone)));
 }
 
 function rosterEmbed(db, owner = false) {
@@ -520,6 +586,109 @@ async function handleOwnerConfirm(interaction, ctx) {
   }
 }
 
+async function handleOwnerSettingsSelect(interaction, ctx) {
+  if (!interaction.customId.startsWith('owner:settings:')) return null;
+  if (!await requireManagerInteraction(interaction, ctx, true)) return;
+
+  const [namespace, section, action, target] = interaction.customId.split(':');
+  if (namespace !== 'owner' || section !== 'settings') return null;
+
+  if (interaction.isStringSelectMenu() && action === 'channel') {
+    const setting = interaction.values[0];
+    if (!Object.hasOwn(ownerChannelSettings, setting)) {
+      return interaction.reply({ content: 'That channel setting is not supported.', ephemeral: true });
+    }
+    return interaction.update({
+      embeds: [makeEmbed(config.EMBED_COLORS.management, `⚙️ ${ownerChannelSettings[setting]}`,
+        `Current channel: ${/^\d{17,20}$/.test(getConfigValue(ctx.db, setting) ?? '') ? `<#${getConfigValue(ctx.db, setting)}>` : 'Not configured'}\nSelect a replacement text channel.`)],
+      components: [
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder()
+          .setCustomId(`owner:settings:setchannel:${setting}`)
+          .setPlaceholder('Select a text channel')
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
+        new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('owner:settings')
+          .setLabel('Back to Server Settings').setStyle(ButtonStyle.Secondary)),
+      ],
+    });
+  }
+
+  if (interaction.isStringSelectMenu() && action === 'roles') {
+    const group = interaction.values[0];
+    if (!Object.hasOwn(ownerRoleGroups, group)) {
+      return interaction.reply({ content: 'That role group is not supported.', ephemeral: true });
+    }
+    const settingKey = `role_${group}`;
+    const fallbackKey = { staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS' }[group];
+    const current = getConfigValue(ctx.db, settingKey) ?? getConfigValue(ctx.db, fallbackKey) ?? [];
+    return interaction.update({
+      embeds: [makeEmbed(config.EMBED_COLORS.management, `⚙️ ${ownerRoleGroups[group]}`,
+        `Current roles: ${current.length ? current.map((roleId) => `<@&${roleId}>`).join(', ') : 'None'}\nSelect all roles that should belong to this group. This replaces the current group.`)],
+      components: [
+        new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder()
+          .setCustomId(`owner:settings:saveroles:${group}`)
+          .setPlaceholder(`Select ${ownerRoleGroups[group].toLowerCase()}`)
+          .setMinValues(0).setMaxValues(25)),
+        new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('owner:settings')
+          .setLabel('Back to Server Settings').setStyle(ButtonStyle.Secondary)),
+      ],
+    });
+  }
+
+  if (interaction.isChannelSelectMenu() && action === 'setchannel') {
+    const setting = target;
+    if (!Object.hasOwn(ownerChannelSettings, setting)) {
+      return interaction.reply({ content: 'That channel setting is not supported.', ephemeral: true });
+    }
+    const channelId = interaction.values[0];
+    const previous = getConfigValue(ctx.db, setting);
+    setConfigValue(ctx.db, setting, channelId);
+    logAudit(ctx.db, {
+      action: 'configuration_change', targetId: interaction.guild.id, actorId: interaction.user.id,
+      reason: `Updated ${ownerChannelSettings[setting]}`, previousValue: previous ?? 'not configured', newValue: channelId,
+      details: { setting },
+    });
+    return interaction.update({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents() });
+  }
+
+  if (interaction.isRoleSelectMenu() && action === 'saveroles') {
+    const group = target;
+    if (!Object.hasOwn(ownerRoleGroups, group)) {
+      return interaction.reply({ content: 'That role group is not supported.', ephemeral: true });
+    }
+    const settingKey = `role_${group}`;
+    const fallbackKey = { staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS' }[group];
+    const previous = getConfigValue(ctx.db, settingKey) ?? getConfigValue(ctx.db, fallbackKey) ?? [];
+    const updated = [...new Set(interaction.values)];
+    setConfigValue(ctx.db, settingKey, updated);
+    logAudit(ctx.db, {
+      action: 'permission_change', targetId: interaction.guild.id, actorId: interaction.user.id,
+      reason: `Updated ${ownerRoleGroups[group]}`, previousValue: previous.join(',') || 'none', newValue: updated.join(',') || 'none',
+      details: { group },
+    });
+    return interaction.update({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents() });
+  }
+
+  return interaction.reply({ content: 'That Owner Settings control is not recognized.', ephemeral: true });
+}
+
+async function handleOwnerSettingsModal(interaction, ctx) {
+  if (interaction.customId !== 'owner:settings:timezone_modal') return null;
+  if (!await requireManagerInteraction(interaction, ctx, true)) return;
+  const timezone = interaction.fields.getTextInputValue('timezone').trim();
+  const zone = DateTime.now().setZone(timezone);
+  if (!zone.isValid || !zone.zoneName) {
+    return interaction.reply({ content: 'That timezone is not valid. Enter an IANA timezone such as `America/Chicago` or `UTC`.', ephemeral: true });
+  }
+  const normalizedTimezone = zone.zoneName;
+  const previous = getConfigValue(ctx.db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
+  setConfigValue(ctx.db, 'TIME_ZONE', normalizedTimezone);
+  logAudit(ctx.db, {
+    action: 'configuration_change', targetId: interaction.guild.id, actorId: interaction.user.id,
+    reason: 'Updated server timezone', previousValue: previous, newValue: normalizedTimezone,
+  });
+  return interaction.reply({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents(), ephemeral: true });
+}
+
 async function handleOwnerButton(interaction, ctx) {
   if (!interaction.customId.startsWith('owner:')) return null;
   if (!await requireManagerInteraction(interaction, ctx, true)) return;
@@ -541,6 +710,8 @@ async function handleOwnerButton(interaction, ctx) {
     });
   }
   switch (interaction.customId) {
+    case 'owner:settings': return interaction.update({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents() });
+    case 'owner:settings:timezone': return interaction.showModal(createOwnerTimezoneModal(getConfigValue(ctx.db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC'));
     case 'owner:overview': return interaction.update({ embeds: [rosterEmbed(ctx.db, true)], components: ownerComponents(ctx.db) });
     case 'owner:reports': return interaction.update({ embeds: [reportEmbed(ctx.db)], components: ownerComponents(ctx.db) });
     case 'owner:audit': return interaction.update({ embeds: [auditEmbed(ctx.db)], components: ownerComponents(ctx.db) });
@@ -577,6 +748,8 @@ module.exports = {
   handleOwnerButton,
   handleOwnerConfirm,
   handleOwnerHistorySelect,
+  handleOwnerSettingsSelect,
+  handleOwnerSettingsModal,
   openManagementDashboard,
   openOwnerDashboard,
 };

@@ -23,6 +23,7 @@ const {
   submitDailyReport,
 } = require('../services/staffRewards');
 const { formatDuration } = require('../utils/format');
+const { handleStaffCenterControl } = require('./events');
 const {
   fetchGuildMember,
   getConfigValue,
@@ -137,6 +138,10 @@ async function handleStaffCenterCommand(interaction, ctx) {
 async function handleStaffCenterButton(interaction, ctx) {
   const id = interaction.customId;
   if (!id.startsWith('gv:center:')) return null;
+  if (id.startsWith('gv:center:event:') || id === 'gv:center:events'
+    || id === 'gv:center:rp:start' || id === 'gv:center:rp:controls') {
+    return handleStaffCenterControl(interaction, ctx);
+  }
   await interaction.deferReply({ ephemeral: true });
   const member = await getInteractionMember(interaction);
   if (!member || !isStaff(member, interaction.guild, ctx.db)) {

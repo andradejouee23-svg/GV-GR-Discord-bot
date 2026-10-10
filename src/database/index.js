@@ -66,6 +66,46 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS event_attendance (
+      event_id INTEGER NOT NULL REFERENCES events(id),
+      user_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      response TEXT NOT NULL CHECK(response IN ('going', 'cant_go')),
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (event_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS event_reminders (
+      event_id INTEGER NOT NULL REFERENCES events(id),
+      reminder_type TEXT NOT NULL CHECK(reminder_type IN ('one_hour', 'fifteen_minutes', 'started')),
+      attempted_at TEXT NOT NULL,
+      delivery_status TEXT NOT NULL CHECK(delivery_status IN ('sent', 'failed')),
+      PRIMARY KEY (event_id, reminder_type)
+    );
+
+    CREATE TABLE IF NOT EXISTS event_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id INTEGER NOT NULL REFERENCES events(id),
+      actor_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS event_drafts (
+      draft_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      data_json TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_drafts (
+      draft_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      data_json TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS warnings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT NOT NULL,
@@ -237,6 +277,36 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     CREATE INDEX IF NOT EXISTS staff_audit_target_created
       ON staff_audit_logs(target_id, created_at);
   `);
+
+  const addColumns = (table, columns) => {
+    const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+    for (const [name, definition] of Object.entries(columns)) {
+      if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+    }
+  };
+  addColumns('events', {
+    event_code: 'TEXT', event_type: "TEXT NOT NULL DEFAULT 'Other'", duration_minutes: 'INTEGER NOT NULL DEFAULT 120',
+    voice_channel_id: 'TEXT', announcement_channel_id: 'TEXT', announcement_message_id: 'TEXT', edited_at: 'TEXT',
+    time_zone: "TEXT NOT NULL DEFAULT 'UTC'",
+  });
+  addColumns('sessions', {
+    session_code: 'TEXT', rp_type: "TEXT NOT NULL DEFAULT 'General RP'", activity: "TEXT NOT NULL DEFAULT ''",
+    expected_duration: "TEXT NOT NULL DEFAULT ''", voice_channel_id: 'TEXT', announcement_channel_id: 'TEXT',
+    lifecycle_status: "TEXT NOT NULL DEFAULT 'active'", session_start_label: "TEXT NOT NULL DEFAULT ''",
+    paused_at: 'TEXT', paused_seconds: 'INTEGER NOT NULL DEFAULT 0', time_zone: "TEXT NOT NULL DEFAULT 'UTC'",
+  });
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS events_event_code_unique ON events(event_code);
+    CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_code_unique ON sessions(session_code);
+    CREATE INDEX IF NOT EXISTS events_status_starts_at ON events(status, starts_at);
+    CREATE INDEX IF NOT EXISTS event_history_event_created ON event_history(event_id, created_at);
+  `);
+  for (const event of db.prepare('SELECT id FROM events WHERE event_code IS NULL').all()) {
+    db.prepare('UPDATE events SET event_code = ? WHERE id = ?').run(`GV-EV-${String(event.id).padStart(4, '0')}`, event.id);
+  }
+  for (const session of db.prepare('SELECT id FROM sessions WHERE session_code IS NULL').all()) {
+    db.prepare('UPDATE sessions SET session_code = ? WHERE id = ?').run(`GV-RP-${String(session.id).padStart(4, '0')}`, session.id);
+  }
 
   return db;
 }
