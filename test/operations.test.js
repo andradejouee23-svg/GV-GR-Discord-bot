@@ -197,7 +197,10 @@ test('background tasks start/complete events and sessions and refresh their publ
   await processEventTasks(client, db, start);
   const eventReminder = db.prepare("SELECT delivery_status FROM event_reminders WHERE event_id = ? AND reminder_type = 'started'").get(event.id);
   assert.equal(eventReminder.delivery_status, 'sent');
-  assert.equal(db.prepare('SELECT lifecycle_status FROM sessions WHERE id = ?').get(session.id).lifecycle_status, 'active');
+  const activatedSession = db.prepare('SELECT lifecycle_status, scheduled_start_at, actual_started_at FROM sessions WHERE id = ?').get(session.id);
+  assert.equal(activatedSession.lifecycle_status, 'active');
+  assert.equal(activatedSession.scheduled_start_at, start.toISOString());
+  assert.equal(activatedSession.actual_started_at, start.toISOString());
   assert.ok(messages.some((entry) => entry.kind === 'edit'));
 
   await processEventTasks(client, db, new Date(start.getTime() + 61_000));
@@ -256,6 +259,7 @@ test('session controls acknowledge promptly, reject pre-start ending, and update
   await handleOperationButton(start.interaction, { db });
   assert.equal(start.wasDeferred(), true);
   assert.equal(db.prepare('SELECT lifecycle_status FROM sessions WHERE id = ?').get(session.id).lifecycle_status, 'active');
+  assert.ok(db.prepare('SELECT actual_started_at FROM sessions WHERE id = ?').get(session.id).actual_started_at);
   assert.ok(publicEdits.length >= 1);
 
   const pause = interactionFor('pause');
@@ -271,4 +275,48 @@ test('session controls acknowledge promptly, reject pre-start ending, and update
   assert.equal(db.prepare('SELECT lifecycle_status FROM sessions WHERE id = ?').get(session.id).lifecycle_status, 'completed');
   assert.match(end.finalPayload().content, /ended/i);
   assert.ok(publicEdits.length >= 2);
+});
+
+test('scheduled session cancellation requires confirmation and disables the public join controls', async (t) => {
+  const { db } = openDatabase(t);
+  const now = new Date();
+  const session = createSession(db, {
+    name: 'Cancelled RP', description: 'A scheduled community scene.', activity: 'Community scene',
+    hostId: 'cancel-host', hostName: 'Host', rpType: 'General RP', expectedDuration: '2 hours',
+    voiceChannelId: '123456789012345678', announcementChannelId: '223456789012345678',
+    scheduledStartAt: new Date(now.getTime() + 60_000).toISOString(),
+  }, now.toISOString());
+  db.prepare('UPDATE sessions SET channel_id = ?, message_id = ? WHERE id = ?')
+    .run('223456789012345678', '323456789012345678', session.id);
+  const publicEdits = [];
+  const client = { channels: { fetch: async () => ({
+    isTextBased: () => true,
+    messages: { fetch: async () => ({ edit: async (payload) => publicEdits.push(payload) }) },
+  }) } };
+  const host = {
+    id: 'cancel-host',
+    roles: { cache: new Map(config.STAFF_ROLE_IDS.map((roleId) => [roleId, {}])) },
+  };
+  const guild = { ownerId: 'server-owner' };
+  let confirmation;
+  await handleOperationButton({
+    customId: `gv:rp:control:${session.id}:cancel`, guild, member: host,
+    user: { id: host.id, username: 'Host' },
+    reply: async (payload) => { confirmation = payload; },
+  }, { db });
+  assert.equal(confirmation.ephemeral, true);
+  assert.equal(confirmation.components[0].components[0].data.custom_id, `gv:rp:control:${session.id}:cancel_confirm`);
+
+  let finalPayload;
+  await handleOperationButton({
+    customId: `gv:rp:control:${session.id}:cancel_confirm`, guild, member: host,
+    user: { id: host.id, username: 'Host' }, client,
+    deferUpdate: async () => {},
+    editReply: async (payload) => { finalPayload = payload; },
+  }, { db });
+  assert.match(finalPayload.content, /was cancelled/i);
+  assert.equal(db.prepare('SELECT status, lifecycle_status FROM sessions WHERE id = ?').get(session.id).lifecycle_status, 'cancelled');
+  assert.equal(publicEdits.length, 1);
+  assert.match(publicEdits[0].embeds[0].data.description, /SESSION CANCELLED/);
+  assert.equal(publicEdits[0].components[0].components[0].data.disabled, true);
 });

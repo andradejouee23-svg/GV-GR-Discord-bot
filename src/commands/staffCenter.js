@@ -11,6 +11,7 @@ const {
   awardStaffOfWeek,
   checkInStaff,
   checkOutStaff,
+  claimStaffFeatureCooldown,
   currentStatus,
   getOverdueShifts,
   getPendingDailyReportReminders,
@@ -24,6 +25,7 @@ const {
 } = require('../services/staffRewards');
 const { formatDuration } = require('../utils/format');
 const { handleStaffCenterControl } = require('./events');
+const { refreshStaffPanel } = require('./clock');
 const {
   fetchGuildMember,
   getConfigValue,
@@ -164,6 +166,7 @@ async function handleStaffCenterButton(interaction, ctx) {
     await logStaffAction(interaction.client, ctx.db, {
       embeds: [makeEmbed(config.EMBED_COLORS.active, '🟢 Staff Checked In', `<@${interaction.user.id}> • ${roleName}\nStarted: ${unixTime(result.shift.started_at)}`)],
     });
+    await refreshStaffPanel(interaction.client, interaction.guild, ctx.db);
     return replyEphemeral(interaction, { embeds: [makeEmbed(config.EMBED_COLORS.active, '🟢 Checked In', `Your GV GR shift started ${unixTime(result.shift.started_at)}.`)] }, 60000);
   }
 
@@ -173,6 +176,7 @@ async function handleStaffCenterButton(interaction, ctx) {
     await logStaffAction(interaction.client, ctx.db, {
       embeds: [makeEmbed(config.EMBED_COLORS.error, '🔴 Staff Checked Out', `<@${interaction.user.id}> • ${shift.role_name}\nShift: **${formatDuration(shift.duration_seconds)}**\nHourly Points: **+${shift.hourly_points}**\nEnded: ${unixTime(shift.ended_at)}`)],
     });
+    await refreshStaffPanel(interaction.client, interaction.guild, ctx.db);
     return replyEphemeral(interaction, createCheckoutReply(ctx.db, shift), 60000);
   }
 
@@ -198,6 +202,13 @@ async function handleStaffCenterButton(interaction, ctx) {
   return replyEphemeral(interaction, { content: 'That Staff Center control is not recognized.' });
 }
 
+function formatCooldownRemaining(remainingMs) {
+  const seconds = Math.ceil(remainingMs / 1000);
+  if (seconds < 60) return 'less than a minute';
+  const minutes = Math.ceil(seconds / 60);
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
+
 async function handleDailyReportSelect(interaction, ctx) {
   const shiftId = Number(interaction.customId.split(':').at(-1));
   if (!Number.isSafeInteger(shiftId) || shiftId < 1) {
@@ -207,6 +218,10 @@ async function handleDailyReportSelect(interaction, ctx) {
   if (!shift) return interaction.reply({ content: 'This checkout is not linked to one of your completed shifts.', ephemeral: true });
   const alreadySubmitted = ctx.db.prepare('SELECT id FROM daily_rp_reports WHERE user_id = ? AND report_date = ?').get(interaction.user.id, shift.ended_at.slice(0, 10));
   if (alreadySubmitted) return interaction.reply({ content: 'A daily RP report has already been submitted for this date. The report bonus cannot be earned twice.', ephemeral: true });
+  const cooldown = claimStaffFeatureCooldown(ctx.db, interaction.user.id, 'daily_report');
+  if (!cooldown.allowed) {
+    return interaction.reply({ content: `Daily report cooldown: try again in ${formatCooldownRemaining(cooldown.remainingMs)}.`, ephemeral: true });
+  }
   return interaction.showModal(createDailyReportModal(shiftId, interaction.values[0]));
 }
 
@@ -288,14 +303,17 @@ async function handleShiftReminder(interaction, ctx) {
   await logStaffAction(interaction.client, ctx.db, {
     embeds: [makeEmbed(config.EMBED_COLORS.error, '🔴 Staff Checked Out From Reminder', `<@${interaction.user.id}>\nShift: **${formatDuration(completed.duration_seconds)}**\nHourly Points: **+${completed.hourly_points}**`)],
   });
+  await refreshStaffPanel(interaction.client, interaction.guild, ctx.db);
   return replyEphemeral(interaction, createCheckoutReply(ctx.db, completed));
 }
 
-async function processShiftReminders(client, db) {
+async function processShiftReminders(client, db, now = new Date()) {
   const channelId = getConfigValue(db, 'STAFF_ACTIVITY_CHANNEL_ID');
   if (!channelId) return;
-  for (const shift of getOverdueShifts(db)) {
-    const elapsed = Math.floor((Date.now() - Date.parse(shift.started_at)) / 1000);
+  for (const shift of getOverdueShifts(db, now)) {
+    const cooldown = claimStaffFeatureCooldown(db, shift.user_id, 'shift_reminder', now);
+    if (!cooldown.allowed) continue;
+    const elapsed = Math.floor((now.getTime() - Date.parse(shift.started_at)) / 1000);
     let messageId = null;
     let deliveryStatus = 'failed';
     try {
@@ -311,6 +329,9 @@ async function processShiftReminders(client, db) {
       }
     } catch (error) {
       console.error(`Could not send shift reminder for shift ${shift.id}:`, error.message);
+    }
+    if (deliveryStatus !== 'sent') {
+      releaseStaffFeatureCooldown(db, shift.user_id, 'shift_reminder', cooldown.claimId);
     }
     recordReminderAttempt(db, shift.id, deliveryStatus, messageId);
   }

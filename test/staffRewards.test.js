@@ -10,9 +10,11 @@ const {
   awardStaffOfWeek,
   checkInStaff,
   checkOutStaff,
+  closeShiftByManagement,
   getCurrentStreak,
   getStaffStats,
   getWeekStart,
+  managementClockInStaff,
   submitDailyReport,
 } = require('../src/services/staffRewards');
 
@@ -74,6 +76,35 @@ test('a 4:28 to 4:30 shift is recorded as two minutes and earns no full-hour poi
   assert.equal(shift.hourly_points, 0);
   assert.equal(getStaffStats(db, member.id, new Date('2026-10-04T16:30:00.000Z')).totalSeconds, 120);
   assert.equal(getStaffStats(db, member.id, new Date('2026-10-04T16:30:00.000Z')).totalPoints, 0);
+});
+
+test('management clock actions share shift rules and audit manager attribution', (t) => {
+  const db = openDatabase(t);
+  const member = { id: 'manual-staff', username: 'ManualStaff', roleName: 'Moderator' };
+  const startedAt = '2026-10-04T08:00:00.000Z';
+  const started = managementClockInStaff(db, {
+    member, actorId: 'manager-1', reason: 'Approved manual shift', now: startedAt,
+  });
+  assert.equal(started.alreadyOnDuty, false);
+  assert.equal(managementClockInStaff(db, {
+    member, actorId: 'manager-1', reason: 'Duplicate request', now: '2026-10-04T08:01:00.000Z',
+  }).alreadyOnDuty, true);
+
+  const completed = closeShiftByManagement(db, {
+    shiftId: started.shift.id, actorId: 'manager-2', reason: 'Approved manual checkout',
+    now: '2026-10-04T10:30:00.000Z',
+  });
+  assert.equal(completed.started_at, startedAt);
+  assert.equal(completed.ended_at, '2026-10-04T10:30:00.000Z');
+  assert.equal(completed.duration_seconds, 9000);
+  assert.equal(completed.hourly_points, 2);
+  assert.deepEqual(db.prepare(`SELECT action, target_id, actor_id, reason FROM staff_audit_logs
+    WHERE action LIKE 'shift_manual_clock_%' ORDER BY id`).all(), [
+    { action: 'shift_manual_clock_in', target_id: member.id, actor_id: 'manager-1', reason: 'Approved manual shift' },
+    { action: 'shift_manual_clock_out', target_id: member.id, actor_id: 'manager-2', reason: 'Approved manual checkout' },
+  ]);
+  assert.equal(db.prepare('SELECT actor_id FROM staff_points_ledger WHERE source_id = ?').get(String(started.shift.id)).actor_id, 'manager-2');
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM shifts WHERE user_id = ? AND status = 'active'").get(member.id).count, 0);
 });
 
 test('weekly stats only include elapsed active time and streaks require distinct qualified days', (t) => {

@@ -102,9 +102,18 @@ function createSessionModal(draftId, timeZone = 'UTC') {
   return new ModalBuilder().setCustomId(`gv:rp:create:${draftId}`).setTitle('Start a GV GR RP Session')
     .addComponents(
       row(modalText('name', 'RP session name', TextInputStyle.Short, true, 100, 'Friday Night Greenville RP')),
-      row(modalText('time', `Start time (${timeZone})`, TextInputStyle.Short, true, 20, '6:30 PM')),
+      row(modalText('description', 'Session description', TextInputStyle.Paragraph, true, 1000)),
+      row(modalText('date', `Scheduled date (${timeZone})`, TextInputStyle.Short, true, 40, 'October 4, 2026')),
+      row(modalText('time', `Scheduled start time (${timeZone})`, TextInputStyle.Short, true, 20, '6:30 PM')),
+    );
+}
+
+function createSessionDetailsModal(draftId) {
+  return new ModalBuilder().setCustomId(`gv:rp:create:${draftId}:details`).setTitle('Session Details')
+    .addComponents(
       row(modalText('duration', 'Expected duration', TextInputStyle.Short, true, 30, '2 hours')),
       row(modalText('activity', 'Main activity', TextInputStyle.Paragraph, true, 1000)),
+      row(modalText('image_url', 'Optional banner image URL (HTTPS)', TextInputStyle.Short, false, 500)),
     );
 }
 
@@ -252,6 +261,28 @@ async function openRpControls(interaction, ctx) {
   return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, '🎛️ RP SESSION CONTROLS', description)], components: rows, ephemeral: true });
 }
 
+async function openSessionCreation(interaction, ctx, { hostId = interaction.user.id, hostName = interaction.user.username, managementOnly = false } = {}) {
+  const member = await getInteractionMember(interaction);
+  if (!member || !isStaff(member, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'Starting an official RP session is available to configured staff only.', ephemeral: true });
+  }
+  if (managementOnly && !isManagement(member, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'Management access is required to start a session for another host.', ephemeral: true });
+  }
+  const host = await fetchGuildMember(interaction.guild, hostId);
+  if (!host || !getStaffRoleName(host, ctx.db) || !isStaff(host, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'The session host must be a current member of a configured staff role.', ephemeral: true });
+  }
+  if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) {
+    return interaction.reply({ content: 'An RP session is already active. Open RP Controls to manage it.', ephemeral: true });
+  }
+  const timeZone = getConfigValue(ctx.db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
+  const draftId = createDraft(ctx.db, 'session_drafts', interaction.user.id, {
+    hostId, hostName, timeZone, managementOnly,
+  });
+  return interaction.showModal(createSessionModal(draftId, timeZone));
+}
+
 function createSessionHistoryEmbed(db) {
   const rows = db.prepare(`SELECT s.session_code, s.name, s.host_id, s.rp_type, s.status, s.lifecycle_status,
       s.started_at, s.ended_at, s.duration_seconds, s.expected_duration,
@@ -266,14 +297,7 @@ function createSessionHistoryEmbed(db) {
 async function handleStaffCenterControl(interaction, ctx) {
   const id = interaction.customId;
   if (id === 'gv:center:events') return openEventPanel(interaction, ctx);
-  if (id === 'gv:center:rp:start') {
-    const member = await getInteractionMember(interaction);
-    if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Starting an official RP session is available to configured staff only.', ephemeral: true });
-    if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) return interaction.reply({ content: 'An RP session is already active. Open RP Controls to manage it.', ephemeral: true });
-    const timeZone = getConfigValue(ctx.db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
-      const draftId = createDraft(ctx.db, 'session_drafts', interaction.user.id, { hostId: interaction.user.id, hostName: interaction.user.username, timeZone });
-    return interaction.showModal(createSessionModal(draftId, timeZone));
-  }
+  if (id === 'gv:center:rp:start') return openSessionCreation(interaction, ctx);
   if (id === 'gv:center:rp:controls') return openRpControls(interaction, ctx);
   if (id === 'gv:center:rp:history') {
     const member = await getInteractionMember(interaction);
@@ -512,13 +536,27 @@ async function submitSessionDraft(interaction, ctx, draftId) {
   if (!channelId) return interaction.reply({ content: 'Configure SESSION_CHANNEL_ID with `/staffconfig channel` before starting a session.', ephemeral: true });
   const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased() || !channel.send) return interaction.reply({ content: 'The configured RP announcement channel is unavailable.', ephemeral: true });
-  const session = createSession(ctx.db, { ...draft, scheduledStartAt, timeZone: draft.timeZone, announcementChannelId: channelId });
+  const host = await fetchGuildMember(interaction.guild, draft.hostId ?? interaction.user.id);
+  if (!host || !getStaffRoleName(host, ctx.db) || !isStaff(host, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'The selected session host no longer has a configured staff role.', ephemeral: true });
+  }
+  const session = createSession(ctx.db, {
+    ...draft,
+    hostId: host.id,
+    hostName: host.user.username,
+    scheduledStartAt,
+    timeZone: draft.timeZone,
+    announcementChannelId: channelId,
+    description: draft.description,
+    imageUrl: draft.imageUrl || null,
+  });
   ctx.db.prepare('UPDATE sessions SET session_start_label = ? WHERE id = ?').run(draft.startLabel, session.id);
-  const embed = sessionEmbed(session, draft.startLabel);
+  const displaySession = withSessionSettings(session, ctx.db);
+  const embed = sessionEmbed(displaySession, draft.startLabel);
   let message;
   try {
-    message = await channel.send({ embeds: [embed], files: [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')],
-      components: sessionPublicComponents(session.id), allowedMentions: { users: [session.host_id] } });
+    message = await channel.send({ embeds: [embed], files: displaySession.image_url ? [] : [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')],
+      components: sessionPublicComponents(session.id, false, displaySession.join_url), allowedMentions: { users: [session.host_id] } });
   } catch (error) { console.error(`Could not announce session ${session.session_code}:`, error.message); }
   if (message) ctx.db.prepare('UPDATE sessions SET channel_id = ?, message_id = ? WHERE id = ?').run(message.channelId, message.id, session.id);
   deleteDraft(ctx.db, 'session_drafts', draftId);
@@ -527,43 +565,71 @@ async function submitSessionDraft(interaction, ctx, draftId) {
   return interaction.reply({ content: message ? `**${session.session_code}** ${session.lifecycle_status === 'scheduled' ? 'is scheduled for' : 'is live in'} <#${channelId}>.` : `**${session.session_code}** was saved, but the announcement could not be sent.`, ephemeral: true });
 }
 
+function withSessionSettings(session, db) {
+  return {
+    ...session,
+    join_code: getConfigValue(db, 'SESSION_JOIN_CODE') ?? '',
+    join_url: getConfigValue(db, 'SESSION_JOIN_URL') ?? '',
+    image_url: session.image_url || getConfigValue(db, 'SESSION_DEFAULT_IMAGE_URL') || '',
+  };
+}
+
 function sessionEmbed(session, startLabel = session.session_start_label) {
-  const elapsed = session.duration_seconds ?? Math.max(0, Math.floor((Date.now() - Date.parse(session.started_at)) / 1000));
+  const scheduledStart = session.scheduled_start_at ?? session.started_at;
+  const actualStart = session.actual_started_at;
+  const durationMinutes = parseDurationMinutes(session.expected_duration);
+  const expectedEnd = durationMinutes ? new Date(Date.parse(actualStart ?? scheduledStart) + durationMinutes * 60_000) : null;
+  const pauseNow = session.lifecycle_status === 'paused' && session.paused_at
+    ? Math.max(0, Math.floor((Date.now() - Date.parse(session.paused_at)) / 1000)) : 0;
+  const elapsed = session.duration_seconds ?? (actualStart
+    ? Math.max(0, Math.floor((Date.now() - Date.parse(actualStart)) / 1000) - (session.paused_seconds ?? 0) - pauseNow)
+    : 0);
   const participants = session.participant_count ?? 1;
   const timeZone = session.time_zone || 'UTC';
-  const localStart = DateTime.fromISO(session.started_at, { zone: 'utc' }).setZone(timeZone);
+  const localStart = DateTime.fromISO(scheduledStart, { zone: 'utc' }).setZone(timeZone);
   const status = session.lifecycle_status === 'scheduled'
     ? '🟡 **SESSION SCHEDULED**'
     : session.lifecycle_status === 'paused' ? '⏸️ **SESSION PAUSED**'
-      : session.lifecycle_status === 'completed' ? '⚫ **SESSION ENDED**' : '🟢 **SESSION LIVE**';
+      : session.lifecycle_status === 'cancelled' ? '⚫ **SESSION CANCELLED**'
+        : session.lifecycle_status === 'completed' ? '⚫ **SESSION ENDED**' : '🟢 **SESSION LIVE**';
+  const joinSection = session.join_code
+    ? `**Custom Server Join Code**\n\`\`\`\n${session.join_code}\n\`\`\`\n**Join Instructions**\n1. Open Greenville.\n2. Open the Custom Servers menu.\n3. Search for GV GR or enter the code above.\n4. Join the session.`
+    : 'The Owner has not configured the Greenville custom-server join code yet.';
+  const expectedEndText = expectedEnd ? `<t:${Math.floor(expectedEnd.getTime() / 1000)}:F>` : 'Not set';
+  const actualStartText = actualStart ? unixTime(actualStart) : 'Not started yet';
   return makeEmbed(config.EMBED_COLORS.management, '🎮 GV GR RP SESSION',
-    `**${session.name.toUpperCase()}**\n${status}\n\n📅 <t:${Math.floor(Date.parse(session.started_at) / 1000)}:D>\n⏰ ${startLabel || localStart.toFormat('h:mm a')} ${localStart.offsetNameShort} (${timeZone})\n⌛ ${session.expected_duration || 'Open session'}${session.lifecycle_status === 'completed' ? `\n⏹️ **Ended:** ${session.ended_at ? unixTime(session.ended_at) : 'Recorded'}\n⏱️ **Active Duration:** ${formatDuration(elapsed)}` : ''}\n\n🎯 **Activities**\n${session.activity || session.description || 'Community roleplay'}\n\n🎤 **Host**\n<@${session.host_id}>\n🔊 **Voice**\n<#${session.voice_channel_id}>\n🆔 **Session ID**\n\`${session.session_code}\`\n👥 **Participants**\n${participants} joined`)
+    `**${session.name.toUpperCase()}**\n${status}\n\n${session.description ? `${session.description}\n\n` : ''}📅 **Scheduled Start**\n<t:${Math.floor(Date.parse(scheduledStart) / 1000)}:F> (${timeZone})\n🟢 **Actual Start**\n${actualStartText}\n⌛ **Expected End**\n${expectedEndText}\n⏱️ **Active Duration**\n${formatDuration(elapsed)}\n\n🎭 **Session Type**\n${session.rp_type}\n🎯 **Activity**\n${session.activity || 'Community roleplay'}\n🎤 **Host**\n<@${session.host_id}>\n🔊 **Voice Channel**\n${session.voice_channel_id ? `<#${session.voice_channel_id}>` : 'Not configured'}\n🆔 **Session ID**\n\`${session.session_code}\`\n👥 **Participants**\n${participants} joined\n\n${joinSection}${session.join_url ? `\n\n[Open Greenville](${session.join_url})` : ''}${session.ended_at ? `\n\n⏹️ **Ended:** ${unixTime(session.ended_at)}` : ''}`)
     .setColor(COLORS[session.rp_type] ?? COLORS.Other)
-    .setImage('attachment://gv-gr-event.png')
-    .setFooter({ text: `GV GR • ${session.rp_type} • Live for ${formatDuration(elapsed)}` });
+    .setImage(session.image_url || 'attachment://gv-gr-event.png')
+    .setFooter({ text: `GV GR • ${session.rp_type} • ${session.lifecycle_status === 'scheduled' ? 'Scheduled' : formatDuration(elapsed)}` });
 }
 
-function sessionPublicComponents(sessionId, disabled = false) {
-  return [row(
+function sessionPublicComponents(sessionId, disabled = false, joinUrl = '') {
+  const buttons = [
     new ButtonBuilder().setCustomId(`gv:rp:join:${sessionId}`).setLabel('Join Session').setEmoji('🟢').setStyle(ButtonStyle.Success).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`gv:rp:leave:${sessionId}`).setLabel('Leave Session').setEmoji('❌').setStyle(ButtonStyle.Danger).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`gv:rp:info:${sessionId}`).setLabel('Session Info').setEmoji('📋').setStyle(ButtonStyle.Secondary),
-  )];
+  ];
+  if (joinUrl && !disabled) buttons.push(new ButtonBuilder().setLabel('Open Greenville').setStyle(ButtonStyle.Link).setURL(joinUrl));
+  return [row(...buttons)];
 }
 
 function sessionControlComponents(session) {
   const lifecycle = session.lifecycle_status ?? 'active';
+  const terminal = ['completed', 'cancelled'].includes(lifecycle);
   return [
     row(
       new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:start`).setLabel('Start Session').setEmoji('▶️').setStyle(ButtonStyle.Success).setDisabled(lifecycle !== 'scheduled'),
-      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:pause`).setLabel(lifecycle === 'paused' ? 'Resume Session' : 'Pause Session').setEmoji(lifecycle === 'paused' ? '▶️' : '⏸️').setStyle(ButtonStyle.Secondary).setDisabled(['scheduled', 'completed'].includes(lifecycle)),
-      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:remind`).setLabel('Send Reminder').setEmoji('🔔').setStyle(ButtonStyle.Secondary).setDisabled(lifecycle === 'completed'),
+      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:pause`).setLabel(lifecycle === 'paused' ? 'Resume Session' : 'Pause Session').setEmoji(lifecycle === 'paused' ? '▶️' : '⏸️').setStyle(ButtonStyle.Secondary).setDisabled(['scheduled', ...['completed', 'cancelled']].includes(lifecycle)),
+      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:remind`).setLabel('Send Reminder').setEmoji('🔔').setStyle(ButtonStyle.Secondary).setDisabled(terminal),
     ),
     row(
-      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:announce`).setLabel('RP Announcement').setEmoji('📢').setStyle(ButtonStyle.Primary).setDisabled(lifecycle === 'completed'),
+      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:announce`).setLabel('RP Announcement').setEmoji('📢').setStyle(ButtonStyle.Primary).setDisabled(terminal),
       new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:participants`).setLabel('View Participants').setEmoji('👥').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:end`).setLabel('End Session').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(lifecycle === 'completed'),
+      new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:end`).setLabel('End Session').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(terminal),
     ),
+    row(new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:cancel`).setLabel('Cancel Scheduled Session')
+      .setEmoji('❌').setStyle(ButtonStyle.Danger).setDisabled(lifecycle !== 'scheduled')),
   ];
 }
 
@@ -572,16 +638,18 @@ function getSession(db, sessionId) {
     FROM sessions s WHERE s.id = ?`).get(sessionId);
 }
 
-async function updateSessionAnnouncement(client, session) {
+async function updateSessionAnnouncement(client, session, db) {
   if (!session.channel_id || !session.message_id) return;
   try {
     const channel = await client.channels.fetch(session.channel_id);
     const message = channel?.isTextBased() ? await channel.messages.fetch(session.message_id) : null;
     if (!message) return;
+    const displaySession = withSessionSettings(session, db);
     await message.edit({
-      embeds: [sessionEmbed(session)],
-      files: [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')],
-      components: sessionPublicComponents(session.id, session.status === 'completed'),
+      embeds: [sessionEmbed(displaySession)],
+      files: displaySession.image_url ? [] : [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')],
+      components: sessionPublicComponents(session.id,
+        session.status === 'completed' || session.lifecycle_status === 'cancelled', displaySession.join_url),
     });
   } catch (error) {
     console.error(`Could not refresh session announcement ${session.session_code}:`, error.message);
@@ -633,8 +701,10 @@ async function handleSessionButton(interaction, ctx) {
   const manager = member && isManagement(member, interaction.guild, ctx.db);
   if (action === 'info') {
     const controls = authorizedHost || manager ? sessionControlComponents(session) : [];
+    const displaySession = withSessionSettings(session, ctx.db);
     await interaction.deferReply({ ephemeral: true });
-    return interaction.editReply({ embeds: [sessionEmbed(session)], components: controls, files: [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')] });
+    return interaction.editReply({ embeds: [sessionEmbed(displaySession)], components: controls,
+      files: displaySession.image_url ? [] : [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')] });
   }
   if (action !== 'control') return interaction.reply({ content: 'This session control is not recognized.', ephemeral: true });
   if (!authorizedHost && !manager) return interaction.reply({ content: 'Only this session’s active staff host or management can use live controls.', ephemeral: true });
@@ -643,62 +713,96 @@ async function handleSessionButton(interaction, ctx) {
     const list = people.length ? people.slice(0, 40).map((person) => `<@${person.user_id}>`).join('\n') : 'No participants yet.';
     return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, `👥 SESSION PARTICIPANTS • ${session.session_code}`, `**${session.name}**\n\n${list}`)], ephemeral: true });
   }
-  if (!['start', 'pause', 'remind', 'announce', 'end'].includes(subAction)) {
+  if (subAction === 'cancel_abort') {
+    return interaction.update({ content: 'Session cancellation stopped.', embeds: [], components: [] });
+  }
+  if (subAction === 'cancel') {
+    if (session.lifecycle_status !== 'scheduled') return interaction.reply({ content: 'Only a scheduled session can be cancelled.', ephemeral: true });
+    return interaction.reply({
+      content: `Cancel **${session.session_code} • ${session.name}**? Its announcement will be marked cancelled.`,
+      components: [row(
+        new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:cancel_confirm`).setLabel('Confirm Cancellation').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`gv:rp:control:${session.id}:cancel_abort`).setLabel('Keep Session').setStyle(ButtonStyle.Secondary),
+      )],
+      ephemeral: true,
+    });
+  }
+  if (!['start', 'pause', 'remind', 'announce', 'end', 'cancel_confirm'].includes(subAction)) {
     return interaction.reply({ content: 'This RP session action is not recognized.', ephemeral: true });
+  }
+  if (subAction === 'start' && session.lifecycle_status !== 'scheduled') {
+    return interaction.reply({ content: 'This session has already started or ended.', ephemeral: true });
+  }
+  if (subAction === 'pause' && ['completed', 'cancelled'].includes(session.lifecycle_status)) {
+    return interaction.reply({ content: 'This session has already ended.', ephemeral: true });
   }
   if (subAction === 'end' && session.lifecycle_status === 'scheduled') {
     return interaction.reply({ content: 'This session has not started yet. Use the Start Session control at its scheduled time.', ephemeral: true });
   }
+  if (subAction === 'end' && ['completed', 'cancelled'].includes(session.lifecycle_status)) {
+    return interaction.reply({ content: 'This session has already ended.', ephemeral: true });
+  }
+  if (subAction === 'cancel_confirm' && session.lifecycle_status !== 'scheduled') {
+    return interaction.reply({ content: 'This session is no longer scheduled and was not cancelled.', ephemeral: true });
+  }
+  if (['remind', 'announce'].includes(subAction) && ['completed', 'cancelled'].includes(session.lifecycle_status)) {
+    return interaction.reply({ content: 'This session has ended; no further announcements can be sent.', ephemeral: true });
+  }
   await interaction.deferUpdate();
+  if (subAction === 'cancel_confirm') {
+    const now = new Date().toISOString();
+    const cancelled = ctx.db.prepare(`UPDATE sessions SET status = 'completed', lifecycle_status = 'cancelled', ended_at = ?
+      WHERE id = ? AND status = 'active' AND lifecycle_status = 'scheduled'`).run(now, session.id);
+    if (!cancelled.changes) return interaction.editReply({ content: 'This session changed state before cancellation; no changes were made.', components: [] });
+    const updated = getSession(ctx.db, session.id);
+    await updateSessionAnnouncement(interaction.client, updated, ctx.db);
+    await logStaffAction(interaction.client, ctx.db, { embeds: [sessionEmbed(withSessionSettings(updated, ctx.db))] });
+    return interaction.editReply({ content: `${session.session_code} was cancelled.`, embeds: [], components: [] });
+  }
   if (subAction === 'start') {
-    if (session.lifecycle_status !== 'scheduled') return interaction.reply({ content: 'This session has already started or ended.', ephemeral: true });
-    ctx.db.prepare("UPDATE sessions SET lifecycle_status = 'active', started_at = ? WHERE id = ?").run(new Date().toISOString(), session.id);
-    const started = getSession(ctx.db, session.id);
-    await updateSessionAnnouncement(interaction.client, started);
-    await logStaffAction(interaction.client, ctx.db, { embeds: [makeEmbed(config.EMBED_COLORS.active, '🎮 GV GR RP SESSION STARTED', `\`${session.session_code}\` • ${session.name}\nHost: <@${session.host_id}>\nStarted by: <@${interaction.user.id}>`)] });
+    const now = new Date().toISOString();
+    const started = ctx.db.prepare(`UPDATE sessions SET lifecycle_status = 'active', started_at = ?, actual_started_at = ?
+      WHERE id = ? AND status = 'active' AND lifecycle_status = 'scheduled'`).run(now, now, session.id);
+    if (!started.changes) return interaction.editReply({ content: 'This session changed state before it could start.', components: [] });
   } else if (subAction === 'pause') {
-    if (session.lifecycle_status === 'completed') return interaction.reply({ content: 'This session has already ended.', ephemeral: true });
     if (session.lifecycle_status === 'paused') {
       const pausedSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(session.paused_at)) / 1000));
-      ctx.db.prepare("UPDATE sessions SET lifecycle_status = 'active', paused_seconds = paused_seconds + ?, paused_at = NULL WHERE id = ?").run(pausedSeconds, session.id);
+      ctx.db.prepare("UPDATE sessions SET lifecycle_status = 'active', paused_seconds = paused_seconds + ?, paused_at = NULL WHERE id = ? AND lifecycle_status = 'paused'").run(pausedSeconds, session.id);
     } else {
-      ctx.db.prepare("UPDATE sessions SET lifecycle_status = 'paused', paused_at = ? WHERE id = ?").run(new Date().toISOString(), session.id);
+      ctx.db.prepare("UPDATE sessions SET lifecycle_status = 'paused', paused_at = ? WHERE id = ? AND lifecycle_status = 'active'").run(new Date().toISOString(), session.id);
     }
   } else if (subAction === 'remind' || subAction === 'announce') {
     const channelId = session.channel_id || session.announcement_channel_id;
     const channel = channelId && await interaction.client.channels.fetch(channelId).catch(() => null);
     if (!channel?.isTextBased() || !channel.send) return interaction.followUp({ content: 'The session announcement channel is unavailable.', ephemeral: true });
     const title = subAction === 'remind' ? '🔔 GV GR RP SESSION REMINDER' : '📢 GV GR RP SESSION ANNOUNCEMENT';
-    await channel.send({ embeds: [makeEmbed(config.EMBED_COLORS.management, title, `**${session.name}** • \`${session.session_code}\`\n${session.activity}\n\nJoin the session in <#${session.voice_channel_id}>. Host: <@${session.host_id}>.`)],
-      components: sessionPublicComponents(session.id), allowedMentions: { users: [session.host_id] } });
+    const displaySession = withSessionSettings(session, ctx.db);
+    const embed = sessionEmbed(displaySession).setTitle(title);
+    await channel.send({ embeds: [embed], files: displaySession.image_url ? [] : [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')],
+      components: sessionPublicComponents(session.id, false, displaySession.join_url), allowedMentions: { users: [session.host_id] } });
     return interaction.followUp({ content: `${subAction === 'remind' ? 'Reminder' : 'Announcement'} sent to <#${channelId}>.`, ephemeral: true });
   } else if (subAction === 'end') {
-    if (session.status !== 'active' || session.lifecycle_status === 'completed') return interaction.reply({ content: 'This session has already ended.', ephemeral: true });
     const endedAt = new Date().toISOString();
     const pauseAtEnd = session.lifecycle_status === 'paused' && session.paused_at
       ? Math.max(0, Math.floor((Date.now() - Date.parse(session.paused_at)) / 1000)) : 0;
-    const durationSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(session.started_at)) / 1000) - (session.paused_seconds ?? 0) - pauseAtEnd);
-    ctx.db.prepare("UPDATE sessions SET status = 'completed', lifecycle_status = 'completed', ended_at = ?, duration_seconds = ?, paused_seconds = paused_seconds + ? WHERE id = ?")
-      .run(endedAt, durationSeconds, pauseAtEnd, session.id);
+    const actualStart = session.actual_started_at ?? session.started_at;
+    const durationSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(actualStart)) / 1000) - (session.paused_seconds ?? 0) - pauseAtEnd);
+    const ended = ctx.db.prepare(`UPDATE sessions SET status = 'completed', lifecycle_status = 'completed', ended_at = ?,
+      duration_seconds = ?, paused_seconds = paused_seconds + ? WHERE id = ? AND status = 'active'
+      AND lifecycle_status IN ('active', 'paused')`).run(endedAt, durationSeconds, pauseAtEnd, session.id);
+    if (!ended.changes) return interaction.editReply({ content: 'This session changed state before it could end.', components: [] });
     const completed = getSession(ctx.db, session.id);
-    const summary = makeEmbed(config.EMBED_COLORS.management, '⏹️ GV GR RP SESSION ENDED',
-      `**${session.name}** • \`${session.session_code}\`\nHost: <@${session.host_id}>\nType: ${session.rp_type}\nStarted: <t:${Math.floor(Date.parse(session.started_at) / 1000)}:F>\nEnded: <t:${Math.floor(Date.parse(endedAt) / 1000)}:F>\nDuration: **${formatDuration(durationSeconds)}**\nParticipants: **${completed.participant_count}**\nActivities: ${session.activity}`);
-    if (session.channel_id && session.message_id) {
-      try {
-        const channel = await interaction.client.channels.fetch(session.channel_id);
-        const message = await channel.messages.fetch(session.message_id);
-        await message.edit({ embeds: [summary], components: sessionPublicComponents(session.id, true) });
-      } catch (error) { console.error(`Could not update ended session ${session.session_code}:`, error.message); }
-    }
+    await updateSessionAnnouncement(interaction.client, completed, ctx.db);
+    const summary = sessionEmbed(withSessionSettings(completed, ctx.db));
     await logStaffAction(interaction.client, ctx.db, { embeds: [summary] });
     return interaction.editReply({ content: `${session.session_code} ended. Active time: **${formatDuration(durationSeconds)}**.`, embeds: [], components: [] });
   }
   const updated = getSession(ctx.db, session.id);
-  if (subAction === 'pause') await updateSessionAnnouncement(interaction.client, updated);
+  await updateSessionAnnouncement(interaction.client, updated, ctx.db);
   const actionEmbed = makeEmbed(config.EMBED_COLORS.management, `🎮 SESSION ${subAction.toUpperCase()}`,
     `\`${session.session_code}\` • ${session.name}\nUpdated by <@${interaction.user.id}>\nStatus: **${updated.lifecycle_status.toUpperCase()}**`);
   await logStaffAction(interaction.client, ctx.db, { embeds: [actionEmbed] });
-  return interaction.editReply({ embeds: [sessionEmbed(updated)], components: sessionControlComponents(updated) });
+  return interaction.editReply({ embeds: [sessionEmbed(withSessionSettings(updated, ctx.db))], components: sessionControlComponents(updated) });
 }
 
 async function handleEventChannelSelect(interaction, ctx) {
@@ -729,24 +833,53 @@ async function handleOperationTypeSelect(interaction, ctx, kind) {
 }
 
 async function submitRpModal(interaction, ctx) {
-  const [, , , draftId] = interaction.customId.split(':');
+  const parts = interaction.customId.split(':');
+  const draftId = parts[3];
+  const detailsStep = parts[4] === 'details';
   const member = await getInteractionMember(interaction);
   if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Configured staff access is required.', ephemeral: true });
   const existing = getDraft(ctx.db, 'session_drafts', draftId, interaction.user.id);
   if (!existing) return interaction.reply({ content: 'This session form expired. Open the Staff Center and start again.', ephemeral: true });
+  if (existing.managementOnly && !isManagement(member, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'Management access is required to start this selected-host session.', ephemeral: true });
+  }
   if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) return interaction.reply({ content: 'An RP session is already active.', ephemeral: true });
-  const name = interaction.fields.getTextInputValue('name').trim();
-  const startLabel = interaction.fields.getTextInputValue('time').trim();
+  const timeZone = existing.timeZone ?? getConfigValue(ctx.db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
+  if (!detailsStep) {
+    const name = interaction.fields.getTextInputValue('name').trim();
+    const description = interaction.fields.getTextInputValue('description').trim();
+    const dateLabel = interaction.fields.getTextInputValue('date').trim();
+    const startLabel = interaction.fields.getTextInputValue('time').trim();
+    const scheduledStartAt = parseStartAt(dateLabel, startLabel, timeZone);
+    if (!name || !description) return interaction.reply({ content: 'Session title and description are required.', ephemeral: true });
+    const host = await fetchGuildMember(interaction.guild, existing.hostId ?? interaction.user.id);
+    if (!host || !getStaffRoleName(host, ctx.db) || !isStaff(host, interaction.guild, ctx.db)) {
+      return interaction.reply({ content: 'The selected session host no longer has a configured staff role.', ephemeral: true });
+    }
+    if (!scheduledStartAt || Date.parse(scheduledStartAt) <= Date.now()) {
+      return interaction.reply({ content: `Enter a valid future date and time in ${timeZone}; check daylight-saving transitions.`, ephemeral: true });
+    }
+    updateDraft(ctx.db, 'session_drafts', draftId, interaction.user.id, {
+      name, description, dateLabel, startLabel, scheduledStartAt, timeZone,
+      hostId: host.id, hostName: host.user.username,
+    });
+    return interaction.showModal(createSessionDetailsModal(draftId));
+  }
+
   const duration = interaction.fields.getTextInputValue('duration').trim();
   const activity = interaction.fields.getTextInputValue('activity').trim();
-  const timeZone = existing.timeZone ?? getConfigValue(ctx.db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
-  const scheduledStartAt = parseSessionStartAt(startLabel, new Date(), timeZone);
-  if (!scheduledStartAt) return interaction.reply({ content: `Enter a valid time in ${timeZone}; check for daylight-saving transitions.`, ephemeral: true });
+  const imageUrl = interaction.fields.getTextInputValue('image_url').trim();
   if (!parseDurationMinutes(duration)) return interaction.reply({ content: 'Enter an expected duration such as `2 hours` or `90 minutes`.', ephemeral: true });
-  if (!name || !activity) return interaction.reply({ content: 'Session name and main activity are required.', ephemeral: true });
+  if (!activity) return interaction.reply({ content: 'Session activity is required.', ephemeral: true });
+  if (imageUrl) {
+    try {
+      if (new URL(imageUrl).protocol !== 'https:') throw new Error('HTTPS required');
+    } catch {
+      return interaction.reply({ content: 'The optional banner must be a valid HTTPS image URL.', ephemeral: true });
+    }
+  }
   const data = updateDraft(ctx.db, 'session_drafts', draftId, interaction.user.id, {
-    name, startLabel, scheduledStartAt, timeZone, expectedDuration: duration, activity,
-    hostId: interaction.user.id, hostName: interaction.user.username,
+    expectedDuration: duration, activity, imageUrl,
   });
   return interaction.reply({ content: `Choose the RP type for **${data.name}**.`, components: [typeSelect(`gv:rp:type:${draftId}`, 'Select RP type', RP_TYPES)], ephemeral: true });
 }
@@ -848,27 +981,28 @@ async function processEventTasks(client, db, now = new Date()) {
   const startingSessions = db.prepare(`SELECT id FROM sessions
     WHERE status = 'active' AND lifecycle_status = 'scheduled' AND started_at <= ?`).all(now.toISOString());
   for (const { id } of startingSessions) {
-    const claimed = db.prepare(`UPDATE sessions SET lifecycle_status = 'active'
+    const claimed = db.prepare(`UPDATE sessions SET lifecycle_status = 'active', started_at = ?, actual_started_at = ?
       WHERE id = ? AND status = 'active' AND lifecycle_status = 'scheduled' AND started_at <= ?`)
-      .run(id, now.toISOString());
+      .run(now.toISOString(), now.toISOString(), id, now.toISOString());
     if (!claimed.changes) continue;
     const session = getSession(db, id);
     const embed = makeEmbed(config.EMBED_COLORS.active, '🎮 GV GR RP SESSION STARTED',
       `\`${session.session_code}\` • **${session.name}**\nHost: <@${session.host_id}>\nType: ${session.rp_type}\nVoice: <#${session.voice_channel_id}>\nStarted: <t:${Math.floor(Date.parse(session.started_at) / 1000)}:F>`);
-    await updateSessionAnnouncement(client, session);
+    await updateSessionAnnouncement(client, session, db);
     await logStaffAction(client, db, { embeds: [embed] });
   }
 
   const expiredSessions = db.prepare("SELECT * FROM sessions WHERE status = 'active' AND lifecycle_status = 'active' AND expected_duration != ''").all();
   for (const session of expiredSessions) {
     const durationMinutes = parseDurationMinutes(session.expected_duration);
-    if (!durationMinutes || now.getTime() - Date.parse(session.started_at) < durationMinutes * 60_000) continue;
+    const actualStart = session.actual_started_at ?? session.started_at;
+    if (!durationMinutes || now.getTime() - Date.parse(actualStart) - (session.paused_seconds ?? 0) * 1000 < durationMinutes * 60_000) continue;
     const endedAt = now.toISOString();
-    const durationSeconds = Math.max(0, Math.floor((now.getTime() - Date.parse(session.started_at)) / 1000) - (session.paused_seconds ?? 0));
+    const durationSeconds = Math.max(0, Math.floor((now.getTime() - Date.parse(actualStart)) / 1000) - (session.paused_seconds ?? 0));
     const result = db.prepare("UPDATE sessions SET status = 'completed', lifecycle_status = 'completed', ended_at = ?, duration_seconds = ? WHERE id = ? AND status = 'active'").run(endedAt, durationSeconds, session.id);
     if (!result.changes) continue;
     const completed = getSession(db, session.id);
-    await updateSessionAnnouncement(client, completed);
+    await updateSessionAnnouncement(client, completed, db);
     const log = makeEmbed(config.EMBED_COLORS.info, '✅ GV GR RP SESSION COMPLETED', `\`${session.session_code}\` • ${session.name}\nHost: <@${session.host_id}>\nDuration: **${formatDuration(durationSeconds)}**\nParticipants: **${completed.participant_count}**\nClosed automatically at expected duration.`);
     await logStaffAction(client, db, { embeds: [log] });
   }
@@ -888,8 +1022,10 @@ module.exports = {
   handleStaffCenterControl,
   createSessionHistoryEmbed,
   openRpControls,
+  openSessionCreation,
   processEventTasks,
   parseSessionStartAt,
+  sessionEmbed,
   sessionControlComponents,
   sessionPublicComponents,
 };

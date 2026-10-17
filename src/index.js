@@ -9,6 +9,7 @@ const {
   Routes,
 } = require('discord.js');
 const config = require('../config');
+const { getConfigValue } = require('./utils/discord');
 const { createDatabase } = require('./database');
 const { commands } = require('./commands/definitions');
 const { handleButton } = require('./buttons');
@@ -16,6 +17,14 @@ const { handleClockCommand } = require('./commands/clock');
 const { handleOperationsCommand, submitSessionModal } = require('./commands/operations');
 const { handleSafetyCommand, submitReport } = require('./commands/safety');
 const { handleStaffCommand } = require('./commands/staff');
+const { applyAutomodJoin, applyAutomodMessage } = require('./events/automod');
+const {
+  handleAnnouncementButton,
+  handleAnnouncementCommand,
+  handleAnnouncementModal,
+  handleAnnouncementSelect,
+} = require('./commands/announcements');
+const { handleTicketButton, handleTicketModal, handleTicketPanelCommand } = require('./commands/tickets');
 const {
   handleOperationButton,
   handleOperationModal,
@@ -42,11 +51,11 @@ const {
   handleOwnerActionSelect,
   handleOwnerButton,
   handleOwnerConfirm,
+  handleOwnerCleanupSelect,
   handleOwnerHistorySelect,
   handleOwnerSettingsModal,
   handleOwnerSettingsSelect,
 } = require('./commands/staffManagement');
-const { logMessageDeletion } = require('./events/messageDelete');
 
 function requireSetup() {
   const missing = [];
@@ -63,6 +72,7 @@ function requireSetup() {
 
 if (requireSetup()) {
   const db = createDatabase(config.DATABASE_PATH);
+  const useMessageContent = getConfigValue(db, 'AUTOMOD_ENABLED') === true;
   const runStaffTasks = async () => {
     try {
       await processShiftReminders(client, db);
@@ -80,13 +90,15 @@ if (requireSetup()) {
       console.error('Event/session background task failed:', error);
     }
   };
-  const client = new Client({
-    intents: [
+  const intents = [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.GuildPresences,
       GatewayIntentBits.GuildMessages,
-    ],
+    ];
+  if (useMessageContent) intents.push(GatewayIntentBits.MessageContent);
+  const client = new Client({
+    intents,
     partials: [Partials.Message],
   });
   const context = { client, db, config };
@@ -138,7 +150,7 @@ if (requireSetup()) {
       }
 
       if (interaction.isChatInputCommand()) {
-        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleSafetyCommand];
+        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleAnnouncementCommand, handleTicketPanelCommand, handleOperationsCommand, handleSafetyCommand];
         for (const handler of handlers) {
           const result = await handler(interaction, context);
           if (result !== null && result !== undefined) return;
@@ -151,6 +163,8 @@ if (requireSetup()) {
       }
 
       if (interaction.isButton()) {
+        if (interaction.customId.startsWith('gv:announce:')) return handleAnnouncementButton(interaction, context);
+        if (interaction.customId.startsWith('gv:ticket:')) return handleTicketButton(interaction, context);
         if (interaction.customId.startsWith('mgmt:shift_confirm:') || interaction.customId.startsWith('mgmt:shift_cancel:')) {
           return handleManagementShiftConfirm(interaction, context);
         }
@@ -173,8 +187,14 @@ if (requireSetup()) {
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:daily:rating:')) {
         return handleDailyReportSelect(interaction, context);
       }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:announce:')) {
+        return handleAnnouncementSelect(interaction, context);
+      }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('owner:action:')) {
         return handleOwnerActionSelect(interaction, context);
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId === 'owner:cleanup:category') {
+        return handleOwnerCleanupSelect(interaction, context);
       }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('owner:settings:')) {
         return handleOwnerSettingsSelect(interaction, context);
@@ -191,7 +211,11 @@ if (requireSetup()) {
         return handleOwnerSettingsSelect(interaction, context);
       }
       if (interaction.isModalSubmit()) {
+        if (interaction.customId.startsWith('gv:announce:')) return handleAnnouncementModal(interaction, context);
+        if (interaction.customId.startsWith('gv:ticket:')) return handleTicketModal(interaction, context);
+        if (interaction.customId.startsWith('owner:automod:')) return handleOwnerSettingsModal(interaction, context);
         if (interaction.customId === 'owner:settings:timezone_modal') return handleOwnerSettingsModal(interaction, context);
+        if (interaction.customId.startsWith('owner:settings:session_modal:')) return handleOwnerSettingsModal(interaction, context);
         if (interaction.customId.startsWith('gv:event:') || interaction.customId.startsWith('gv:rp:create:')) {
           return handleOperationModal(interaction, context);
         }
@@ -213,16 +237,16 @@ if (requireSetup()) {
     }
   });
 
-  client.on(Events.MessageDelete, async (message) => {
-    try {
-      await logMessageDeletion(message, client, db);
-    } catch (error) {
-      console.error('Message deletion logging failed:', error);
-    }
-  });
-
   client.on(Events.Error, (error) => console.error('Discord client error:', error));
   client.on(Events.Warn, (message) => console.warn('Discord.js warning:', message));
+  client.on(Events.MessageCreate, async (message) => {
+    try { await applyAutomodMessage(message, client, db); }
+    catch (error) { console.error('AutoMod message handling failed:', error); }
+  });
+  client.on(Events.GuildMemberAdd, async (member) => {
+    try { await applyAutomodJoin(member, client, db); }
+    catch (error) { console.error('AutoMod join monitoring failed:', error); }
+  });
   process.on('SIGINT', closeBot);
   process.on('SIGTERM', closeBot);
   process.on('uncaughtException', (error) => {

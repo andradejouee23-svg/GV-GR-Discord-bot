@@ -30,6 +30,7 @@ const {
   getStaffStats,
   getWeekStart,
   logAudit,
+  managementClockInStaff,
   resetStaffStreak,
 } = require('../services/staffRewards');
 const { formatDuration } = require('../utils/format');
@@ -37,12 +38,14 @@ const {
   fetchGuildMember,
   getConfigValue,
   getInteractionMember,
+  getStaffRoleName,
   hasRoleGroup,
   makeEmbed,
   setConfigValue,
   unixTime,
 } = require('../utils/discord');
 const { isManagement, isOwner } = require('./staffCenter');
+const { refreshStaffPanel } = require('./clock');
 
 const pendingDuration = 5 * 60 * 1000;
 const actionLabels = {
@@ -57,7 +60,8 @@ const actionLabels = {
   remove: 'Remove From Staff',
   note: 'Add Private Note',
   reset_streak: 'Reset Staff Streak',
-  close_shift: 'Close Active Shift',
+  close_shift: 'Clock Out Manually',
+  manual_clock_in: 'Clock In Manually',
   correct_shift: 'Correct Most Recent Shift',
 };
 
@@ -84,22 +88,25 @@ function managementComponents() {
 }
 
 function ownerComponents(db) {
-  const deletionLoggingEnabled = Boolean(getConfigValue(db, 'MESSAGE_DELETE_LOGGING_ENABLED'));
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('owner:overview').setLabel('Overview').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('owner:reports').setLabel('All Daily Reports').setEmoji('📝').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('owner:audit').setLabel('Audit Log').setEmoji('📚').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('owner:activity').setLabel('Recent Activity').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('owner:toggle_message_delete_logging')
-        .setLabel(deletionLoggingEnabled ? 'Disable Delete Logs' : 'Enable Delete Logs')
-        .setEmoji('🗑️').setStyle(deletionLoggingEnabled ? ButtonStyle.Danger : ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('owner:cleanup').setLabel('Message Cleanup').setEmoji('🧹').setStyle(ButtonStyle.Danger),
     ),
     new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId('owner:select_staff').setPlaceholder('Select a staff member for owner actions'),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('owner:settings').setLabel('Server Settings').setEmoji('⚙️').setStyle(ButtonStyle.Primary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('owner:automod:core').setLabel('AutoMod Thresholds').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('owner:automod:filters').setLabel('AutoMod Filters').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('owner:automod:exemptions').setLabel('AutoMod Exemptions').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('owner:automod:escalation').setLabel('AutoMod Escalation').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -111,12 +118,37 @@ const ownerChannelSettings = {
   REPORT_CHANNEL_ID: 'Private player reports',
   SESSION_CHANNEL_ID: 'RP session announcements',
   EVENT_CHANNEL_ID: 'Event announcements',
+  TICKET_TRANSCRIPT_CHANNEL_ID: 'Private ticket transcripts',
+};
+
+const ownerTicketCategories = {
+  TICKET_SUPPORT_CATEGORY_ID: 'General support tickets category',
+  TICKET_APPLICATION_CATEGORY_ID: 'Staff applications category',
+  TICKET_RECRUITING_CATEGORY_ID: 'Admin testing and recruiting category',
 };
 
 const ownerRoleGroups = {
   staff: 'Staff roles',
   management: 'Management roles',
   owners: 'Owner roles',
+  admin_recruiting: 'Admin testing/recruiting access role',
+};
+
+function configuredRoleGroup(db, group) {
+  const saved = getConfigValue(db, `role_${group}`);
+  if (Array.isArray(saved)) return saved;
+  if (group === 'admin_recruiting') {
+    const roleId = getConfigValue(db, 'ADMIN_RECRUITING_ROLE_ID');
+    return /^\d{17,20}$/.test(roleId ?? '') ? [roleId] : [];
+  }
+  const key = { staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS' }[group];
+  return getConfigValue(db, key) ?? [];
+}
+
+const ownerSessionSettings = {
+  SESSION_JOIN_CODE: { label: 'Greenville custom-server join code', maxLength: 80 },
+  SESSION_JOIN_URL: { label: 'Optional Greenville join link', maxLength: 500 },
+  SESSION_DEFAULT_IMAGE_URL: { label: 'Default session banner URL', maxLength: 500 },
 };
 
 function ownerSettingsEmbed(db) {
@@ -125,14 +157,19 @@ function ownerSettingsEmbed(db) {
     return `**${label}:** ${/^\d{17,20}$/.test(channelId ?? '') ? `<#${channelId}>` : 'Not configured'}`;
   });
   const roleLines = Object.entries(ownerRoleGroups).map(([group, label]) => {
-    const roleIds = getConfigValue(db, `role_${group}`) ?? getConfigValue(db, {
-      staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS',
-    }[group]) ?? [];
+    const roleIds = configuredRoleGroup(db, group);
     return `**${label}:** ${roleIds.length ? roleIds.map((roleId) => `<@&${roleId}>`).join(', ') : 'None configured'}`;
   });
+  const categoryLines = Object.entries(ownerTicketCategories).map(([key, label]) => {
+    const categoryId = getConfigValue(db, key);
+    return `**${label}:** ${/^\d{17,20}$/.test(categoryId ?? '') ? `<#${categoryId}>` : 'Not configured'}`;
+  });
   const zone = getConfigValue(db, 'TIME_ZONE') ?? config.TIME_ZONE ?? 'UTC';
+  const joinCodeStatus = getConfigValue(db, 'SESSION_JOIN_CODE') ? 'Configured' : 'Not configured';
+  const automodStatus = getConfigValue(db, 'AUTOMOD_ENABLED') ? 'Enabled' : 'Disabled';
+  const automodMode = getConfigValue(db, 'AUTOMOD_MODE') ?? config.AUTOMOD_MODE;
   return makeEmbed(config.EMBED_COLORS.management, '⚙️ GV GR SERVER SETTINGS',
-    `**Timezone:** \`${zone}\`\n\n${channelLines.join('\n')}\n\n${roleLines.join('\n')}\n\n**Message deletion logs:** ${getConfigValue(db, 'MESSAGE_DELETE_LOGGING_ENABLED') ? 'Enabled' : 'Disabled'}`)
+    `**Timezone:** \`${zone}\`\n**Session join code:** ${joinCodeStatus}\n**AutoMod:** ${automodStatus} (${automodMode} mode)\n\n${channelLines.join('\n')}\n\n${categoryLines.join('\n')}\n\n${roleLines.join('\n')}\n\n**Message deletion logs:** Disabled`)
     .setFooter({ text: 'Changes are saved to SQLite and audited.' });
 }
 
@@ -149,6 +186,16 @@ function ownerSettingsComponents() {
         .addOptions(Object.entries(ownerRoleGroups).map(([value, label]) => ({ label, value }))),
     ),
     new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('owner:settings:categories')
+        .setPlaceholder('Configure private ticket categories')
+        .addOptions(Object.entries(ownerTicketCategories).map(([value, label]) => ({ label, value }))),
+    ),
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('owner:settings:session')
+        .setPlaceholder('Configure session join details')
+        .addOptions(Object.entries(ownerSessionSettings).map(([value, setting]) => ({ label: setting.label, value }))),
+    ),
+    new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('owner:settings:timezone').setLabel('Set Timezone').setEmoji('🕒').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('owner:overview').setLabel('Back to Owner Dashboard').setStyle(ButtonStyle.Secondary),
     ),
@@ -161,6 +208,51 @@ function createOwnerTimezoneModal(currentTimezone) {
       .setCustomId('timezone').setLabel('IANA timezone (example: America/Chicago)')
       .setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true)
       .setValue(currentTimezone)));
+}
+
+function createOwnerSessionSettingModal(setting, currentValue = '') {
+  const definition = ownerSessionSettings[setting];
+  return new ModalBuilder().setCustomId(`owner:settings:session_modal:${setting}`).setTitle(definition.label.slice(0, 45))
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder()
+      .setCustomId('value').setLabel(definition.label).setStyle(TextInputStyle.Short)
+      .setMaxLength(definition.maxLength).setRequired(false).setValue(currentValue.slice(0, definition.maxLength))));
+}
+
+function createAutomodModal(stage, db) {
+  const field = (id, label, key, max = 4) => new ActionRowBuilder().addComponents(new TextInputBuilder()
+    .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setMaxLength(max).setRequired(true)
+    .setValue(String(getConfigValue(db, key) ?? config[key])));
+  const title = { core: 'AutoMod Thresholds', filters: 'AutoMod Filters', exemptions: 'AutoMod Exemptions', escalation: 'AutoMod Escalation' }[stage];
+  const modal = new ModalBuilder().setCustomId(`owner:automod:${stage}_modal`).setTitle(title);
+  if (stage === 'core') {
+    return modal.addComponents(
+      field('enabled', 'Enabled (true/false)', 'AUTOMOD_ENABLED'),
+      field('mode', 'Mode: log, delete, or timeout', 'AUTOMOD_MODE', 10),
+      field('spam_threshold', 'Messages per spam window (3-100)', 'AUTOMOD_SPAM_THRESHOLD'),
+      field('spam_window', 'Spam window seconds (3-300)', 'AUTOMOD_SPAM_WINDOW_SECONDS'),
+      field('repeat_threshold', 'Repeated message threshold (2-20)', 'AUTOMOD_REPEAT_THRESHOLD'),
+    );
+  }
+  if (stage === 'filters') {
+    return modal.addComponents(
+      field('mention_limit', 'Mention limit (2-100)', 'AUTOMOD_MENTION_LIMIT'),
+      field('filter_links', 'Filter non-allowlisted links (true/false)', 'AUTOMOD_FILTER_LINKS'),
+      field('filter_invites', 'Filter Discord invites (true/false)', 'AUTOMOD_FILTER_INVITES'),
+      field('raid_threshold', 'Join alert threshold (3-500)', 'AUTOMOD_RAID_THRESHOLD'),
+      field('raid_window', 'Join alert window seconds (5-600)', 'AUTOMOD_RAID_WINDOW_SECONDS'),
+    );
+  }
+  if (stage === 'exemptions') {
+    return modal.addComponents(
+      field('role_ids', 'Exempt role IDs, comma-separated', 'AUTOMOD_EXEMPT_ROLE_IDS', 1000),
+      field('channel_ids', 'Exempt channel IDs, comma-separated', 'AUTOMOD_EXEMPT_CHANNEL_IDS', 1000),
+      field('domains', 'Trusted domains, comma-separated', 'AUTOMOD_ALLOWLISTED_DOMAINS', 1000),
+    );
+  }
+  return modal.addComponents(
+    field('timeout_minutes', 'Timeout minutes (1-60)', 'AUTOMOD_TIMEOUT_MINUTES'),
+    field('timeout_after', 'Incidents before timeout (1-20)', 'AUTOMOD_TIMEOUT_AFTER_INCIDENTS'),
+  );
 }
 
 function rosterEmbed(db, owner = false) {
@@ -176,7 +268,7 @@ function rosterEmbed(db, owner = false) {
   const weekRanks = leaderboard.slice(0, 5).map((row, index) => `${index + 1}. <@${row.user_id}> • ${row.points} points`).join('\n') || 'No weekly points yet.';
   const embed = makeEmbed(owner ? config.EMBED_COLORS.management : config.EMBED_COLORS.info,
     owner ? '👑 GV GR Owner Dashboard' : '🛡️ GV GR Management Dashboard',
-    `Staff on duty: **${active.length}**\nStaff in database: **${roster.length}**\nWeekly goal: **${config.WEEKLY_GOAL_HOURS} hours**${owner ? `\nMessage deletion logs: **${getConfigValue(db, 'MESSAGE_DELETE_LOGGING_ENABLED') ? 'Enabled' : 'Disabled'}**` : ''}\n\n${body.join('\n\n') || 'No staff records yet.'}`)
+    `Staff on duty: **${active.length}**\nStaff in database: **${roster.length}**\nWeekly goal: **${config.WEEKLY_GOAL_HOURS} hours**${owner ? '\nMessage deletion logs: **Disabled**' : ''}\n\n${body.join('\n\n') || 'No staff records yet.'}`)
     .addFields({ name: 'Weekly Points Leaders', value: weekRanks });
   if (roster.length > 18) embed.setFooter({ text: `Showing 18 of ${roster.length} staff records. Select a member for full history.` });
   return embed;
@@ -233,7 +325,9 @@ function staffHistoryEmbed(db, userId) {
   function managementShiftActions(db, userId) {
     const choices = [];
     if (db.prepare("SELECT id FROM shifts WHERE user_id = ? AND status = 'active'").get(userId)) {
-      choices.push({ label: 'Close Active Shift', value: 'close_shift', emoji: '🔴' });
+      choices.push({ label: 'Clock Out Manually', value: 'close_shift', emoji: '🔴' });
+    } else {
+      choices.push({ label: 'Clock In Manually', value: 'manual_clock_in', emoji: '🟢' });
     }
     if (db.prepare('SELECT id FROM shifts WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(userId)) {
       choices.push({ label: 'Correct Most Recent Shift', value: 'correct_shift', emoji: '🕒' });
@@ -241,7 +335,7 @@ function staffHistoryEmbed(db, userId) {
     if (!choices.length) return [];
     return [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
       .setCustomId(`mgmt:shift_action:${userId}`)
-      .setPlaceholder('Close or correct this staff member’s shift')
+      .setPlaceholder('Manually clock or correct this staff member’s shift')
       .addOptions(choices))];
   }
 
@@ -298,7 +392,7 @@ async function handleManagementShiftActionSelect(interaction, ctx) {
   if (!await requireManagerInteraction(interaction, ctx)) return;
   const userId = interaction.customId.split(':').at(-1);
   const action = interaction.values[0];
-  if (!['close_shift', 'correct_shift'].includes(action)
+  if (!['close_shift', 'correct_shift', 'manual_clock_in'].includes(action)
     || !ctx.db.prepare('SELECT user_id FROM staff WHERE user_id = ?').get(userId)) {
     return interaction.reply({ content: 'Invalid staff shift action.', ephemeral: true });
   }
@@ -310,7 +404,7 @@ async function handleManagementShiftActionSelect(interaction, ctx) {
   }
   const modal = new ModalBuilder()
     .setCustomId(`mgmt:shift_modal:${userId}:${action}`)
-    .setTitle(action === 'close_shift' ? 'Close Active Staff Shift' : 'Correct Staff Shift');
+    .setTitle(action === 'close_shift' ? 'Manual Staff Clock-Out' : action === 'manual_clock_in' ? 'Manual Staff Clock-In' : 'Correct Staff Shift');
   if (action === 'correct_shift') {
     modal.addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('started_at').setLabel('Correct start time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true)),
@@ -319,7 +413,7 @@ async function handleManagementShiftActionSelect(interaction, ctx) {
     );
   } else {
     modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder()
-      .setCustomId('reason').setLabel('Reason for closing').setStyle(TextInputStyle.Paragraph)
+      .setCustomId('reason').setLabel(`Reason for ${action === 'manual_clock_in' ? 'clock-in' : 'clock-out'}`).setStyle(TextInputStyle.Paragraph)
       .setMaxLength(1000).setRequired(true)));
   }
   return interaction.showModal(modal);
@@ -328,7 +422,7 @@ async function handleManagementShiftActionSelect(interaction, ctx) {
 async function handleManagementShiftModal(interaction, ctx) {
   const [, , userId, action] = interaction.customId.split(':');
   if (!await requireManagerInteraction(interaction, ctx)) return;
-  if (!['close_shift', 'correct_shift'].includes(action)
+  if (!['close_shift', 'correct_shift', 'manual_clock_in'].includes(action)
     || !ctx.db.prepare('SELECT user_id FROM staff WHERE user_id = ?').get(userId)) {
     return interaction.reply({ content: 'Invalid staff shift action.', ephemeral: true });
   }
@@ -362,7 +456,7 @@ async function handleManagementShiftConfirm(interaction, ctx) {
   if (!await requireManagerInteraction(interaction, ctx)) return;
   const [, verb, actionId] = interaction.customId.split(':');
   const pending = ctx.db.prepare('SELECT * FROM staff_pending_actions WHERE action_id = ?').get(actionId);
-  if (!pending || pending.actor_id !== interaction.user.id || !['close_shift', 'correct_shift'].includes(pending.action)) {
+  if (!pending || pending.actor_id !== interaction.user.id || !['close_shift', 'correct_shift', 'manual_clock_in'].includes(pending.action)) {
     return interaction.reply({ content: 'This shift confirmation is missing or belongs to another manager.', ephemeral: true });
   }
   if (pending.status !== 'pending') return interaction.reply({ content: 'This shift action was already processed.', ephemeral: true });
@@ -375,12 +469,32 @@ async function handleManagementShiftConfirm(interaction, ctx) {
     return interaction.update({ content: 'Shift action cancelled.', embeds: [], components: [] });
   }
 
+  await interaction.deferUpdate();
+
+  let targetMember;
+  let targetRoleName;
+  if (pending.action === 'manual_clock_in') {
+    targetMember = await fetchGuildMember(interaction.guild, pending.target_id);
+    targetRoleName = targetMember && getStaffRoleName(targetMember, ctx.db);
+    if (!targetMember || !targetRoleName) {
+      return interaction.editReply({ content: 'Manual clock-in requires the selected member to have a configured staff role.', embeds: [], components: [] });
+    }
+  }
+
   try {
     ctx.db.transaction(() => {
       const claimed = ctx.db.prepare("UPDATE staff_pending_actions SET status = 'confirmed' WHERE action_id = ? AND status = 'pending'").run(actionId);
       if (!claimed.changes) throw new Error('This shift action has already been processed.');
       const data = JSON.parse(pending.data_json);
-      if (pending.action === 'close_shift') {
+      if (pending.action === 'manual_clock_in') {
+        const result = managementClockInStaff(ctx.db, {
+          member: { id: pending.target_id, username: targetMember.user.username, roleName: targetRoleName },
+          actorId: interaction.user.id,
+          reason: pending.reason,
+        });
+        if (result.alreadyOnDuty) throw new Error('This staff member is already on duty.');
+        if (result.unavailable) throw new Error(`This staff member cannot clock in while their status is ${result.status}.`);
+      } else if (pending.action === 'close_shift') {
         const shift = ctx.db.prepare("SELECT id FROM shifts WHERE user_id = ? AND status = 'active'").get(pending.target_id);
         if (!shift) throw new Error('The active shift has already ended.');
         closeShiftByManagement(ctx.db, { shiftId: shift.id, actorId: interaction.user.id, reason: pending.reason });
@@ -393,10 +507,12 @@ async function handleManagementShiftConfirm(interaction, ctx) {
         });
       }
     })();
-    return interaction.update({ content: 'The shift change was applied and saved to the audit log.', embeds: [], components: [] });
+    const response = await interaction.editReply({ content: 'The shift change was applied and saved to the audit log.', embeds: [], components: [] });
+    await refreshStaffPanel(interaction.client, interaction.guild, ctx.db);
+    return response;
   } catch (error) {
     console.error('Management shift action failed:', error);
-    return interaction.reply({ content: `Shift change was not applied: ${error.message}`, ephemeral: true });
+    return interaction.editReply({ content: `Shift change was not applied: ${error.message}`, embeds: [], components: [] });
   }
 }
 
@@ -618,8 +734,7 @@ async function handleOwnerSettingsSelect(interaction, ctx) {
       return interaction.reply({ content: 'That role group is not supported.', ephemeral: true });
     }
     const settingKey = `role_${group}`;
-    const fallbackKey = { staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS' }[group];
-    const current = getConfigValue(ctx.db, settingKey) ?? getConfigValue(ctx.db, fallbackKey) ?? [];
+    const current = configuredRoleGroup(ctx.db, group);
     return interaction.update({
       embeds: [makeEmbed(config.EMBED_COLORS.management, `⚙️ ${ownerRoleGroups[group]}`,
         `Current roles: ${current.length ? current.map((roleId) => `<@&${roleId}>`).join(', ') : 'None'}\nSelect all roles that should belong to this group. This replaces the current group.`)],
@@ -627,11 +742,38 @@ async function handleOwnerSettingsSelect(interaction, ctx) {
         new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder()
           .setCustomId(`owner:settings:saveroles:${group}`)
           .setPlaceholder(`Select ${ownerRoleGroups[group].toLowerCase()}`)
-          .setMinValues(0).setMaxValues(25)),
+          .setMinValues(0).setMaxValues(group === 'admin_recruiting' ? 1 : 25)),
         new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('owner:settings')
           .setLabel('Back to Server Settings').setStyle(ButtonStyle.Secondary)),
       ],
     });
+  }
+
+  if (interaction.isStringSelectMenu() && action === 'categories') {
+    const setting = interaction.values[0];
+    if (!Object.hasOwn(ownerTicketCategories, setting)) {
+      return interaction.reply({ content: 'That ticket category setting is not supported.', ephemeral: true });
+    }
+    return interaction.update({
+      embeds: [makeEmbed(config.EMBED_COLORS.management, ownerTicketCategories[setting],
+        `Current category: ${/^\d{17,20}$/.test(getConfigValue(ctx.db, setting) ?? '') ? `<#${getConfigValue(ctx.db, setting)}>` : 'Not configured'}\nSelect a private Discord category.`)],
+      components: [
+        new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder()
+          .setCustomId(`owner:settings:setcategory:${setting}`)
+          .setPlaceholder('Select a category')
+          .setChannelTypes(ChannelType.GuildCategory)),
+        new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('owner:settings')
+          .setLabel('Back to Server Settings').setStyle(ButtonStyle.Secondary)),
+      ],
+    });
+  }
+
+  if (interaction.isStringSelectMenu() && action === 'session') {
+    const setting = interaction.values[0];
+    if (!Object.hasOwn(ownerSessionSettings, setting)) {
+      return interaction.reply({ content: 'That session setting is not supported.', ephemeral: true });
+    }
+    return interaction.showModal(createOwnerSessionSettingModal(setting, getConfigValue(ctx.db, setting) ?? ''));
   }
 
   if (interaction.isChannelSelectMenu() && action === 'setchannel') {
@@ -650,15 +792,33 @@ async function handleOwnerSettingsSelect(interaction, ctx) {
     return interaction.update({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents() });
   }
 
+  if (interaction.isChannelSelectMenu() && action === 'setcategory') {
+    const setting = target;
+    if (!Object.hasOwn(ownerTicketCategories, setting)) {
+      return interaction.reply({ content: 'That ticket category setting is not supported.', ephemeral: true });
+    }
+    const categoryId = interaction.values[0];
+    const previous = getConfigValue(ctx.db, setting);
+    setConfigValue(ctx.db, setting, categoryId);
+    logAudit(ctx.db, {
+      action: 'configuration_change', targetId: interaction.guild.id, actorId: interaction.user.id,
+      reason: `Updated ${ownerTicketCategories[setting]}`, previousValue: previous ?? 'not configured', newValue: categoryId,
+      details: { setting },
+    });
+    return interaction.update({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents() });
+  }
+
   if (interaction.isRoleSelectMenu() && action === 'saveroles') {
     const group = target;
     if (!Object.hasOwn(ownerRoleGroups, group)) {
       return interaction.reply({ content: 'That role group is not supported.', ephemeral: true });
     }
     const settingKey = `role_${group}`;
-    const fallbackKey = { staff: 'STAFF_ROLE_IDS', management: 'MANAGEMENT_ROLE_IDS', owners: 'OWNER_ROLE_IDS' }[group];
-    const previous = getConfigValue(ctx.db, settingKey) ?? getConfigValue(ctx.db, fallbackKey) ?? [];
+    const previous = configuredRoleGroup(ctx.db, group);
     const updated = [...new Set(interaction.values)];
+    if (group === 'admin_recruiting' && updated.length > 1) {
+      return interaction.reply({ content: 'Admin testing/recruiting access must use exactly one role.', ephemeral: true });
+    }
     setConfigValue(ctx.db, settingKey, updated);
     logAudit(ctx.db, {
       action: 'permission_change', targetId: interaction.guild.id, actorId: interaction.user.id,
@@ -672,8 +832,111 @@ async function handleOwnerSettingsSelect(interaction, ctx) {
 }
 
 async function handleOwnerSettingsModal(interaction, ctx) {
-  if (interaction.customId !== 'owner:settings:timezone_modal') return null;
+  const sessionSetting = interaction.customId.startsWith('owner:settings:session_modal:')
+    ? interaction.customId.split(':').at(-1) : null;
+  const automodStage = interaction.customId.startsWith('owner:automod:')
+    ? interaction.customId.split(':').at(-1).replace(/_modal$/, '') : null;
+  if (interaction.customId !== 'owner:settings:timezone_modal' && !sessionSetting && !automodStage) return null;
   if (!await requireManagerInteraction(interaction, ctx, true)) return;
+  if (sessionSetting) {
+    const definition = ownerSessionSettings[sessionSetting];
+    if (!definition) return interaction.reply({ content: 'That session setting is not supported.', ephemeral: true });
+    let value = interaction.fields.getTextInputValue('value').trim();
+    if (sessionSetting === 'SESSION_JOIN_CODE' && /[\r\n`]/.test(value)) {
+      return interaction.reply({ content: 'The join code must be one line and cannot contain code-fence characters.', ephemeral: true });
+    }
+    if (sessionSetting !== 'SESSION_JOIN_CODE' && value) {
+      try {
+        const url = new URL(value);
+        if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) throw new Error('Invalid HTTPS URL');
+        value = url.toString();
+      } catch {
+        return interaction.reply({ content: 'Enter a valid HTTPS URL, or leave the field blank to clear it.', ephemeral: true });
+      }
+    }
+    const previous = getConfigValue(ctx.db, sessionSetting) ?? '';
+    setConfigValue(ctx.db, sessionSetting, value);
+    logAudit(ctx.db, {
+      action: 'configuration_change', targetId: interaction.guild.id, actorId: interaction.user.id,
+      reason: `Updated ${definition.label}`, previousValue: previous || 'not configured', newValue: value || 'not configured',
+      details: { setting: sessionSetting },
+    });
+    return interaction.reply({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents(), ephemeral: true });
+  }
+  if (automodStage) {
+    const read = (field) => interaction.fields.getTextInputValue(field).trim();
+    const bool = (value, label) => {
+      if (!['true', 'false'].includes(value.toLowerCase())) throw new Error(`${label} must be true or false.`);
+      return value.toLowerCase() === 'true';
+    };
+    const integer = (value, label, minimum, maximum) => {
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+        throw new Error(`${label} must be a whole number from ${minimum} to ${maximum}.`);
+      }
+      return parsed;
+    };
+    let updates;
+    try {
+      if (automodStage === 'core') {
+        const mode = read('mode').toLowerCase();
+        if (!['log', 'warn', 'delete', 'timeout'].includes(mode)) throw new Error('Mode must be log, warn, delete, or timeout.');
+        updates = {
+          AUTOMOD_ENABLED: bool(read('enabled'), 'Enabled'),
+          AUTOMOD_MODE: mode,
+          AUTOMOD_SPAM_THRESHOLD: integer(read('spam_threshold'), 'Spam threshold', 3, 100),
+          AUTOMOD_SPAM_WINDOW_SECONDS: integer(read('spam_window'), 'Spam window', 3, 300),
+          AUTOMOD_REPEAT_THRESHOLD: integer(read('repeat_threshold'), 'Repeat threshold', 2, 20),
+        };
+      } else if (automodStage === 'filters') {
+        updates = {
+          AUTOMOD_MENTION_LIMIT: integer(read('mention_limit'), 'Mention limit', 2, 100),
+          AUTOMOD_FILTER_LINKS: bool(read('filter_links'), 'Link filter'),
+          AUTOMOD_FILTER_INVITES: bool(read('filter_invites'), 'Invite filter'),
+          AUTOMOD_RAID_THRESHOLD: integer(read('raid_threshold'), 'Join alert threshold', 3, 500),
+          AUTOMOD_RAID_WINDOW_SECONDS: integer(read('raid_window'), 'Join alert window', 5, 600),
+        };
+      } else if (automodStage === 'exemptions') {
+        const parseIds = (value, label) => {
+          const ids = value.split(/[\s,]+/).filter(Boolean);
+          if (ids.length > 25 || ids.some((id) => !/^\d{17,20}$/.test(id))) throw new Error(`${label} must contain valid Discord IDs (up to 25).`);
+          return [...new Set(ids)];
+        };
+        const domains = read('domains').split(/[\s,]+/).filter(Boolean).map((domain) => domain.toLowerCase());
+        if (domains.length > 25 || domains.some((domain) => !/^(?:\*\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}$/.test(domain))) {
+          throw new Error('Trusted domains must be hostnames such as `example.com` (up to 25).');
+        }
+        updates = {
+          AUTOMOD_EXEMPT_ROLE_IDS: parseIds(read('role_ids'), 'Exempt roles'),
+          AUTOMOD_EXEMPT_CHANNEL_IDS: parseIds(read('channel_ids'), 'Exempt channels'),
+          AUTOMOD_ALLOWLISTED_DOMAINS: [...new Set(domains)],
+        };
+      } else if (automodStage === 'escalation') {
+        updates = {
+          AUTOMOD_TIMEOUT_MINUTES: integer(read('timeout_minutes'), 'Timeout duration', 1, 60),
+          AUTOMOD_TIMEOUT_AFTER_INCIDENTS: integer(read('timeout_after'), 'Incidents before timeout', 1, 20),
+        };
+      } else {
+        return interaction.reply({ content: 'That AutoMod settings form is not supported.', ephemeral: true });
+      }
+    } catch (error) {
+      return interaction.reply({ content: error.message, ephemeral: true });
+    }
+    const previous = Object.fromEntries(Object.keys(updates).map((key) => [key, getConfigValue(ctx.db, key)]));
+    ctx.db.transaction(() => {
+      for (const [key, value] of Object.entries(updates)) setConfigValue(ctx.db, key, value);
+      logAudit(ctx.db, {
+        action: 'configuration_change', targetId: interaction.guild.id, actorId: interaction.user.id,
+        reason: `Updated AutoMod ${automodStage} settings`,
+        previousValue: JSON.stringify(previous), newValue: JSON.stringify(updates),
+        details: { settings: Object.keys(updates) },
+      });
+    })();
+    const content = updates.AUTOMOD_ENABLED === true
+      ? 'AutoMod settings saved. Enable the Message Content privileged intent in Discord Developer Portal, then restart before relying on text/link filters. No bans are automated.'
+      : 'AutoMod settings saved. No message monitoring is active while AutoMod is disabled.';
+    return interaction.reply({ content, embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents(), ephemeral: true });
+  }
   const timezone = interaction.fields.getTextInputValue('timezone').trim();
   const zone = DateTime.now().setZone(timezone);
   if (!zone.isValid || !zone.zoneName) {
@@ -692,22 +955,32 @@ async function handleOwnerSettingsModal(interaction, ctx) {
 async function handleOwnerButton(interaction, ctx) {
   if (!interaction.customId.startsWith('owner:')) return null;
   if (!await requireManagerInteraction(interaction, ctx, true)) return;
+  if (interaction.customId.startsWith('owner:automod:')) {
+    const stage = interaction.customId.split(':').at(-1);
+    if (!['core', 'filters', 'exemptions', 'escalation'].includes(stage)) {
+      return interaction.reply({ content: 'That AutoMod settings action is not supported.', ephemeral: true });
+    }
+    return interaction.showModal(createAutomodModal(stage, ctx.db));
+  }
   if (interaction.customId === 'owner:toggle_message_delete_logging') {
-    const previous = Boolean(getConfigValue(ctx.db, 'MESSAGE_DELETE_LOGGING_ENABLED'));
-    const enabled = !previous;
-    setConfigValue(ctx.db, 'MESSAGE_DELETE_LOGGING_ENABLED', enabled);
-    logAudit(ctx.db, {
-      action: 'message_delete_logging_toggle',
-      targetId: interaction.user.id,
-      actorId: interaction.user.id,
-      reason: `Message deletion logging ${enabled ? 'enabled' : 'disabled'} from the Owner Dashboard.`,
-      previousValue: previous ? 'enabled' : 'disabled',
-      newValue: enabled ? 'enabled' : 'disabled',
-    });
     return interaction.update({
+      content: 'Message deletion logging is disabled and can no longer be enabled here.',
       embeds: [rosterEmbed(ctx.db, true)],
       components: ownerComponents(ctx.db),
     });
+  }
+  if (interaction.customId === 'owner:cleanup') {
+    const selector = new StringSelectMenuBuilder().setCustomId('owner:cleanup:category')
+      .setPlaceholder('Select a safe cleanup category')
+      .addOptions({ label: 'Completed session announcements older than 14 days', value: 'completed_sessions' });
+    return interaction.reply({
+      content: 'Cleanup only includes completed session announcements tracked by the bot. Panels, active sessions, session records, and untracked messages are excluded.',
+      components: [new ActionRowBuilder().addComponents(selector)], ephemeral: true,
+    });
+  }
+  if (interaction.customId.startsWith('owner:cleanup:confirm:')
+    || interaction.customId.startsWith('owner:cleanup:cancel:')) {
+    return handleOwnerCleanupConfirmation(interaction, ctx);
   }
   switch (interaction.customId) {
     case 'owner:settings': return interaction.update({ embeds: [ownerSettingsEmbed(ctx.db)], components: ownerSettingsComponents() });
@@ -718,6 +991,92 @@ async function handleOwnerButton(interaction, ctx) {
     case 'owner:activity': return interaction.update({ embeds: [activityEmbed(ctx.db)], components: ownerComponents(ctx.db) });
     default: return null;
   }
+}
+
+async function handleOwnerCleanupSelect(interaction, ctx) {
+  if (interaction.customId !== 'owner:cleanup:category') return null;
+  if (!await requireManagerInteraction(interaction, ctx, true)) return;
+  if (interaction.values[0] !== 'completed_sessions') {
+    return interaction.reply({ content: 'That cleanup category is not supported.', ephemeral: true });
+  }
+  const cutoff = new Date(Date.now() - 14 * 86400_000).toISOString();
+  const items = ctx.db.prepare(`SELECT id, session_code, name, channel_id, message_id, ended_at
+    FROM sessions WHERE status = 'completed' AND lifecycle_status = 'completed'
+      AND ended_at <= ? AND channel_id IS NOT NULL AND message_id IS NOT NULL
+    ORDER BY ended_at ASC`).all(cutoff);
+  if (!items.length) {
+    return interaction.reply({ content: 'No completed session announcements older than 14 days are safely identified. No messages were changed.', ephemeral: true });
+  }
+  const previewId = randomUUID();
+  const now = new Date().toISOString();
+  ctx.db.prepare(`INSERT INTO message_cleanup_previews (preview_id, owner_id, category, items_json, expires_at, created_at)
+    VALUES (?, ?, 'completed_sessions', ?, ?, ?)`)
+    .run(previewId, interaction.user.id, JSON.stringify(items), new Date(Date.now() + pendingDuration).toISOString(), now);
+  const previewLines = items.slice(0, 8).map((item) => `• ${item.session_code || `Session #${item.id}`} ${item.name} • <#${item.channel_id}>`).join('\n');
+  const rowButtons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`owner:cleanup:confirm:${previewId}`).setLabel(`Delete ${items.length} tracked posts`).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`owner:cleanup:cancel:${previewId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return interaction.reply({
+    content: `Preview: **${items.length}** completed session announcement(s), all older than 14 days. Only stored message IDs authored by this bot will be deleted. Session records and history are preserved.\n\n${previewLines}${items.length > 8 ? `\n…and ${items.length - 8} more.` : ''}\n\nThis preview expires in 5 minutes.`,
+    components: [rowButtons], ephemeral: true,
+  });
+}
+
+async function handleOwnerCleanupConfirmation(interaction, ctx) {
+  const [, , action, previewId] = interaction.customId.split(':');
+  const preview = ctx.db.prepare('SELECT * FROM message_cleanup_previews WHERE preview_id = ?').get(previewId);
+  if (!preview || preview.owner_id !== interaction.user.id || preview.category !== 'completed_sessions') {
+    return interaction.reply({ content: 'This cleanup preview is missing or belongs to another Owner.', ephemeral: true });
+  }
+  if (preview.status !== 'pending') return interaction.reply({ content: 'This cleanup preview was already processed.', ephemeral: true });
+  if (preview.expires_at <= new Date().toISOString()) {
+    ctx.db.prepare("UPDATE message_cleanup_previews SET status = 'expired' WHERE preview_id = ? AND status = 'pending'").run(previewId);
+    return interaction.reply({ content: 'This cleanup preview expired. Create a new preview to continue.', ephemeral: true });
+  }
+  if (action === 'cancel') {
+    ctx.db.prepare("UPDATE message_cleanup_previews SET status = 'cancelled' WHERE preview_id = ? AND status = 'pending'").run(previewId);
+    return interaction.update({ content: 'Cleanup cancelled. No messages were changed.', embeds: [], components: [] });
+  }
+  if (action !== 'confirm') return interaction.reply({ content: 'That cleanup action is not supported.', ephemeral: true });
+
+  const claimed = ctx.db.prepare("UPDATE message_cleanup_previews SET status = 'processing' WHERE preview_id = ? AND status = 'pending'").run(previewId);
+  if (!claimed.changes) return interaction.reply({ content: 'This cleanup preview was already claimed.', ephemeral: true });
+  await interaction.deferUpdate();
+
+  const items = JSON.parse(preview.items_json);
+  const deletedMessageIds = [];
+  const skipped = [];
+  for (const item of items) {
+    const current = ctx.db.prepare(`SELECT status, lifecycle_status, channel_id, message_id FROM sessions WHERE id = ?`).get(item.id);
+    if (!current || current.status !== 'completed' || current.lifecycle_status !== 'completed'
+      || current.channel_id !== item.channel_id || current.message_id !== item.message_id) {
+      skipped.push({ messageId: item.message_id, reason: 'session state or message reference changed' });
+      continue;
+    }
+    try {
+      const channel = await interaction.client.channels.fetch(item.channel_id);
+      const message = channel?.isTextBased() ? await channel.messages.fetch(item.message_id) : null;
+      if (!message || message.author?.id !== interaction.client.user.id) {
+        skipped.push({ messageId: item.message_id, reason: 'message missing or not authored by this bot' });
+        continue;
+      }
+      await message.delete();
+      deletedMessageIds.push(item.message_id);
+    } catch (error) {
+      skipped.push({ messageId: item.message_id, reason: error.message });
+    }
+  }
+
+  ctx.db.transaction(() => {
+    ctx.db.prepare("UPDATE message_cleanup_previews SET status = 'completed' WHERE preview_id = ? AND status = 'processing'").run(previewId);
+    logAudit(ctx.db, {
+      action: 'message_cleanup', targetId: interaction.guild.id, actorId: interaction.user.id,
+      reason: 'Owner-approved cleanup of completed session announcements',
+      details: { category: preview.category, deletedMessageIds, skipped },
+    });
+  })();
+  return interaction.editReply({ content: `Cleanup finished: **${deletedMessageIds.length}** message(s) deleted; **${skipped.length}** skipped. Session records and history were preserved.`, embeds: [], components: [] });
 }
 
 async function handleOwnerHistorySelect(interaction, ctx) {
@@ -746,6 +1105,7 @@ module.exports = {
   handleOwnerActionModal,
   handleOwnerActionSelect,
   handleOwnerButton,
+  handleOwnerCleanupSelect,
   handleOwnerConfirm,
   handleOwnerHistorySelect,
   handleOwnerSettingsSelect,

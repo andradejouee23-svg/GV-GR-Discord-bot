@@ -1,4 +1,10 @@
+const { randomUUID } = require('node:crypto');
 const config = require('../../config');
+
+const featureCooldowns = {
+  shift_reminder: 30 * 60_000,
+  daily_report: 30 * 60_000,
+};
 
 function getWeekStart(date = new Date()) {
   const start = new Date(date);
@@ -62,25 +68,44 @@ function checkInStaff(db, member, now = new Date().toISOString()) {
 
 function checkOutStaff(db, userId, now = new Date().toISOString()) {
   return db.transaction(() => {
-    const shift = db.prepare("SELECT * FROM shifts WHERE user_id = ? AND status = 'active'").get(userId);
-    if (!shift) return null;
+    return completeActiveShift(db, userId, now);
+  })();
+}
 
-    const durationSeconds = Math.max(0, Math.floor((Date.parse(now) - Date.parse(shift.started_at)) / 1000));
-    const hourlyPoints = Math.floor(durationSeconds / 3600);
+function completeActiveShift(db, userId, now, actorId = null, reason = 'One point per completed shift hour') {
+  const shift = db.prepare("SELECT * FROM shifts WHERE user_id = ? AND status = 'active'").get(userId);
+  if (!shift) return null;
+
+  const durationSeconds = Math.max(0, Math.floor((Date.parse(now) - Date.parse(shift.started_at)) / 1000));
+  const hourlyPoints = Math.floor(durationSeconds / 3600);
+  db.prepare(`
+    UPDATE shifts SET ended_at = ?, duration_seconds = ?, status = 'completed'
+    WHERE id = ? AND status = 'active'
+  `).run(now, durationSeconds, shift.id);
+
+  if (hourlyPoints > 0) {
     db.prepare(`
-      UPDATE shifts SET ended_at = ?, duration_seconds = ?, status = 'completed'
-      WHERE id = ? AND status = 'active'
-    `).run(now, durationSeconds, shift.id);
+      INSERT INTO staff_points_ledger (user_id, amount, source_type, source_id, reason, actor_id, created_at)
+      VALUES (?, ?, 'shift_hours', ?, ?, ?, ?)
+      ON CONFLICT DO NOTHING
+    `).run(userId, hourlyPoints, String(shift.id), reason, actorId, now);
+  }
 
-    if (hourlyPoints > 0) {
-      db.prepare(`
-        INSERT INTO staff_points_ledger (user_id, amount, source_type, source_id, reason, created_at)
-        VALUES (?, ?, 'shift_hours', ?, 'One point per completed shift hour', ?)
-        ON CONFLICT DO NOTHING
-      `).run(userId, hourlyPoints, String(shift.id), now);
+  return { ...shift, ended_at: now, duration_seconds: durationSeconds, status: 'completed', hourly_points: hourlyPoints };
+}
+
+function managementClockInStaff(db, { member, actorId, reason, now = new Date().toISOString() }) {
+  if (!reason?.trim()) throw new Error('A reason is required for a manual clock-in.');
+  return db.transaction(() => {
+    const result = checkInStaff(db, member, now);
+    if (!result.alreadyOnDuty && !result.unavailable) {
+      logAudit(db, {
+        action: 'shift_manual_clock_in', targetId: member.id, actorId, reason,
+        previousValue: 'off duty', newValue: 'on duty', createdAt: now,
+        details: { shiftId: result.shift.id },
+      });
     }
-
-    return { ...shift, ended_at: now, duration_seconds: durationSeconds, status: 'completed', hourly_points: hourlyPoints };
+    return result;
   })();
 }
 
@@ -466,24 +491,14 @@ function closeShiftByManagement(db, { shiftId, actorId, reason, now = new Date()
   return db.transaction(() => {
     const shift = db.prepare("SELECT * FROM shifts WHERE id = ? AND status = 'active'").get(shiftId);
     if (!shift) throw new Error('Active shift not found.');
-    const durationSeconds = Math.max(0, Math.floor((Date.parse(now) - Date.parse(shift.started_at)) / 1000));
-    const hourlyPoints = Math.floor(durationSeconds / 3600);
-    db.prepare(`
-      UPDATE shifts SET ended_at = ?, duration_seconds = ?, status = 'completed' WHERE id = ? AND status = 'active'
-    `).run(now, durationSeconds, shiftId);
-    if (hourlyPoints > 0) {
-      db.prepare(`
-        INSERT INTO staff_points_ledger (user_id, amount, source_type, source_id, reason, actor_id, created_at)
-        VALUES (?, ?, 'shift_hours', ?, 'Management-closed completed shift', ?, ?)
-        ON CONFLICT DO NOTHING
-      `).run(shift.user_id, hourlyPoints, String(shift.id), actorId, now);
-    }
+    const completed = completeActiveShift(db, shift.user_id, now, actorId, 'Management-closed completed shift');
+    if (!completed) throw new Error('Active shift not found.');
     logAudit(db, {
-      action: 'shift_closed', targetId: shift.user_id, actorId, reason,
-      previousValue: 'active', newValue: 'completed', durationSeconds, createdAt: now,
-      details: { shiftId, hourlyPoints },
+      action: 'shift_manual_clock_out', targetId: shift.user_id, actorId, reason,
+      previousValue: 'active', newValue: 'completed', durationSeconds: completed.duration_seconds, createdAt: now,
+      details: { shiftId, hourlyPoints: completed.hourly_points },
     });
-    return { ...shift, ended_at: now, duration_seconds: durationSeconds, hourly_points: hourlyPoints };
+    return completed;
   })();
 }
 
@@ -494,6 +509,35 @@ function recordReminderAttempt(db, shiftId, status, messageId = null, now = new 
     ON CONFLICT(shift_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
       message_id = excluded.message_id, delivery_status = excluded.delivery_status
   `).run(shiftId, now, messageId, status);
+}
+
+function claimStaffFeatureCooldown(db, userId, feature, now = new Date(), cooldownMs = featureCooldowns[feature]) {
+  if (!Object.hasOwn(featureCooldowns, feature) || !Number.isFinite(cooldownMs) || cooldownMs <= 0) {
+    throw new Error('Unsupported staff cooldown feature.');
+  }
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Invalid cooldown timestamp.');
+  const nowIso = nowDate.toISOString();
+
+  return db.transaction(() => {
+    const current = db.prepare(`SELECT expires_at FROM staff_feature_cooldowns
+      WHERE user_id = ? AND feature = ?`).get(userId, feature);
+    const remainingMs = current ? Date.parse(current.expires_at) - nowDate.getTime() : 0;
+    if (remainingMs > 0) return { allowed: false, remainingMs };
+
+    const claimId = randomUUID();
+    const expiresAt = new Date(nowDate.getTime() + cooldownMs).toISOString();
+    db.prepare(`INSERT INTO staff_feature_cooldowns (user_id, feature, expires_at, claim_id)
+      VALUES (?, ?, ?, ?) ON CONFLICT(user_id, feature) DO UPDATE SET
+      expires_at = excluded.expires_at, claim_id = excluded.claim_id`)
+      .run(userId, feature, expiresAt, claimId);
+    return { allowed: true, expiresAt, claimId };
+  })();
+}
+
+function releaseStaffFeatureCooldown(db, userId, feature, claimId) {
+  return db.prepare(`DELETE FROM staff_feature_cooldowns
+    WHERE user_id = ? AND feature = ? AND claim_id = ?`).run(userId, feature, claimId).changes > 0;
 }
 
 function getOverdueShifts(db, now = new Date()) {
@@ -574,6 +618,7 @@ module.exports = {
   awardStaffOfWeek,
   checkInStaff,
   checkOutStaff,
+  claimStaffFeatureCooldown,
   closeShiftByManagement,
   correctCompletedShift,
   currentStatus,
@@ -596,7 +641,9 @@ module.exports = {
   getWeekStart,
   getWeeklySummary,
   logAudit,
+  managementClockInStaff,
   recordReminderAttempt,
+  releaseStaffFeatureCooldown,
   recordDailyReportReminder,
   getWeeklyGoalReminderCandidates,
   recordWeeklyGoalReminder,

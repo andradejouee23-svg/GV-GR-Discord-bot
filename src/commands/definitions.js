@@ -68,6 +68,16 @@ const commands = [
     .addStringOption((option) => option.setName('title').setDescription('Announcement title').setRequired(true).setMaxLength(200))
     .addStringOption((option) => option.setName('message').setDescription('Announcement').setRequired(true).setMaxLength(3000)),
   new SlashCommandBuilder()
+    .setName('announcement-builder')
+    .setDescription('Create, edit, and reuse management announcements.')
+    .addSubcommand((subcommand) => subcommand.setName('create').setDescription('Build and preview an announcement.'))
+    .addSubcommand((subcommand) => subcommand.setName('edit').setDescription('Edit a bot-published announcement.'))
+    .addSubcommand((subcommand) => subcommand.setName('templates').setDescription('Create an announcement from a saved template.')),
+  new SlashCommandBuilder()
+    .setName('ticket-panel')
+    .setDescription('Post or refresh the private ticket creation panel.')
+    .addChannelOption((option) => option.setName('channel').setDescription('Public channel for the ticket panel').setRequired(true).addChannelTypes(ChannelType.GuildText)),
+  new SlashCommandBuilder()
     .setName('mod')
     .setDescription('Record or perform a player moderation action.')
     .addSubcommand((subcommand) => subcommand.setName('warn').setDescription('Record a player warning.')

@@ -233,6 +233,14 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       PRIMARY KEY (user_id, week_start)
     );
 
+    CREATE TABLE IF NOT EXISTS staff_feature_cooldowns (
+      user_id TEXT NOT NULL REFERENCES staff(user_id),
+      feature TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      claim_id TEXT NOT NULL,
+      PRIMARY KEY (user_id, feature)
+    );
+
     CREATE TABLE IF NOT EXISTS staff_streak_resets (
       user_id TEXT PRIMARY KEY REFERENCES staff(user_id),
       reset_before_date TEXT NOT NULL,
@@ -251,6 +259,114 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'confirmed', 'cancelled', 'expired')),
       expires_at TEXT NOT NULL,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS message_cleanup_previews (
+      preview_id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      items_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'completed', 'cancelled', 'expired')),
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS announcement_drafts (
+      draft_id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL,
+      flow TEXT NOT NULL CHECK(flow IN ('create', 'edit')),
+      published_id INTEGER,
+      payload_json TEXT NOT NULL,
+      channel_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'publishing', 'published', 'cancelled')),
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bot_announcements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      creator_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(channel_id, message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS announcement_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+      payload_json TEXT NOT NULL,
+      creator_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS tickets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_type TEXT NOT NULL CHECK(ticket_type IN ('general', 'staff_application', 'admin_recruiting')),
+      requester_id TEXT NOT NULL,
+      requester_name TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      answers_json TEXT NOT NULL,
+      channel_id TEXT,
+      panel_message_id TEXT,
+      status TEXT NOT NULL DEFAULT 'creating' CHECK(status IN ('creating', 'open', 'accepted', 'rejected', 'closing', 'closed', 'failed')),
+      review_note TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      closed_at TEXT,
+      closed_by TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS one_open_ticket_per_requester_type
+      ON tickets(requester_id, ticket_type)
+      WHERE status IN ('creating', 'open', 'accepted', 'rejected', 'closing');
+
+    CREATE TABLE IF NOT EXISTS automod_activity (
+      activity_id TEXT PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      channel_id TEXT,
+      activity_type TEXT NOT NULL CHECK(activity_type IN ('message', 'join')),
+      content_hash TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS automod_user_channel_created
+      ON automod_activity(user_id, channel_id, activity_type, created_at);
+    CREATE INDEX IF NOT EXISTS automod_user_hash_created
+      ON automod_activity(user_id, channel_id, content_hash, created_at);
+
+    CREATE TABLE IF NOT EXISTS automod_incidents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_id TEXT NOT NULL UNIQUE,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      channel_id TEXT,
+      incident_type TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      action_result TEXT NOT NULL DEFAULT 'logged',
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS automod_alert_windows (
+      guild_id TEXT NOT NULL,
+      alert_type TEXT NOT NULL,
+      window_start TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (guild_id, alert_type, window_start)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_action_cooldowns (
+      user_id TEXT NOT NULL,
+      feature TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, feature)
     );
 
     CREATE TABLE IF NOT EXISTS staff_temporary_roles (
@@ -278,6 +394,27 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       ON staff_audit_logs(target_id, created_at);
   `);
 
+  const defaultAnnouncementTemplates = [
+    ['RP Session Starting', 'GV GR RP session starting', 'Session: {title}\nHost: {host}\nType/activity: {activity}\nStart: {start_time}\n\nGV GR CUSTOM SERVER JOIN CODE\n```\n{join_code}\n```\n\n{join_instructions}\n{join_url}'],
+    ['Upcoming Sessions', 'Upcoming GV GR sessions', 'Next session: {title}\nHost: {host}\nStart: {start_time}\n\nGV GR CUSTOM SERVER JOIN CODE\n```\n{join_code}\n```\n{join_instructions}\n{join_url}'],
+    ['Session Ending', 'GV GR RP session ending', 'Session: {title}\nHost: {host}\nEnded: {end_time}\nThank you for participating.'],
+    ['Special Event', 'GV GR special event', 'Event: {title}\nWhen: {start_time}\nDetails: {details}'],
+    ['Weather Emergency', 'GV GR weather emergency', 'Situation: {details}\nArea: {area}\nUpdates: {updates}'],
+    ['Curfew / Evacuation', 'GV GR safety notice', 'Action: {curfew_or_evacuation}\nArea: {area}\nEffective: {start_time}\nInstructions: {details}'],
+    ['Staff Announcement', 'GV GR staff announcement', 'Message for staff: {details}'],
+    ['Maintenance / Server Update', 'GV GR maintenance update', 'Status: {status}\nWindow: {start_time} to {end_time}\nDetails: {details}'],
+    ['Community Announcement', 'GV GR community announcement', 'Message: {details}'],
+  ];
+  const insertTemplate = db.prepare(`INSERT OR IGNORE INTO announcement_templates
+    (name, payload_json, creator_id, created_at, updated_at) VALUES (?, ?, 'system', ?, ?)`);
+  const templateNow = new Date().toISOString();
+  for (const [name, title, description] of defaultAnnouncementTemplates) {
+    insertTemplate.run(name, JSON.stringify({
+      title, description, color: '#286F61', footer: 'GV GR', timestamp: '', imageUrl: '', thumbnailUrl: '',
+      startAt: '', endAt: '', fields: [], buttonType: 'none', buttonLabel: '', buttonUrl: '',
+    }), templateNow, templateNow);
+  }
+
   const addColumns = (table, columns) => {
     const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
     for (const [name, definition] of Object.entries(columns)) {
@@ -294,7 +431,12 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     expected_duration: "TEXT NOT NULL DEFAULT ''", voice_channel_id: 'TEXT', announcement_channel_id: 'TEXT',
     lifecycle_status: "TEXT NOT NULL DEFAULT 'active'", session_start_label: "TEXT NOT NULL DEFAULT ''",
     paused_at: 'TEXT', paused_seconds: 'INTEGER NOT NULL DEFAULT 0', time_zone: "TEXT NOT NULL DEFAULT 'UTC'",
+    scheduled_start_at: 'TEXT', actual_started_at: 'TEXT', image_url: 'TEXT',
   });
+  db.prepare('UPDATE sessions SET scheduled_start_at = started_at WHERE scheduled_start_at IS NULL').run();
+  db.prepare(`UPDATE sessions SET actual_started_at = started_at
+    WHERE actual_started_at IS NULL AND status = 'active' AND lifecycle_status = 'active' AND started_at <= ?`)
+    .run(new Date().toISOString());
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS events_event_code_unique ON events(event_code);
     CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_code_unique ON sessions(session_code);

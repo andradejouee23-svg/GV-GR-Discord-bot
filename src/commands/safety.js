@@ -9,6 +9,7 @@ const {
   TextInputStyle,
 } = require('discord.js');
 const config = require('../../config');
+const { claimUserActionCooldown } = require('../services/automod');
 const {
   fetchGuildMember,
   getConfigValue,
@@ -55,6 +56,13 @@ async function submitReport(interaction, ctx) {
   const description = interaction.fields.getTextInputValue('description').trim();
   const evidence = interaction.fields.getTextInputValue('evidence').trim();
   const now = new Date().toISOString();
+  const cooldownSeconds = Number(getConfigValue(ctx.db, 'PLAYER_REPORT_COOLDOWN_SECONDS')) || config.PLAYER_REPORT_COOLDOWN_SECONDS;
+  const cooldown = claimUserActionCooldown(ctx.db, interaction.user.id, 'player_report', new Date(now), cooldownSeconds * 1000);
+  if (!cooldown.allowed) {
+    const remaining = Math.ceil(cooldown.remainingMs / 1000);
+    return interaction.reply({ content: `Report cooldown: try again in ${remaining} second${remaining === 1 ? '' : 's'}.`, ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
   const result = ctx.db.prepare(`
     INSERT INTO reports (reporter_id, reporter_name, reported_player, reason, description, evidence, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -78,9 +86,9 @@ async function submitReport(interaction, ctx) {
   await logStaffAction(interaction.client, ctx.db, {
     embeds: [makeEmbed(config.EMBED_COLORS.warning, '🚨 Player Report Submitted', `Report #${reportId} • **${player}**\nSubmitted by: <@${interaction.user.id}>\nReason: ${reason}`)],
   });
-  return interaction.reply({ content: sentMessage
+  return interaction.editReply({ content: sentMessage
     ? `Your report (#${reportId}) was sent privately to staff.`
-    : `Your report (#${reportId}) was saved, but I could not deliver it. Staff should check REPORT_CHANNEL_ID and bot channel permissions.`, ephemeral: true });
+    : `Your report (#${reportId}) was saved, but I could not deliver it. Staff should check REPORT_CHANNEL_ID and bot channel permissions.` });
 }
 
 async function updateReport(interaction, ctx) {
@@ -144,6 +152,14 @@ async function moderationCommand(interaction, ctx) {
     }
   }
 
+  const moderationCooldown = Number(getConfigValue(ctx.db, 'MODERATION_ACTION_COOLDOWN_SECONDS')) || config.MODERATION_ACTION_COOLDOWN_SECONDS;
+  const cooldown = claimUserActionCooldown(ctx.db, interaction.user.id, `moderation_${action}`, new Date(), moderationCooldown * 1000);
+  if (!cooldown.allowed) {
+    const remaining = Math.ceil(cooldown.remainingMs / 1000);
+    return interaction.reply({ content: `Moderation cooldown: try again in ${remaining} second${remaining === 1 ? '' : 's'}.`, ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+
   try {
     if (action === 'kick') await targetMember.kick(reason);
     if (action === 'ban') await interaction.guild.members.ban(target.id, { reason });
@@ -153,7 +169,7 @@ async function moderationCommand(interaction, ctx) {
     }
   } catch (error) {
     console.error(`Could not ${action} ${target.id}:`, error.message);
-    return interaction.reply({ content: `Discord did not allow that ${action}. Check the bot's role position, permissions, and the target's role hierarchy.`, ephemeral: true });
+    return interaction.editReply({ content: `Discord did not allow that ${action}. Check the bot's role position, permissions, and the target's role hierarchy.` });
   }
 
   const now = logModeration(ctx.db, action, interaction.user, target, reason);
@@ -161,7 +177,7 @@ async function moderationCommand(interaction, ctx) {
   const embed = makeEmbed(config.EMBED_COLORS.management, `🛡️ Player ${actionLabel}`,
     `**Staff:** <@${interaction.user.id}>\n**Target:** <@${target.id}>\n**Reason:** ${reason}\n**Date:** ${unixTime(now)}`);
   await logStaffAction(interaction.client, ctx.db, { embeds: [embed] });
-  return interaction.reply({ content: `${actionLabel} recorded for <@${target.id}>.`, ephemeral: true });
+  return interaction.editReply({ content: `${actionLabel} recorded for <@${target.id}>.` });
 }
 
 async function handleSafetyCommand(interaction, ctx) {

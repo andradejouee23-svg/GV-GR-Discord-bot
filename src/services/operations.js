@@ -138,10 +138,12 @@ function createSession(db, data, now = new Date().toISOString()) {
     const lifecycleStatus = Date.parse(startsAt) > Date.parse(now) ? 'scheduled' : 'active';
     const result = db.prepare(`INSERT INTO sessions
       (name, description, host_id, host_name, channel_id, started_at, status, rp_type, activity,
-       expected_duration, voice_channel_id, announcement_channel_id, lifecycle_status, time_zone)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`)
-      .run(data.name, data.activity, data.hostId, data.hostName, data.announcementChannelId,
-        startsAt, data.rpType, data.activity, data.expectedDuration, data.voiceChannelId, data.announcementChannelId, lifecycleStatus, data.timeZone ?? 'UTC');
+       expected_duration, voice_channel_id, announcement_channel_id, lifecycle_status, time_zone,
+       scheduled_start_at, actual_started_at, image_url)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(data.name, data.description ?? '', data.hostId, data.hostName, data.announcementChannelId,
+        startsAt, data.rpType, data.activity, data.expectedDuration, data.voiceChannelId, data.announcementChannelId,
+        lifecycleStatus, data.timeZone ?? 'UTC', startsAt, lifecycleStatus === 'active' ? now : null, data.imageUrl ?? null);
     const id = Number(result.lastInsertRowid);
     const sessionCode = nextPublicId('GV-RP', id);
     db.prepare('UPDATE sessions SET session_code = ? WHERE id = ?').run(sessionCode, id);

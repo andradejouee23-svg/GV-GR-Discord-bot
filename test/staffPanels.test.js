@@ -3,13 +3,18 @@ const { mkdtempSync, rmSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { ChannelType } = require('discord.js');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
 const { canRefreshStaffPanel } = require('../src/commands/clock');
 const { isManagement, isOwner, isStaff } = require('../src/commands/staffCenter');
 const {
   handleManagementButton,
+  handleManagementShiftActionSelect,
+  handleManagementShiftConfirm,
+  handleManagementShiftModal,
   handleOwnerButton,
+  handleOwnerCleanupSelect,
   handleOwnerSettingsModal,
   handleOwnerSettingsSelect,
 } = require('../src/commands/staffManagement');
@@ -20,7 +25,10 @@ const {
   createPermanentLeaderboardEmbed,
   createStaffCenterComponents,
 } = require('../src/utils/staffCenter');
-const { createDailyReportReminderComponents } = require('../src/commands/staffCenter');
+const {
+  createDailyReportReminderComponents,
+  handleDailyReportSelect,
+} = require('../src/commands/staffCenter');
 
 function member(id, roleIds = []) {
   return { id, roles: { cache: new Map(roleIds.map((roleId) => [roleId, {}])) } };
@@ -158,7 +166,40 @@ test('Staff Center buttons and report reminder open the expected private flows',
   assert.match(deniedPayload.content, /not linked to one of your completed shifts/i);
 });
 
-test('management and Owner dashboard buttons work; Owner toggles user-only delete logs', async (t) => {
+test('daily report cooldown is shared across checkout and reminder entry points', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-daily-report-cooldown-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  db.prepare('INSERT INTO staff (user_id, username, role_name, first_seen_at) VALUES (?, ?, ?, ?)')
+    .run('report-cooldown-user', 'ReportUser', 'Moderator', '2026-10-17T00:00:00.000Z');
+  for (const [start, end] of [['08:00', '09:00'], ['10:00', '11:00']]) {
+    db.prepare(`INSERT INTO shifts (user_id, username, role_name, started_at, ended_at, duration_seconds, status)
+      VALUES (?, ?, ?, ?, ?, 3600, 'completed')`)
+      .run('report-cooldown-user', 'ReportUser', 'Moderator', `2026-10-17T${start}:00.000Z`, `2026-10-17T${end}:00.000Z`);
+  }
+  const user = { id: 'report-cooldown-user' };
+  let modal;
+  await handleDailyReportSelect({
+    customId: 'gv:daily:rating:1', user, values: ['good'],
+    showModal: async (value) => { modal = value; return value; },
+    reply: async (payload) => payload,
+  }, { db });
+  assert.equal(modal.data.custom_id, 'gv:daily:submit:1:good');
+
+  let blocked;
+  await handleDailyReportSelect({
+    customId: 'gv:daily:rating:2', user, values: ['great'],
+    showModal: async () => { throw new Error('second entry point bypassed cooldown'); },
+    reply: async (payload) => { blocked = payload; return payload; },
+  }, { db });
+  assert.equal(blocked.ephemeral, true);
+  assert.match(blocked.content, /Daily report cooldown: try again in/);
+});
+
+test('management and Owner dashboard buttons work; deletion logging stays disabled', async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-dashboard-actions-'));
   const db = createDatabase(path.join(directory, 'test.sqlite'));
   t.after(() => {
@@ -190,10 +231,11 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
     assert.ok(result.embeds[0], `Owner button ${customId} should update the dashboard.`);
   }
 
-  const toggleOffResult = await handleOwnerButton(createInteraction('owner:toggle_message_delete_logging', owner), { db });
-  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'MESSAGE_DELETE_LOGGING_ENABLED'").get().value), false);
-  assert.match(toggleOffResult.embeds[0].data.description, /Message deletion logs: \*\*Disabled\*\*/);
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action = 'message_delete_logging_toggle'").get().count, 1);
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)')
+    .run('MESSAGE_DELETE_LOGGING_ENABLED', JSON.stringify(true));
+  const staleToggleResult = await handleOwnerButton(createInteraction('owner:toggle_message_delete_logging', owner), { db });
+  assert.match(staleToggleResult.content, /disabled/i);
+  assert.doesNotMatch(JSON.stringify(staleToggleResult.components), /toggle_message_delete_logging/);
 
   const deletedMessage = {
     guild: {},
@@ -213,16 +255,133 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
   await logMessageDeletion(deletedMessage, client, db);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM moderation_logs WHERE action = 'message_delete'").get().count, 0);
   assert.equal(sent.length, 0);
-
-  const toggleOnResult = await handleOwnerButton(createInteraction('owner:toggle_message_delete_logging', owner), { db });
   assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'MESSAGE_DELETE_LOGGING_ENABLED'").get().value), true);
-  assert.match(toggleOnResult.embeds[0].data.description, /Message deletion logs: \*\*Enabled\*\*/);
-  await logMessageDeletion(deletedMessage, client, db);
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM moderation_logs WHERE action = 'message_delete'").get().count, 1);
-  assert.equal(sent.length, 1);
-  assert.match(sent[0].embeds[0].data.description, /\*\*User:\*\* <@message-author>/);
-  assert.doesNotMatch(JSON.stringify(sent[0]), /message contents are not logged/);
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action = 'message_delete_logging_toggle'").get().count, 2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action = 'message_delete_logging_toggle'").get().count, 0);
+});
+
+test('Management can manually clock in a staff member with confirmation and audit attribution', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-manual-clock-ui-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const managerRoleId = '1556064708795306157';
+  const staffRoleId = config.STAFF_ROLE_IDS[0];
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRoleId]));
+  db.prepare('INSERT INTO staff (user_id, username, role_name, first_seen_at) VALUES (?, ?, ?, ?)')
+    .run('manual-target', 'Target', 'Moderator', '2026-10-04T00:00:00.000Z');
+  const manager = member('manual-manager', [managerRoleId]);
+  const target = {
+    id: 'manual-target',
+    user: { username: 'Target' },
+    roles: { cache: new Map([[staffRoleId, { name: 'Moderator' }]]) },
+  };
+  const guild = {
+    ownerId: 'server-owner',
+    members: { fetch: async (userId) => userId === target.id ? target : null },
+  };
+  const baseInteraction = {
+    guild,
+    member: manager,
+    user: { id: manager.id, username: 'Manager' },
+  };
+
+  const modal = await handleManagementShiftActionSelect({
+    ...baseInteraction,
+    customId: 'mgmt:shift_action:manual-target',
+    values: ['manual_clock_in'],
+    showModal: async (value) => value,
+    reply: async (payload) => payload,
+  }, { db });
+  assert.equal(modal.data.custom_id, 'mgmt:shift_modal:manual-target:manual_clock_in');
+
+  const confirmation = await handleManagementShiftModal({
+    ...baseInteraction,
+    customId: modal.data.custom_id,
+    fields: { getTextInputValue: () => 'Approved opening shift' },
+    reply: async (payload) => payload,
+  }, { db });
+  assert.match(confirmation.embeds[0].data.description, /Clock In Manually/);
+  const confirmId = confirmation.components[0].components[0].data.custom_id;
+  const result = await handleManagementShiftConfirm({
+    ...baseInteraction,
+    customId: confirmId,
+    client: {},
+    deferUpdate: async () => {},
+    editReply: async (payload) => payload,
+    reply: async (payload) => payload,
+  }, { db });
+
+  assert.match(result.content, /applied and saved to the audit log/i);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM shifts WHERE user_id = 'manual-target' AND status = 'active'").get().count, 1);
+  assert.deepEqual(db.prepare(`SELECT action, target_id, actor_id, reason FROM staff_audit_logs
+    WHERE action = 'shift_manual_clock_in'`).get(), {
+    action: 'shift_manual_clock_in',
+    target_id: 'manual-target',
+    actor_id: 'manual-manager',
+    reason: 'Approved opening shift',
+  });
+});
+
+test('Owner cleanup deletes only confirmed old completed bot session posts', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-cleanup-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const owner = member('cleanup-owner', config.OWNER_ROLE_IDS);
+  const guild = { id: 'cleanup-guild', ownerId: 'server-owner' };
+  const oldDate = '2026-08-01T12:00:00.000Z';
+  const insertSession = ({ name, status, lifecycleStatus, endedAt, messageId }) => db.prepare(`INSERT INTO sessions (
+    name, description, host_id, host_name, started_at, ended_at, duration_seconds, status,
+    session_code, lifecycle_status, channel_id, message_id
+  ) VALUES (?, '', 'session-host', 'Host', ?, ?, ?, ?, ?, ?, 'session-channel', ?)`)
+    .run(name, oldDate, endedAt, status === 'completed' ? 3600 : null, status,
+      `GV-RP-${String(Math.random()).slice(2, 6)}`, lifecycleStatus, messageId).lastInsertRowid;
+  const completedId = insertSession({ name: 'Old completed', status: 'completed', lifecycleStatus: 'completed', endedAt: oldDate, messageId: 'bot-post' });
+  insertSession({ name: 'Old active', status: 'active', lifecycleStatus: 'active', endedAt: null, messageId: 'active-post' });
+  const untrustedId = insertSession({ name: 'Untrusted message reference', status: 'completed', lifecycleStatus: 'completed', endedAt: oldDate, messageId: 'user-post' });
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('panel_message', JSON.stringify('protected-panel'));
+
+  const messages = {
+    'bot-post': { author: { id: 'bot-id' }, delete: async () => { deleted.push('bot-post'); } },
+    'user-post': { author: { id: 'human-id' }, delete: async () => { deleted.push('user-post'); } },
+  };
+  const deleted = [];
+  const client = {
+    user: { id: 'bot-id' },
+    channels: { fetch: async () => ({
+      isTextBased: () => true,
+      messages: { fetch: async (messageId) => messages[messageId] ?? null },
+    }) },
+  };
+  let preview;
+  await handleOwnerCleanupSelect({
+    customId: 'owner:cleanup:category', guild, member: owner,
+    user: { id: owner.id }, values: ['completed_sessions'],
+    reply: async (payload) => { preview = payload; },
+  }, { db });
+  assert.equal(preview.ephemeral, true);
+  assert.match(preview.content, /\*\*2\*\* completed session announcement/);
+  const confirmId = preview.components[0].components[0].data.custom_id;
+  let finalPayload;
+  await handleOwnerButton({
+    customId: confirmId, guild, member: owner, user: { id: owner.id }, client,
+    deferUpdate: async () => {},
+    editReply: async (payload) => { finalPayload = payload; },
+    reply: async (payload) => { finalPayload = payload; },
+  }, { db });
+
+  assert.deepEqual(deleted, ['bot-post']);
+  assert.match(finalPayload.content, /\*\*1\*\* message\(s\) deleted; \*\*1\*\* skipped/);
+  assert.equal(db.prepare('SELECT id FROM sessions WHERE id = ?').get(completedId).id, completedId);
+  assert.equal(db.prepare('SELECT id FROM sessions WHERE id = ?').get(untrustedId).id, untrustedId);
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'panel_message'").get().value), 'protected-panel');
+  const audit = db.prepare("SELECT actor_id, details_json FROM staff_audit_logs WHERE action = 'message_cleanup'").get();
+  assert.equal(audit.actor_id, owner.id);
+  assert.deepEqual(JSON.parse(audit.details_json).deletedMessageIds, ['bot-post']);
 });
 
 test('Owner Settings updates channels, role groups, and timezone with audit records; Management is denied', async (t) => {
@@ -245,16 +404,34 @@ test('Owner Settings updates channels, role groups, and timezone with audit reco
     user: { id: actingMember.id, username: actingMember.id },
     values,
     fields: { getTextInputValue: () => 'America/Chicago' },
-    isStringSelectMenu: () => customId === 'owner:settings:channel' || customId === 'owner:settings:roles',
-    isChannelSelectMenu: () => customId.startsWith('owner:settings:setchannel:'),
+    isStringSelectMenu: () => ['owner:settings:channel', 'owner:settings:roles', 'owner:settings:session', 'owner:settings:categories'].includes(customId),
+    isChannelSelectMenu: () => customId.startsWith('owner:settings:setchannel:') || customId.startsWith('owner:settings:setcategory:'),
     isRoleSelectMenu: () => customId.startsWith('owner:settings:saveroles:'),
     update: async (payload) => payload,
+    showModal: async (payload) => payload,
     reply: async (payload) => { lastReply = payload; return payload; },
   });
 
   const settingsPanel = await handleOwnerButton(interaction('owner:settings', owner), { db });
   assert.match(settingsPanel.embeds[0].data.title, /SERVER SETTINGS/);
-  assert.equal(settingsPanel.components.length, 3);
+  assert.equal(settingsPanel.components.length, 5);
+
+  const automodModal = await handleOwnerButton(interaction('owner:automod:core', owner), { db });
+  assert.equal(automodModal.data.custom_id, 'owner:automod:core_modal');
+  const automodSaved = await handleOwnerSettingsModal({
+    ...interaction('owner:automod:core_modal', owner),
+    fields: { getTextInputValue: (key) => ({
+      enabled: 'true', mode: 'log', spam_threshold: '6', spam_window: '10', repeat_threshold: '3',
+    })[key] },
+  }, { db });
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'AUTOMOD_ENABLED'").get().value), true);
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'AUTOMOD_MODE'").get().value), 'log');
+  assert.match(automodSaved.content, /Message Content privileged intent/i);
+  await handleOwnerSettingsModal({
+    ...interaction('owner:automod:core_modal', manager),
+    fields: { getTextInputValue: () => 'true' },
+  }, { db });
+  assert.match(lastReply.content, /server owner or a configured Owner role/i);
 
   await handleOwnerSettingsSelect(interaction('owner:settings:channel', manager, ['EVENT_CHANNEL_ID']), { db });
   assert.match(lastReply.content, /Only the server owner or a configured Owner role/);
@@ -270,6 +447,16 @@ test('Owner Settings updates channels, role groups, and timezone with audit reco
   await handleOwnerSettingsSelect(interaction('owner:settings:saveroles:management', owner, ['523456789012345678']), { db });
   assert.deepEqual(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'role_management'").get().value), ['523456789012345678']);
 
+  const recruitingRoles = await handleOwnerSettingsSelect(interaction('owner:settings:roles', owner, ['admin_recruiting']), { db });
+  assert.equal(recruitingRoles.components[0].components[0].data.max_values, 1);
+  await handleOwnerSettingsSelect(interaction('owner:settings:saveroles:admin_recruiting', owner, ['623456789012345678']), { db });
+  assert.deepEqual(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'role_admin_recruiting'").get().value), ['623456789012345678']);
+
+  const categories = await handleOwnerSettingsSelect(interaction('owner:settings:categories', owner, ['TICKET_RECRUITING_CATEGORY_ID']), { db });
+  assert.equal(categories.components[0].components[0].data.channel_types[0], ChannelType.GuildCategory);
+  const setCategory = await handleOwnerSettingsSelect(interaction('owner:settings:setcategory:TICKET_RECRUITING_CATEGORY_ID', owner, ['723456789012345678']), { db });
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'TICKET_RECRUITING_CATEGORY_ID'").get().value), '723456789012345678');
+
   await handleOwnerSettingsModal(interaction('owner:settings:timezone_modal', owner), { db });
   assert.equal(lastReply.ephemeral, true);
   assert.match(lastReply.embeds[0].data.description, /America\/Chicago/);
@@ -280,5 +467,18 @@ test('Owner Settings updates channels, role groups, and timezone with audit reco
   }, { db });
   assert.match(lastReply.content, /timezone is not valid/i);
   assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'TIME_ZONE'").get().value), 'America/Chicago');
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action IN ('configuration_change', 'permission_change')").get().count, 3);
+
+  const joinSettingModal = await handleOwnerSettingsSelect(interaction('owner:settings:session', owner, ['SESSION_JOIN_CODE']), { db });
+  assert.equal(joinSettingModal.data.custom_id, 'owner:settings:session_modal:SESSION_JOIN_CODE');
+  await handleOwnerSettingsModal({
+    ...interaction('owner:settings:session_modal:SESSION_JOIN_CODE', owner),
+    fields: { getTextInputValue: () => 'ACTUAL-CODE-123' },
+  }, { db });
+  assert.equal(JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'SESSION_JOIN_CODE'").get().value), 'ACTUAL-CODE-123');
+  await handleOwnerSettingsModal({
+    ...interaction('owner:settings:session_modal:SESSION_JOIN_URL', owner),
+    fields: { getTextInputValue: () => 'http://unsafe.example' },
+  }, { db });
+  assert.match(lastReply.content, /valid HTTPS URL/i);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action IN ('configuration_change', 'permission_change')").get().count, 7);
 });

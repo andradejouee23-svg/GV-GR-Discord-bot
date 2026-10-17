@@ -5,6 +5,8 @@ const path = require('node:path');
 const test = require('node:test');
 const { createDatabase } = require('../src/database');
 const { clockIn, clockOut, getOnDuty } = require('../src/services/clock');
+const { refreshStaffPanel } = require('../src/commands/clock');
+const { checkInStaff, checkOutStaff } = require('../src/services/staffRewards');
 
 test('clock shifts persist across database reopen and cannot be duplicated', (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-clock-'));
@@ -33,4 +35,29 @@ test('clock shifts persist across database reopen and cannot be duplicated', (t)
   assert.equal(shifts[0].status, 'completed');
   assert.equal(shifts[0].role_name, 'Moderator');
   db.close();
+});
+
+test('the saved staff panel refreshes its current duty count after shift changes', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-clock-panel-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('panel_message', JSON.stringify('panel-message'));
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('panel_channel', JSON.stringify('123456789012345678'));
+  const updates = [];
+  const client = { channels: { fetch: async () => ({
+    isTextBased: () => true,
+    messages: { fetch: async () => ({ edit: async (payload) => updates.push(payload) }) },
+  }) } };
+  const guild = { members: { fetch: async () => {}, cache: { filter: () => ({ size: 0 }) } } };
+
+  checkInStaff(db, { id: 'panel-staff', username: 'PanelStaff', roleName: 'Moderator' }, '2026-10-04T08:00:00.000Z');
+  assert.equal(await refreshStaffPanel(client, guild, db), true);
+  assert.match(updates.at(-1).embeds[0].data.fields[0].value, /Currently On Duty: \*\*1\*\*/);
+
+  checkOutStaff(db, 'panel-staff', '2026-10-04T09:00:00.000Z');
+  assert.equal(await refreshStaffPanel(client, guild, db), true);
+  assert.match(updates.at(-1).embeds[0].data.fields[0].value, /Currently On Duty: \*\*0\*\*/);
 });

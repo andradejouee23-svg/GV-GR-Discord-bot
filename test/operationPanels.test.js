@@ -15,6 +15,8 @@ const {
   handleStaffCenterControl,
   makeGraphic,
   parseSessionStartAt,
+  sessionEmbed,
+  sessionPublicComponents,
 } = require('../src/commands/events');
 const { createStaffCenterComponents } = require('../src/utils/staffCenter');
 
@@ -98,6 +100,33 @@ test('session history shows persisted IDs, host, type, time, duration, and parti
   assert.match(embed.data.description, /<@session-host>/);
 });
 
+test('session embed separates scheduled and actual start and shows the configured join code', () => {
+  const embed = sessionEmbed({
+    name: 'Friday Patrol',
+    description: 'A coordinated city patrol.',
+    host_id: 'session-host',
+    scheduled_start_at: '2026-10-08T18:00:00.000Z',
+    actual_started_at: null,
+    expected_duration: '2 hours',
+    rp_type: 'Police RP',
+    activity: 'Patrol and traffic stops',
+    voice_channel_id: '123456789012345678',
+    session_code: 'GV-RP-0008',
+    lifecycle_status: 'scheduled',
+    join_code: 'OWNER-CONFIGURED-CODE',
+    join_url: 'https://example.com/join',
+    image_url: 'https://example.com/banner.png',
+  });
+  assert.match(embed.data.description, /Friday Patrol/i);
+  assert.match(embed.data.description, /A coordinated city patrol/);
+  assert.match(embed.data.description, /Not started yet/);
+  assert.match(embed.data.description, /OWNER-CONFIGURED-CODE/);
+  assert.match(embed.data.description, /Open Greenville/);
+  assert.match(embed.data.description, /Custom Servers menu/);
+  assert.equal(embed.data.image.url, 'https://example.com/banner.png');
+  assert.equal(sessionPublicComponents(8, false, 'https://example.com/join')[0].components.length, 4);
+});
+
 test('RP time inputs roll to the next UTC day if today’s entered time already passed', () => {
   assert.equal(parseSessionStartAt('6:30 PM', new Date('2026-10-05T17:00:00.000Z')), '2026-10-05T18:30:00.000Z');
   assert.equal(parseSessionStartAt('6:30 PM', new Date('2026-10-05T18:45:00.000Z')), '2026-10-06T18:30:00.000Z');
@@ -157,9 +186,13 @@ test('staff event and RP session buttons flow through modal, type dropdown, and 
   assert.match(sessionStart.data.custom_id, /^gv:rp:create:[0-9a-f-]+$/);
   const sessionDraftId = sessionStart.data.custom_id.split(':')[3];
   const sessionTypePrompt = await handleOperationModal(makeInteraction(`gv:rp:create:${sessionDraftId}`, {
-    fields: { name: 'Friday Night RP', time: '6:30 PM', duration: '2 hours', activity: 'Patrols and community RP' },
+    fields: { name: 'Friday Night RP', description: 'An organized community roleplay session.', date: eventDate, time: '6:30 PM' },
   }), { db });
-  assert.deepEqual(sessionTypePrompt.components[0].components[0].toJSON().options.map((option) => option.value), [
+  assert.equal(sessionTypePrompt.data.custom_id, `gv:rp:create:${sessionDraftId}:details`);
+  const sessionTypeMenu = await handleOperationModal(makeInteraction(`gv:rp:create:${sessionDraftId}:details`, {
+    fields: { duration: '2 hours', activity: 'Patrols and community RP', image_url: '' },
+  }), { db });
+  assert.deepEqual(sessionTypeMenu.components[0].components[0].toJSON().options.map((option) => option.value), [
     'Police RP', 'Fire/EMS RP', 'DOT RP', 'Business RP', 'Government RP', 'Emergency RP', 'General RP',
   ]);
   const voicePrompt = await handleOperationSelect(makeInteraction(`gv:rp:type:${sessionDraftId}`, { values: ['Police RP'] }), { db });

@@ -5,13 +5,16 @@ const path = require('node:path');
 const test = require('node:test');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
+const { processShiftReminders } = require('../src/commands/staffCenter');
 const {
   checkInStaff,
   checkOutStaff,
+  claimStaffFeatureCooldown,
   getPendingDailyReportReminders,
   getWeeklyGoalReminderCandidates,
   recordDailyReportReminder,
   recordWeeklyGoalReminder,
+  releaseStaffFeatureCooldown,
   submitDailyReport,
 } = require('../src/services/staffRewards');
 
@@ -24,6 +27,57 @@ function openDatabase(t) {
   });
   return db;
 }
+
+test('staff reminder and daily report cooldowns are isolated, expiring, and persistent', (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-cooldowns-'));
+  const databasePath = path.join(directory, 'test.sqlite');
+  let db = createDatabase(databasePath);
+  t.after(() => {
+    if (db.open) db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const now = new Date('2026-10-04T12:00:00.000Z');
+  checkInStaff(db, { id: 'cooldown-staff', username: 'Staff', roleName: 'Moderator' }, now.toISOString());
+
+  const reminder = claimStaffFeatureCooldown(db, 'cooldown-staff', 'shift_reminder', now);
+  assert.equal(reminder.allowed, true);
+  assert.deepEqual(claimStaffFeatureCooldown(db, 'cooldown-staff', 'shift_reminder', new Date(now.getTime() + 29 * 60_000)), {
+    allowed: false,
+    remainingMs: 60_000,
+  });
+  assert.equal(claimStaffFeatureCooldown(db, 'cooldown-staff', 'daily_report', now).allowed, true);
+  checkInStaff(db, { id: 'another-staff', username: 'Another', roleName: 'Moderator' }, now.toISOString());
+  assert.equal(claimStaffFeatureCooldown(db, 'another-staff', 'shift_reminder', now).allowed, true);
+
+  db.close();
+  db = createDatabase(databasePath);
+  assert.equal(claimStaffFeatureCooldown(db, 'cooldown-staff', 'shift_reminder', new Date(now.getTime() + 29 * 60_000)).allowed, false);
+  assert.equal(claimStaffFeatureCooldown(db, 'cooldown-staff', 'shift_reminder', new Date(now.getTime() + 30 * 60_000)).allowed, true);
+  assert.equal(releaseStaffFeatureCooldown(db, 'cooldown-staff', 'shift_reminder', reminder.claimId), false);
+});
+
+test('overlapping shift reminder runs send only one reminder per staff cooldown', async (t) => {
+  const db = openDatabase(t);
+  const now = new Date('2026-10-17T12:00:00.000Z');
+  checkInStaff(db, { id: 'reminder-staff', username: 'ReminderStaff', roleName: 'Moderator' }, '2026-10-17T00:00:00.000Z');
+  let releaseSend;
+  let notifySend;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+  const sendStarted = new Promise((resolve) => { notifySend = resolve; });
+  let sends = 0;
+  const client = { channels: { fetch: async () => ({
+    isTextBased: () => true,
+    send: async () => { sends += 1; notifySend(); await sendGate; return { id: 'reminder-message' }; },
+  }) } };
+
+  const firstRun = processShiftReminders(client, db, now);
+  await sendStarted;
+  await processShiftReminders(client, db, now);
+  assert.equal(sends, 1);
+  releaseSend();
+  await firstRun;
+  assert.equal(db.prepare('SELECT delivery_status FROM staff_shift_reminders WHERE shift_id = 1').get().delivery_status, 'sent');
+});
 
 test('daily report reminders wait, retry failures, and stop after a report is submitted', (t) => {
   const db = openDatabase(t);

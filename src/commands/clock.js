@@ -88,10 +88,21 @@ async function publishPanel(interaction, ctx) {
   const payload = { embeds: [await buildPanelEmbed(ctx.db, interaction.guild)], components: createPanelComponents() };
   let message;
   const savedMessageId = getConfigValue(ctx.db, 'panel_message');
+  const savedPanelChannelId = getConfigValue(ctx.db, 'panel_channel');
+  if (savedMessageId && savedPanelChannelId && savedPanelChannelId !== channelId) {
+    try {
+      const oldChannel = await interaction.client.channels.fetch(savedPanelChannelId);
+      const oldMessage = oldChannel?.isTextBased() ? await oldChannel.messages.fetch(savedMessageId) : null;
+      await oldMessage?.edit({ content: `This staff panel moved to <#${channelId}>.`, components: [] });
+    } catch (error) {
+      console.error('Could not retire the previous staff panel:', error.message);
+    }
+  }
   if (savedMessageId) {
     try {
-      const previous = await channel.messages.fetch(savedMessageId);
-      message = await previous.edit(payload);
+      const previousChannel = savedPanelChannelId && savedPanelChannelId !== channelId ? null : channel;
+      const previous = previousChannel && await previousChannel.messages.fetch(savedMessageId);
+      if (previous) message = await previous.edit(payload);
     } catch {
       message = null;
     }
@@ -99,7 +110,24 @@ async function publishPanel(interaction, ctx) {
   if (!message) message = await channel.send(payload);
 
   setConfigValue(ctx.db, 'panel_message', message.id);
+  setConfigValue(ctx.db, 'panel_channel', channel.id);
   return interaction.reply({ content: `Staff duty panel ${savedMessageId ? 'refreshed' : 'posted'} in <#${channel.id}>.`, ephemeral: true });
+}
+
+async function refreshStaffPanel(client, guild, db) {
+  const messageId = getConfigValue(db, 'panel_message');
+  const channelId = getConfigValue(db, 'panel_channel') ?? getConfigValue(db, 'STAFF_ACTIVITY_CHANNEL_ID');
+  if (!messageId || !channelId) return false;
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel?.isTextBased()) return false;
+    const message = await channel.messages.fetch(messageId);
+    await message.edit({ embeds: [await buildPanelEmbed(db, guild)], components: createPanelComponents() });
+    return true;
+  } catch (error) {
+    console.error('Could not refresh the staff duty panel:', error.message);
+    return false;
+  }
 }
 
 function createStatusEmbeds(db) {
@@ -188,6 +216,7 @@ async function handleClockButton(interaction, ctx) {
     await logStaffAction(interaction.client, ctx.db, {
       embeds: [makeEmbed(config.EMBED_COLORS.active, '🟢 Staff Clocked In', `<@${interaction.user.id}> • ${staff.roleName}\nStarted: ${unixTime(now)}`)],
     });
+    await refreshStaffPanel(interaction.client, interaction.guild, ctx.db);
     return safeEphemeralReply(interaction, { embeds: [embed] }, 60000);
   }
 
@@ -198,6 +227,7 @@ async function handleClockButton(interaction, ctx) {
     await logStaffAction(interaction.client, ctx.db, {
       embeds: [makeEmbed(config.EMBED_COLORS.error, '🔴 Staff Clocked Out', `<@${interaction.user.id}> • ${shift.role_name}\nShift Length: **${formatDuration(shift.duration_seconds)}**\nStarted: ${unixTime(shift.started_at)}\nEnded: ${unixTime(shift.ended_at)}`)],
     });
+    await refreshStaffPanel(interaction.client, interaction.guild, ctx.db);
     return safeEphemeralReply(interaction, createCheckoutReply(ctx.db, shift), 60000);
   }
 
@@ -240,4 +270,5 @@ module.exports = {
   createStatusEmbeds,
   handleClockButton,
   handleClockCommand,
+  refreshStaffPanel,
 };
