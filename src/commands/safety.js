@@ -74,7 +74,11 @@ async function submitReport(interaction, ctx) {
   let sentMessage;
   try {
     const channel = channelId && await interaction.client.channels.fetch(channelId);
-    if (channel?.isTextBased() && channel.send) {
+    const everyoneRole = interaction.guild.roles?.everyone;
+    const everyoneCanView = everyoneRole && channel?.permissionsFor
+      ? channel.permissionsFor(everyoneRole).has(PermissionFlagsBits.ViewChannel)
+      : null;
+    if (channel?.isTextBased() && channel.send && everyoneCanView === false) {
       sentMessage = await channel.send({ embeds: [embed], components: reportButtons(reportId) });
     }
   } catch (error) {
@@ -83,9 +87,6 @@ async function submitReport(interaction, ctx) {
   if (sentMessage) {
     ctx.db.prepare('UPDATE reports SET channel_id = ?, message_id = ? WHERE id = ?').run(sentMessage.channelId, sentMessage.id, reportId);
   }
-  await logStaffAction(interaction.client, ctx.db, {
-    embeds: [makeEmbed(config.EMBED_COLORS.warning, '🚨 Player Report Submitted', `Report #${reportId} • **${player}**\nSubmitted by: <@${interaction.user.id}>\nReason: ${reason}`)],
-  });
   return interaction.editReply({ content: sentMessage
     ? `Your report (#${reportId}) was sent privately to staff.`
     : `Your report (#${reportId}) was saved, but I could not deliver it. Staff should check REPORT_CHANNEL_ID and bot channel permissions.` });
@@ -111,9 +112,6 @@ async function updateReport(interaction, ctx) {
     .setColor(status === 'resolved' ? config.EMBED_COLORS.active : status === 'rejected' ? config.EMBED_COLORS.error : config.EMBED_COLORS.warning)
     .setFooter({ text: `${statusLabels[status]} by ${interaction.user.username} • ${new Date(now).toLocaleString('en-US', { timeZone: 'UTC', timeZoneName: 'short' })}` });
   await interaction.update({ embeds: [updatedEmbed], components: [reportButtons(reportId, status !== 'reviewing')[0]] });
-  await logStaffAction(interaction.client, ctx.db, {
-    embeds: [makeEmbed(config.EMBED_COLORS.management, '🚨 Report Status Updated', `Report #${reportId} • ${statusLabels[status]}\nUpdated by: <@${interaction.user.id}>`)],
-  });
 }
 
 function logModeration(db, action, staff, target, reason) {

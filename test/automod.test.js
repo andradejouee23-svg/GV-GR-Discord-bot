@@ -162,13 +162,14 @@ test('player reports use a persistent cooldown and do not create duplicate recor
   const sent = [];
   const client = { channels: { fetch: async () => ({
     isTextBased: () => true,
+    permissionsFor: () => ({ has: () => false }),
     send: async (payload) => { sent.push(payload); return { channelId: config.REPORT_CHANNEL_ID, id: `report-message-${sent.length}` }; },
   }) } };
   const interactionFor = () => ({
     fields: { getTextInputValue: (key) => ({ player: 'Player', reason: 'Rule breach', description: 'Details', evidence: '' })[key] },
     user: { id: 'reporter', username: 'Reporter' },
     client,
-    guild: { id: 'guild' },
+    guild: { id: 'guild', roles: { everyone: { id: 'guild' } } },
     deferReply: async () => {},
     editReply: async (payload) => payload,
     reply: async (payload) => payload,
@@ -178,6 +179,30 @@ test('player reports use a persistent cooldown and do not create duplicate recor
   assert.match(first.content, /report \(#1\) was sent privately/i);
   const repeat = await submitReport(interactionFor(), { db });
   assert.match(repeat.content, /Report cooldown: try again in/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM reports').get().count, 1);
+});
+
+test('player reports are not delivered to a channel visible to @everyone', async (t) => {
+  const db = openDatabase(t);
+  let sends = 0;
+  const client = { channels: { fetch: async () => ({
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    send: async () => { sends += 1; },
+  }) } };
+  const interaction = {
+    fields: { getTextInputValue: (key) => ({ player: 'Player', reason: 'Rule breach', description: 'Details', evidence: '' })[key] },
+    user: { id: 'public-channel-reporter', username: 'Reporter' },
+    client,
+    guild: { id: 'guild', roles: { everyone: { id: 'guild' } } },
+    deferReply: async () => {},
+    editReply: async (payload) => payload,
+    reply: async (payload) => payload,
+  };
+
+  const result = await submitReport(interaction, { db });
+  assert.match(result.content, /was saved, but I could not deliver it/i);
+  assert.equal(sends, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM reports').get().count, 1);
 });
 

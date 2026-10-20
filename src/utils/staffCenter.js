@@ -27,7 +27,6 @@ function createStaffCenterComponents() {
       new ButtonBuilder().setCustomId('gv:center:events').setLabel('Events').setEmoji('📅').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gv:center:rp:start').setLabel('Start RP Session').setEmoji('🎮').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:center:rp:controls').setLabel('RP Controls').setEmoji('🎛️').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('gv:center:rp:history').setLabel('RP History').setEmoji('📚').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }

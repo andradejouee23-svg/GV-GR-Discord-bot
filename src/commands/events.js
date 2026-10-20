@@ -6,6 +6,7 @@ const {
   ChannelType,
   ChannelSelectMenuBuilder,
   ModalBuilder,
+  PermissionFlagsBits,
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -18,19 +19,27 @@ const config = require('../../config');
 const {
   EVENT_TYPES,
   RP_TYPES,
+  cancelEventRecord,
   claimEventReminder,
+  claimEventAnnouncement,
+  completeEventRecord,
+  completeEventAnnouncement,
   createDraft,
   createEvent,
   createSession,
   deleteDraft,
+  endSessionRecord,
   editEvent,
   finishEventReminder,
   formatDurationMinutes,
   getDraft,
+  getCurrentSession,
+  getUpcomingEvents,
   getDueEventReminders,
   parseDurationMinutes,
   parseStartAt,
   recordEventHistory,
+  releaseEventAnnouncement,
   setEventAttendance,
   setSessionParticipation,
   updateDraft,
@@ -153,8 +162,8 @@ function eventEmbed(event) {
     `⏰ **Start Time**\n${localDate.toLocaleString(DateTime.TIME_SIMPLE)} ${localDate.offsetNameShort} (${timeZone})`,
     `⌛ **Duration**\n${formatDurationMinutes(event.duration_minutes)}`,
     `🎤 **Host**\n<@${event.host_id}>`,
-    `🔊 **Voice Channel**\n<#${event.voice_channel_id}>`,
-    `🆔 **Event ID**\n\`${event.event_code}\``,
+    `🔊 **Voice Channel**\n${event.voice_channel_id ? `<#${event.voice_channel_id}>` : 'Not configured'}`,
+    `🆔 **Event ID**\n\`${event.event_code ?? `#${event.id}`}\``,
     '',
     `📝 **Description**\n${event.description}`,
   ].join('\n');
@@ -171,6 +180,87 @@ function eventAnnouncementComponents(eventId, disabled = false) {
     new ButtonBuilder().setCustomId(`gv:event:rsvp:${eventId}:cant_go`).setLabel("Can't Go").setEmoji('🔴').setStyle(ButtonStyle.Danger).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`gv:event:details:${eventId}`).setLabel('Event Details').setEmoji('📋').setStyle(ButtonStyle.Secondary),
   )];
+}
+
+async function getEventAnnouncementChannel(interaction, channelId) {
+  const channel = channelId && await interaction.client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !channel.send || (channel.guildId && channel.guildId !== interaction.guild.id)) {
+    return { error: 'The configured event announcement channel is unavailable in this server.' };
+  }
+  const permissions = channel.permissionsFor?.(interaction.guild.members.me);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions.has(PermissionFlagsBits.SendMessages)
+    || !permissions.has(PermissionFlagsBits.EmbedLinks) || !permissions.has(PermissionFlagsBits.AttachFiles)) {
+    return { error: 'I need View Channel, Send Messages, Embed Links, and Attach Files permissions in the event announcement channel.' };
+  }
+  return { channel };
+}
+
+async function publishEventAnnouncement(interaction, ctx, event, channel) {
+  if (event.announcement_message_id === 'pending') {
+    return { uncertain: true, error: 'A previous announcement attempt has an unknown outcome. Check the event channel before retrying; it was not resent.' };
+  }
+  if (event.announcement_message_id) return { alreadyPublished: true, messageId: event.announcement_message_id };
+  const embed = eventEmbed(event);
+  const graphic = await makeGraphic(event.event_type, event.name);
+  if (!claimEventAnnouncement(ctx.db, event.id)) {
+    const current = ctx.db.prepare('SELECT announcement_message_id FROM events WHERE id = ?').get(event.id);
+    return current?.announcement_message_id && current.announcement_message_id !== 'pending'
+      ? { alreadyPublished: true, messageId: current.announcement_message_id }
+      : { uncertain: true, error: 'Another announcement attempt has claimed this event. Check the event channel before retrying; it was not resent.' };
+  }
+  let message;
+  try {
+    message = await channel.send({
+      embeds: [embed],
+      files: [graphic],
+      components: eventAnnouncementComponents(event.id),
+      allowedMentions: { users: [event.host_id] },
+    });
+  } catch (error) {
+    console.error(`Could not announce event ${event.event_code}:`, error.message);
+    const status = Number(error.status ?? error.statusCode);
+    if (status >= 400 && status < 500) {
+      releaseEventAnnouncement(ctx.db, event.id);
+      return { error: 'The event announcement was rejected. Correct the channel or message issue and retry the existing event.' };
+    }
+    return { uncertain: true, error: 'Discord did not confirm whether it accepted the announcement. Check the channel before taking further action; the event is locked against duplicate publication.' };
+  }
+  try {
+    if (!completeEventAnnouncement(ctx.db, event.id, message.id)) {
+      return { message, warning: 'was published, but its message reference could not be finalized. Do not republish; reconcile the existing message.' };
+    }
+  } catch (error) {
+    console.error(`Event ${event.event_code} was announced but its message reference could not be saved:`, error.message);
+    return { message, warning: 'was published, but its message reference could not be saved. Do not republish; reconcile the existing message.' };
+  }
+  return { message };
+}
+
+async function cancelScheduledEvent(interaction, ctx, eventId) {
+  const event = cancelEventRecord(ctx.db, eventId, interaction.user.id);
+  if (!event) return null;
+  const cancelledEmbed = eventEmbed(event).setTitle('❌ GV GR EVENT CANCELLED')
+    .setFooter({ text: `Cancelled by ${interaction.user.username}` });
+  const announcementUpdated = await updateEventAnnouncement(interaction.client, event, {
+    embeds: [cancelledEmbed],
+    components: eventAnnouncementComponents(event.id, true),
+  });
+  await logStaffAction(interaction.client, ctx.db, { embeds: [cancelledEmbed] });
+  return { ...event, announcementUpdated };
+}
+
+async function updateEventAnnouncement(client, event, payload) {
+  if (!event.announcement_channel_id || !event.announcement_message_id || event.announcement_message_id === 'pending') return false;
+  try {
+    const channel = await client.channels.fetch(event.announcement_channel_id);
+    const message = channel?.isTextBased() ? await channel.messages.fetch(event.announcement_message_id) : null;
+    if (!message) return false;
+    await message.edit(payload);
+    return true;
+  } catch (error) {
+    console.error(`Could not update event announcement ${event.event_code}:`, error.message);
+    return false;
+  }
 }
 
 function eventManageComponents() {
@@ -197,8 +287,8 @@ function channelSelectionComponents(kind, draftId, data = {}) {
       row(new ChannelSelectMenuBuilder().setCustomId(`gv:event:channel:${draftId}:voice`).setPlaceholder('Select event voice channel').setChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)),
     ]
     : [row(new ChannelSelectMenuBuilder().setCustomId(`gv:rp:channel:${draftId}:voice`).setPlaceholder('Select session voice channel').setChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice))];
-  selectors.push(row(new ButtonBuilder().setCustomId(`gv:${kind === 'event' ? 'event' : 'rp'}:publish:${draftId}`)
-    .setLabel(kind === 'event' ? 'Publish Event' : 'Start Session').setEmoji(kind === 'event' ? '📢' : '🎮')
+  selectors.push(row(new ButtonBuilder().setCustomId(`gv:${kind === 'event' ? 'event' : 'rp'}:${kind === 'event' ? 'publish' : 'preview'}:${draftId}`)
+    .setLabel(kind === 'event' ? 'Publish Event' : 'Preview Session').setEmoji(kind === 'event' ? '📢' : '🎮')
     .setStyle(ButtonStyle.Success).setDisabled(!selected)));
   return selectors;
 }
@@ -215,10 +305,9 @@ function createEventIdModal(action) {
 }
 
 function createUpcomingEmbed(db) {
-  const events = db.prepare(`SELECT event_code, name, event_type, host_id, starts_at, duration_minutes
-    FROM events WHERE status = 'scheduled' AND starts_at >= ? ORDER BY starts_at LIMIT 10`).all(new Date().toISOString());
+  const events = getUpcomingEvents(db);
   const description = events.length ? events.map((event) =>
-    `**${event.event_code} • ${event.name}**\n${ICONS[event.event_type] ?? '🎉'} ${event.event_type} • <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:F> • ${formatDurationMinutes(event.duration_minutes)}\nHost: <@${event.host_id}>`)
+    `**${event.event_code ?? `#${event.id}`} • ${event.name}**\n${ICONS[event.event_type] ?? '🎉'} ${event.event_type} • <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:F> • ${formatDurationMinutes(event.duration_minutes)}\nHost: <@${event.host_id}>`)
     .join('\n\n') : 'No upcoming events are scheduled.';
   return makeEmbed(config.EMBED_COLORS.info, '📅 UPCOMING GV GR EVENTS', description)
     .setFooter({ text: 'Select Going or Can’t Go on an event announcement to update your RSVP.' });
@@ -251,13 +340,11 @@ async function openRpControls(interaction, ctx) {
   const sessions = ctx.db.prepare("SELECT id, session_code, name, host_id, rp_type, lifecycle_status FROM sessions WHERE status = 'active' ORDER BY id DESC LIMIT 10").all();
   if (!sessions.length) return interaction.reply({
     embeds: [makeEmbed(config.EMBED_COLORS.info, '🎛️ RP SESSION CONTROLS', 'There are no active RP sessions.')],
-    components: [row(new ButtonBuilder().setCustomId('gv:center:rp:history').setLabel('Session History').setEmoji('📚').setStyle(ButtonStyle.Secondary))],
     ephemeral: true,
   });
   const description = sessions.map((session) => `**${session.session_code} • ${session.name}**\n${session.rp_type} • ${session.lifecycle_status.toUpperCase()} • Host: <@${session.host_id}>`).join('\n\n');
   const rows = sessions.slice(0, 5).map((session) => row(new ButtonBuilder()
     .setCustomId(`gv:rp:info:${session.id}`).setLabel(`Control ${session.session_code}`).setStyle(ButtonStyle.Secondary)));
-  rows.push(row(new ButtonBuilder().setCustomId('gv:center:rp:history').setLabel('Session History').setEmoji('📚').setStyle(ButtonStyle.Secondary)));
   return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, '🎛️ RP SESSION CONTROLS', description)], components: rows, ephemeral: true });
 }
 
@@ -283,27 +370,11 @@ async function openSessionCreation(interaction, ctx, { hostId = interaction.user
   return interaction.showModal(createSessionModal(draftId, timeZone));
 }
 
-function createSessionHistoryEmbed(db) {
-  const rows = db.prepare(`SELECT s.session_code, s.name, s.host_id, s.rp_type, s.status, s.lifecycle_status,
-      s.started_at, s.ended_at, s.duration_seconds, s.expected_duration,
-      (SELECT COUNT(*) FROM session_participants p WHERE p.session_id = s.id) AS participant_count
-    FROM sessions s WHERE s.status = 'completed' ORDER BY s.ended_at DESC, s.id DESC LIMIT 10`).all();
-  const description = rows.length ? rows.map((session) =>
-    `**\`${session.session_code}\` • ${session.name}**\n${session.rp_type} • ${session.lifecycle_status.toUpperCase()}\nHost: <@${session.host_id}> • <t:${Math.floor(Date.parse(session.started_at) / 1000)}:D>\nDuration: ${session.duration_seconds == null ? session.expected_duration || 'Not recorded' : formatDuration(session.duration_seconds)} • ${session.participant_count} participant${session.participant_count === 1 ? '' : 's'}`)
-    .join('\n\n') : 'No completed RP sessions yet.';
-  return makeEmbed(config.EMBED_COLORS.info, '📚 GV GR RP SESSION HISTORY', description);
-}
-
 async function handleStaffCenterControl(interaction, ctx) {
   const id = interaction.customId;
   if (id === 'gv:center:events') return openEventPanel(interaction, ctx);
   if (id === 'gv:center:rp:start') return openSessionCreation(interaction, ctx);
   if (id === 'gv:center:rp:controls') return openRpControls(interaction, ctx);
-  if (id === 'gv:center:rp:history') {
-    const member = await getInteractionMember(interaction);
-    if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Session history is available to configured staff only.', ephemeral: true });
-    return interaction.reply({ embeds: [createSessionHistoryEmbed(ctx.db)], ephemeral: true });
-  }
   if (!id.startsWith('gv:center:event:')) return null;
   const member = await getInteractionMember(interaction);
   if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'The Events panel is available to configured staff only.', ephemeral: true });
@@ -389,7 +460,7 @@ async function submitEventModal(interaction, ctx) {
     return interaction.showModal(new ModalBuilder().setCustomId(`gv:event:edit:${event.id}`).setTitle(`Edit ${event.event_code}`)
       .addComponents(
         row(modalText('name', 'Event name', TextInputStyle.Short, true, 100).setValue(event.name)),
-        row(modalText('type', 'Event type', TextInputStyle.Short, true, 40, EVENT_TYPES.join(', ')).setValue(event.event_type)),
+        row(modalText('type', 'Event type', TextInputStyle.Short, true, 40, 'Enter a supported event type').setValue(event.event_type)),
         row(modalText('date', `Date (${event.time_zone || 'UTC'})`, TextInputStyle.Short, true, 40).setValue(times.dateLabel)),
         row(modalText('time', `Start time (${event.time_zone || 'UTC'})`, TextInputStyle.Short, true, 20).setValue(times.timeLabel)),
         row(modalText('duration', 'Duration', TextInputStyle.Short, true, 20).setValue(formatDurationMinutes(event.duration_minutes))),
@@ -413,18 +484,11 @@ async function submitEventModal(interaction, ctx) {
       if (!isManagement(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Management access is required.', ephemeral: true });
       if (event.status !== 'scheduled') return interaction.reply({ content: `${event.event_code} is already ${event.status}.`, ephemeral: true });
       const now = new Date().toISOString();
-      ctx.db.prepare("UPDATE events SET status = 'cancelled' WHERE id = ? AND status = 'scheduled'").run(event.id);
-      recordEventHistory(ctx.db, event.id, interaction.user.id, 'cancelled', {}, now);
-      const embed = makeEmbed(config.EMBED_COLORS.error, '❌ GV GR EVENT CANCELLED', `**${event.name}** • \`${event.event_code}\`\nCancelled by <@${interaction.user.id}>.`);
-      if (event.announcement_channel_id && event.announcement_message_id) {
-        try {
-          const channel = await interaction.client.channels.fetch(event.announcement_channel_id);
-          const message = await channel.messages.fetch(event.announcement_message_id);
-          await message.edit({ embeds: [embed], components: eventAnnouncementComponents(event.id, true) });
-        } catch (error) { console.error(`Could not update cancelled event ${event.event_code}:`, error.message); }
-      }
-      await logStaffAction(interaction.client, ctx.db, { embeds: [embed] });
-      return interaction.reply({ content: `${event.event_code} has been cancelled.`, ephemeral: true });
+      const cancelled = await cancelScheduledEvent(interaction, ctx, event.id);
+      if (!cancelled) return interaction.reply({ content: `${event.event_code} changed before it could be cancelled.`, ephemeral: true });
+      return interaction.reply({ content: cancelled.announcementUpdated
+        ? `${cancelled.event_code} has been cancelled.`
+        : `${cancelled.event_code} is cancelled in the database, but its announcement could not be updated.`, ephemeral: true });
     }
     if (!isManagement(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Management access is required to change an event host.', ephemeral: true });
     return interaction.reply({
@@ -444,6 +508,7 @@ async function submitEventEdit(interaction, ctx) {
   const eventId = Number(interaction.customId.split(':').at(-1));
   const current = ctx.db.prepare('SELECT * FROM events WHERE id = ?').get(eventId);
   if (!current || current.status !== 'scheduled') return interaction.reply({ content: 'This event is no longer scheduled.', ephemeral: true });
+  if (current.announcement_message_id === 'pending') return interaction.reply({ content: 'A previous announcement attempt has an unknown outcome. Check the event channel before editing or republishing.', ephemeral: true });
   const timeZone = current.time_zone || getConfigValue(ctx.db, 'TIME_ZONE') || config.TIME_ZONE || 'UTC';
   const startsAt = parseStartAt(interaction.fields.getTextInputValue('date'), interaction.fields.getTextInputValue('time'), timeZone);
   const durationMinutes = parseDurationMinutes(interaction.fields.getTextInputValue('duration'));
@@ -457,18 +522,26 @@ async function submitEventEdit(interaction, ctx) {
     starts_at: startsAt,
     duration_minutes: durationMinutes,
     time_zone: timeZone,
+    announcement_channel_id: current.announcement_channel_id ?? getConfigValue(ctx.db, 'EVENT_CHANNEL_ID'),
   }, interaction.user.id);
+  if (!event) return interaction.reply({ content: 'This event changed before it could be edited.', ephemeral: true });
   const embed = eventEmbed(event);
-  if (event.announcement_channel_id && event.announcement_message_id) {
-    try {
-      const channel = await interaction.client.channels.fetch(event.announcement_channel_id);
-      const message = await channel.messages.fetch(event.announcement_message_id);
-      await message.edit({ embeds: [embed], files: [await makeGraphic(event.event_type, event.name)], components: eventAnnouncementComponents(event.id) });
-    } catch (error) { console.error(`Could not update event announcement ${event.event_code}:`, error.message); }
+  let announcementUpdated = true;
+  if (event.announcement_message_id) {
+    announcementUpdated = await updateEventAnnouncement(interaction.client, event, {
+      embeds: [embed], files: [await makeGraphic(event.event_type, event.name)], components: eventAnnouncementComponents(event.id),
+    });
+  } else {
+    const { channel, error } = await getEventAnnouncementChannel(interaction, event.announcement_channel_id);
+    if (error) return interaction.reply({ content: `${event.event_code} was updated, but it still has no announcement: ${error} Retry by editing it after the channel permissions are fixed.`, ephemeral: true });
+    const publication = await publishEventAnnouncement(interaction, ctx, event, channel);
+    if (publication.alreadyPublished) return interaction.reply({ content: `${event.event_code} was already announced; no duplicate was sent.`, ephemeral: true });
+    if (!publication.message) return interaction.reply({ content: `${event.event_code} was updated, but its announcement could not be sent. The event record is retained; retry by editing the event after correcting the channel issue.`, ephemeral: true });
   }
   const log = makeEmbed(config.EMBED_COLORS.management, '✏️ GV GR EVENT EDITED', `**${event.name}** • \`${event.event_code}\`\nEdited by <@${interaction.user.id}>\nNew date: <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:F>`);
   await logStaffAction(interaction.client, ctx.db, { embeds: [log] });
-  return interaction.reply({ content: `${event.event_code} has been updated.`, ephemeral: true });
+  return interaction.reply({ content: announcementUpdated ? `${event.event_code} has been updated.`
+    : `${event.event_code} was updated in the database, but its announcement could not be refreshed.`, ephemeral: true });
 }
 
 async function submitEventHost(interaction, ctx) {
@@ -477,57 +550,86 @@ async function submitEventHost(interaction, ctx) {
   const eventId = Number(interaction.customId.split(':').at(-1));
   const event = ctx.db.prepare("SELECT * FROM events WHERE id = ? AND status = 'scheduled'").get(eventId);
   if (!event) return interaction.reply({ content: 'This scheduled event could not be found.', ephemeral: true });
+  if (event.announcement_message_id === 'pending') return interaction.reply({ content: 'A previous announcement attempt has an unknown outcome. Check the event channel before editing or republishing.', ephemeral: true });
   const hostId = interaction.values?.[0]
     ?? interaction.fields.getTextInputValue('host_id').replace(/[<@!>]/g, '').trim();
   const host = /^\d{17,20}$/.test(hostId) ? await fetchGuildMember(interaction.guild, hostId) : null;
   if (!host || !getStaffRoleName(host, ctx.db) || !isStaff(host, interaction.guild, ctx.db)) return interaction.reply({ content: 'The host must be a current member of a configured staff role.', ephemeral: true });
-  editEvent(ctx.db, event.event_code, { host_id: hostId, host_name: host.user.username }, interaction.user.id);
-  const updated = ctx.db.prepare('SELECT * FROM events WHERE id = ?').get(event.id);
-  if (updated.announcement_channel_id && updated.announcement_message_id) {
-    try {
-      const channel = await interaction.client.channels.fetch(updated.announcement_channel_id);
-      const message = await channel.messages.fetch(updated.announcement_message_id);
-      await message.edit({ embeds: [eventEmbed(updated)], files: [await makeGraphic(updated.event_type, updated.name)] });
-    } catch (error) { console.error(`Could not update event host ${updated.event_code}:`, error.message); }
-  }
+  const updated = editEvent(ctx.db, event.event_code, {
+    host_id: hostId,
+    host_name: host.user.username,
+    announcement_channel_id: event.announcement_channel_id ?? getConfigValue(ctx.db, 'EVENT_CHANNEL_ID'),
+  }, interaction.user.id);
+  if (!updated) return interaction.reply({ content: 'This event changed before its host could be updated.', ephemeral: true });
+  const announcementUpdated = await updateEventAnnouncement(interaction.client, updated, {
+    embeds: [eventEmbed(updated)], files: [await makeGraphic(updated.event_type, updated.name)],
+  });
   const log = makeEmbed(config.EMBED_COLORS.management, '🎤 GV GR EVENT HOST CHANGED', `\`${updated.event_code}\` • ${updated.name}\nPrevious host: <@${event.host_id}>\nNew host: <@${hostId}>\nChanged by: <@${interaction.user.id}>`);
   await logStaffAction(interaction.client, ctx.db, { embeds: [log] });
-  return interaction.reply({ content: `Host updated for ${updated.event_code}.`, ephemeral: true });
+  return interaction.reply({ content: announcementUpdated ? `Host updated for ${updated.event_code}.`
+    : `Host updated for ${updated.event_code}, but the announcement could not be refreshed.`, ephemeral: true });
 }
 
 async function submitEventDraft(interaction, ctx, draftId) {
   const member = await getInteractionMember(interaction);
   if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Configured staff access is required.', ephemeral: true });
   const draft = getDraft(ctx.db, 'event_drafts', draftId, interaction.user.id);
-  if (!draft?.voiceChannelId || !draft?.announcementChannelId) return interaction.reply({ content: 'Select both an announcement channel and a voice channel before publishing.', ephemeral: true });
-  const channel = await interaction.client.channels.fetch(draft.announcementChannelId).catch(() => null);
-  if (!channel?.isTextBased() || !channel.send) return interaction.reply({ content: 'The selected announcement channel is no longer available.', ephemeral: true });
-  const event = createEvent(ctx.db, {
-    name: draft.name, eventType: draft.eventType, startsAt: draft.startsAt,
-    durationMinutes: draft.durationMinutes, description: draft.description, timeZone: draft.timeZone,
-    hostId: interaction.user.id, hostName: interaction.user.username,
-    voiceChannelId: draft.voiceChannelId, announcementChannelId: draft.announcementChannelId,
-  });
-  let message;
-  try {
-    message = await channel.send({ embeds: [eventEmbed(event)], files: [await makeGraphic(event.event_type, event.name)],
-      components: eventAnnouncementComponents(event.id), allowedMentions: { users: [event.host_id] } });
-  } catch (error) {
-    console.error(`Could not announce event ${event.event_code}:`, error.message);
+  if (!draft) return interaction.reply({ content: 'This event form expired. Open Events and start again.', ephemeral: true });
+  if (draft.publishing) return interaction.reply({ content: 'This event is already being published.', ephemeral: true });
+  if (!draft.voiceChannelId || !draft.announcementChannelId || !EVENT_TYPES.includes(draft.eventType)
+    || !draft.name || !draft.startsAt || !draft.durationMinutes) {
+    return interaction.reply({ content: 'Complete the event details, type, announcement channel, and voice channel before publishing.', ephemeral: true });
   }
-  if (message) ctx.db.prepare('UPDATE events SET announcement_message_id = ? WHERE id = ?').run(message.id, event.id);
-  deleteDraft(ctx.db, 'event_drafts', draftId);
+  if (Date.parse(draft.startsAt) <= Date.now()) return interaction.reply({ content: 'Choose a future start time before publishing.', ephemeral: true });
+  const claim = updateDraft(ctx.db, 'event_drafts', draftId, interaction.user.id, { publishing: true });
+  if (!claim) return interaction.reply({ content: 'This event form expired. Open Events and start again.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const { channel, error: channelError } = await getEventAnnouncementChannel(interaction, draft.announcementChannelId);
+  if (channelError) {
+    updateDraft(ctx.db, 'event_drafts', draftId, interaction.user.id, { publishing: false });
+    return interaction.editReply({ content: channelError });
+  }
+  let event = draft.eventId ? ctx.db.prepare("SELECT * FROM events WHERE id = ? AND status = 'scheduled'").get(draft.eventId) : null;
+  if (draft.eventId && !event) {
+    deleteDraft(ctx.db, 'event_drafts', draftId);
+    return interaction.editReply({ content: 'The saved event is no longer scheduled; the draft was closed.' });
+  }
+  if (!event) {
+    event = createEvent(ctx.db, {
+      name: draft.name, eventType: draft.eventType, startsAt: draft.startsAt,
+      durationMinutes: draft.durationMinutes, description: draft.description,
+      timeZone: draft.timeZone, hostId: interaction.user.id, hostName: interaction.user.username,
+      voiceChannelId: draft.voiceChannelId, announcementChannelId: draft.announcementChannelId,
+    });
+    updateDraft(ctx.db, 'event_drafts', draftId, interaction.user.id, { eventId: event.id, publishing: true });
+  }
+  if (event.announcement_message_id) {
+    deleteDraft(ctx.db, 'event_drafts', draftId);
+    return interaction.editReply({ content: event.announcement_message_id === 'pending'
+      ? `${event.event_code} has an announcement attempt with an unknown outcome. Check <#${event.announcement_channel_id}> before retrying; it was not resent.`
+      : `${event.event_code} was already announced in <#${event.announcement_channel_id}>.` });
+  }
+  const publication = await publishEventAnnouncement(interaction, ctx, event, channel);
+  if (publication.alreadyPublished) {
+    deleteDraft(ctx.db, 'event_drafts', draftId);
+    return interaction.editReply({ content: `${event.event_code} was already announced in <#${event.announcement_channel_id}>; no duplicate was sent.` });
+  }
+  if (publication.message) deleteDraft(ctx.db, 'event_drafts', draftId);
+  else updateDraft(ctx.db, 'event_drafts', draftId, interaction.user.id, { publishing: false, eventId: event.id });
   const log = makeEmbed(config.EMBED_COLORS.management, '🎉 GV GR EVENT CREATED', `**${event.name}** • \`${event.event_code}\`\nHost: <@${event.host_id}>\nDate: <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:F>\nCreated by: <@${interaction.user.id}>`);
-  await logStaffAction(interaction.client, ctx.db, { embeds: [log] });
-  return interaction.reply({ content: message ? `**${event.event_code}** is scheduled and announced in <#${event.announcement_channel_id}>.` :
-    `**${event.event_code}** is saved, but its announcement could not be sent. Check the bot's channel permissions.`, ephemeral: true });
+  if (publication.message) await logStaffAction(interaction.client, ctx.db, { embeds: [log] });
+  return interaction.editReply({ content: publication.warning ? `${event.event_code} ${publication.warning}`
+    : publication.message ? `**${event.event_code}** is scheduled and announced in <#${event.announcement_channel_id}>.`
+      : publication.error ?? `**${event.event_code}** is saved, but its announcement could not be sent.` });
 }
 
 async function submitSessionDraft(interaction, ctx, draftId) {
   const member = await getInteractionMember(interaction);
   if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Configured staff access is required.', ephemeral: true });
   const draft = getDraft(ctx.db, 'session_drafts', draftId, interaction.user.id);
-  if (!draft?.voiceChannelId) return interaction.reply({ content: 'Select a voice channel before starting the session.', ephemeral: true });
+  if (!draft) return interaction.reply({ content: 'This session form expired. Open the Staff Center and start again.', ephemeral: true });
+  if (draft.managementOnly && !isManagement(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Management access is required to publish a session for another host.', ephemeral: true });
+  if (!draft.voiceChannelId) return interaction.reply({ content: 'Select a voice channel before starting the session.', ephemeral: true });
   if (!RP_TYPES.includes(draft.rpType)) return interaction.reply({ content: `Choose an RP type from: ${RP_TYPES.join(', ')}.`, ephemeral: true });
   const scheduledStartAt = draft.scheduledStartAt;
   if (!scheduledStartAt || !Number.isFinite(Date.parse(scheduledStartAt))) return interaction.reply({ content: 'The session start time is invalid. Reopen the Staff Center and try again.', ephemeral: true });
@@ -536,33 +638,122 @@ async function submitSessionDraft(interaction, ctx, draftId) {
   if (!channelId) return interaction.reply({ content: 'Configure SESSION_CHANNEL_ID with `/staffconfig channel` before starting a session.', ephemeral: true });
   const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased() || !channel.send) return interaction.reply({ content: 'The configured RP announcement channel is unavailable.', ephemeral: true });
+  const permissions = channel.permissionsFor?.(interaction.guild.members.me);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions.has(PermissionFlagsBits.SendMessages)
+    || !permissions.has(PermissionFlagsBits.EmbedLinks)
+    || (!draft.imageUrl && !getConfigValue(ctx.db, 'SESSION_DEFAULT_IMAGE_URL') && !permissions.has(PermissionFlagsBits.AttachFiles))) {
+    return interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in the configured RP channel; generated banners also need Attach Files.', ephemeral: true });
+  }
   const host = await fetchGuildMember(interaction.guild, draft.hostId ?? interaction.user.id);
   if (!host || !getStaffRoleName(host, ctx.db) || !isStaff(host, interaction.guild, ctx.db)) {
     return interaction.reply({ content: 'The selected session host no longer has a configured staff role.', ephemeral: true });
   }
-  const session = createSession(ctx.db, {
-    ...draft,
-    hostId: host.id,
-    hostName: host.user.username,
-    scheduledStartAt,
-    timeZone: draft.timeZone,
-    announcementChannelId: channelId,
-    description: draft.description,
-    imageUrl: draft.imageUrl || null,
-  });
+  let session;
+  try {
+    session = createSession(ctx.db, {
+      ...draft,
+      hostId: host.id,
+      hostName: host.user.username,
+      scheduledStartAt,
+      timeZone: draft.timeZone,
+      announcementChannelId: channelId,
+      description: draft.description,
+      imageUrl: draft.imageUrl || null,
+    });
+  } catch (error) {
+    if (/already active or scheduled/i.test(error.message)) {
+      return interaction.reply({ content: 'Another RP session was created while this form was open. Open RP Controls to manage it.', ephemeral: true });
+    }
+    throw error;
+  }
   ctx.db.prepare('UPDATE sessions SET session_start_label = ? WHERE id = ?').run(draft.startLabel, session.id);
+  deleteDraft(ctx.db, 'session_drafts', draftId);
+  return publishSession(interaction, ctx, session, channel);
+}
+
+async function previewSessionDraft(interaction, ctx, draftId) {
+  const member = await getInteractionMember(interaction);
+  if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Configured staff access is required.', ephemeral: true });
+  const draft = getDraft(ctx.db, 'session_drafts', draftId, interaction.user.id);
+  if (!draft) return interaction.reply({ content: 'This session form expired. Open the Staff Center and start again.', ephemeral: true });
+  if (draft.managementOnly && !isManagement(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Management access is required to preview a session for another host.', ephemeral: true });
+  if (!draft.voiceChannelId || !RP_TYPES.includes(draft.rpType)) return interaction.reply({ content: 'Complete the session type and voice-channel selections before previewing.', ephemeral: true });
+  if (getCurrentSession(ctx.db)) return interaction.reply({ content: 'Another RP session is already active or scheduled.', ephemeral: true });
+  const channelId = getConfigValue(ctx.db, 'SESSION_CHANNEL_ID');
+  if (!channelId) return interaction.reply({ content: 'Configure SESSION_CHANNEL_ID before publishing an RP session.', ephemeral: true });
+  const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !channel.send || (channel.guildId && channel.guildId !== interaction.guild.id)) {
+    return interaction.reply({ content: 'The configured RP announcement channel is unavailable in this server.', ephemeral: true });
+  }
+  const botMember = interaction.guild.members.me;
+  const permissions = channel.permissionsFor?.(botMember);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions.has(PermissionFlagsBits.SendMessages)
+    || !permissions.has(PermissionFlagsBits.EmbedLinks)
+    || (!draft.imageUrl && !getConfigValue(ctx.db, 'SESSION_DEFAULT_IMAGE_URL') && !permissions.has(PermissionFlagsBits.AttachFiles))) {
+    return interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in the configured RP channel; generated banners also need Attach Files.', ephemeral: true });
+  }
+  const host = await fetchGuildMember(interaction.guild, draft.hostId ?? interaction.user.id);
+  if (!host || !getStaffRoleName(host, ctx.db) || !isStaff(host, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'The selected session host no longer has a configured staff role.', ephemeral: true });
+  }
+  const scheduled = Date.parse(draft.scheduledStartAt) > Date.now();
+  const preview = withSessionSettings({
+    ...draft,
+    id: 0,
+    session_code: 'GV-RP-PREVIEW',
+    host_id: host.id,
+    host_name: host.user.username,
+    rp_type: draft.rpType,
+    expected_duration: draft.expectedDuration,
+    voice_channel_id: draft.voiceChannelId,
+    started_at: draft.scheduledStartAt,
+    scheduled_start_at: draft.scheduledStartAt,
+    actual_started_at: scheduled ? null : new Date().toISOString(),
+    lifecycle_status: scheduled ? 'scheduled' : 'active',
+    paused_seconds: 0,
+    participant_count: 1,
+    session_start_label: draft.startLabel,
+  }, ctx.db);
+  await interaction.deferUpdate();
+  return interaction.editReply({
+    content: `Preview for **${preview.name}** in <#${channelId}>. Confirm to create and publish this session.`,
+    embeds: [sessionEmbed(preview, draft.startLabel)],
+    files: preview.image_url ? [] : [await makeGraphic(preview.rp_type, preview.name, 'GV GR RP SESSION')],
+    components: [row(
+      new ButtonBuilder().setCustomId(`gv:rp:confirm:${draftId}`).setLabel('Confirm & Publish').setEmoji('📢').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`gv:rp:cancel:${draftId}`).setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary),
+    )],
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function cancelSessionDraft(interaction, ctx, draftId) {
+  const member = await getInteractionMember(interaction);
+  if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Configured staff access is required.', ephemeral: true });
+  const draft = getDraft(ctx.db, 'session_drafts', draftId, interaction.user.id);
+  if (!draft) return interaction.reply({ content: 'This session form expired or was already processed.', ephemeral: true });
+  deleteDraft(ctx.db, 'session_drafts', draftId);
+  return interaction.update({ content: 'RP session draft cancelled.', embeds: [], components: [] });
+}
+
+async function publishSession(interaction, ctx, session, existingChannel = null) {
+  const channelId = session.announcement_channel_id || getConfigValue(ctx.db, 'SESSION_CHANNEL_ID');
+  const channel = existingChannel ?? (channelId && await interaction.client.channels.fetch(channelId).catch(() => null));
+  if (!channel?.isTextBased() || !channel.send) {
+    return interaction.reply({ content: `**${session.session_code}** was saved, but the configured RP announcement channel is unavailable.`, ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
   const displaySession = withSessionSettings(session, ctx.db);
-  const embed = sessionEmbed(displaySession, draft.startLabel);
+  const embed = sessionEmbed(displaySession, session.session_start_label);
   let message;
   try {
     message = await channel.send({ embeds: [embed], files: displaySession.image_url ? [] : [await makeGraphic(session.rp_type, session.name, 'GV GR RP SESSION')],
       components: sessionPublicComponents(session.id, false, displaySession.join_url), allowedMentions: { users: [session.host_id] } });
   } catch (error) { console.error(`Could not announce session ${session.session_code}:`, error.message); }
   if (message) ctx.db.prepare('UPDATE sessions SET channel_id = ?, message_id = ? WHERE id = ?').run(message.channelId, message.id, session.id);
-  deleteDraft(ctx.db, 'session_drafts', draftId);
   const log = makeEmbed(config.EMBED_COLORS.management, `🎮 GV GR RP SESSION ${session.lifecycle_status === 'scheduled' ? 'SCHEDULED' : 'STARTED'}`, `**${session.name}** • \`${session.session_code}\`\nHost: <@${session.host_id}>\nType: ${session.rp_type}\nStart: <t:${Math.floor(Date.parse(session.started_at) / 1000)}:F>`);
   await logStaffAction(interaction.client, ctx.db, { embeds: [log] });
-  return interaction.reply({ content: message ? `**${session.session_code}** ${session.lifecycle_status === 'scheduled' ? 'is scheduled for' : 'is live in'} <#${channelId}>.` : `**${session.session_code}** was saved, but the announcement could not be sent.`, ephemeral: true });
+  return interaction.editReply({ content: message ? `**${session.session_code}** ${session.lifecycle_status === 'scheduled' ? 'is scheduled for' : 'is live in'} <#${channelId}>.` : `**${session.session_code}** was saved, but the announcement could not be sent. Check the channel permissions before trying to publish again.` });
 }
 
 function withSessionSettings(session, db) {
@@ -782,20 +973,12 @@ async function handleSessionButton(interaction, ctx) {
       components: sessionPublicComponents(session.id, false, displaySession.join_url), allowedMentions: { users: [session.host_id] } });
     return interaction.followUp({ content: `${subAction === 'remind' ? 'Reminder' : 'Announcement'} sent to <#${channelId}>.`, ephemeral: true });
   } else if (subAction === 'end') {
-    const endedAt = new Date().toISOString();
-    const pauseAtEnd = session.lifecycle_status === 'paused' && session.paused_at
-      ? Math.max(0, Math.floor((Date.now() - Date.parse(session.paused_at)) / 1000)) : 0;
-    const actualStart = session.actual_started_at ?? session.started_at;
-    const durationSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(actualStart)) / 1000) - (session.paused_seconds ?? 0) - pauseAtEnd);
-    const ended = ctx.db.prepare(`UPDATE sessions SET status = 'completed', lifecycle_status = 'completed', ended_at = ?,
-      duration_seconds = ?, paused_seconds = paused_seconds + ? WHERE id = ? AND status = 'active'
-      AND lifecycle_status IN ('active', 'paused')`).run(endedAt, durationSeconds, pauseAtEnd, session.id);
-    if (!ended.changes) return interaction.editReply({ content: 'This session changed state before it could end.', components: [] });
-    const completed = getSession(ctx.db, session.id);
+    const completed = endSessionRecord(ctx.db, session.id);
+    if (!completed) return interaction.editReply({ content: 'This session changed state before it could end.', components: [] });
     await updateSessionAnnouncement(interaction.client, completed, ctx.db);
     const summary = sessionEmbed(withSessionSettings(completed, ctx.db));
     await logStaffAction(interaction.client, ctx.db, { embeds: [summary] });
-    return interaction.editReply({ content: `${session.session_code} ended. Active time: **${formatDuration(durationSeconds)}**.`, embeds: [], components: [] });
+    return interaction.editReply({ content: `${session.session_code} ended. Active time: **${formatDuration(completed.duration_seconds)}**.`, embeds: [], components: [] });
   }
   const updated = getSession(ctx.db, session.id);
   await updateSessionAnnouncement(interaction.client, updated, ctx.db);
@@ -808,6 +991,21 @@ async function handleSessionButton(interaction, ctx) {
 async function handleEventChannelSelect(interaction, ctx) {
   const [, kind, , draftId, selection] = interaction.customId.split(':');
   const table = kind === 'event' ? 'event_drafts' : 'session_drafts';
+  const member = await getInteractionMember(interaction);
+  if (!member || !isStaff(member, interaction.guild, ctx.db)) return interaction.reply({ content: 'Configured staff access is required.', ephemeral: true });
+  const draft = getDraft(ctx.db, table, draftId, interaction.user.id);
+  if (!draft) return interaction.reply({ content: 'This setup form expired. Start again from the Staff Center.', ephemeral: true });
+  if (draft.publishing) return interaction.reply({ content: 'This event draft is already being published.', ephemeral: true });
+  if (kind === 'rp' && draft.managementOnly && !isManagement(member, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'Management access is required to select channels for a session hosted by another staff member.', ephemeral: true });
+  }
+  const selectedChannel = await interaction.guild.channels.fetch(interaction.values[0]).catch(() => null);
+  const validType = selection === 'voice'
+    ? [ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(selectedChannel?.type)
+    : kind === 'event' && ['announce', 'announcement'].includes(selection)
+      ? [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(selectedChannel?.type)
+      : false;
+  if (!validType) return interaction.reply({ content: 'Choose a valid channel of the requested type from this server.', ephemeral: true });
   const key = selection === 'voice' ? 'voiceChannelId' : 'announcementChannelId';
   const data = updateDraft(ctx.db, table, draftId, interaction.user.id, { [key]: interaction.values[0] });
   if (!data) return interaction.reply({ content: 'This setup form expired. Start again from the Staff Center.', ephemeral: true });
@@ -825,6 +1023,12 @@ async function handleOperationTypeSelect(interaction, ctx, kind) {
   if (!values.includes(selectedType)) return interaction.reply({ content: 'Choose a valid type from the menu.', ephemeral: true });
   const table = kind === 'event' ? 'event_drafts' : 'session_drafts';
   const key = kind === 'event' ? 'eventType' : 'rpType';
+  const existingDraft = getDraft(ctx.db, table, draftId, interaction.user.id);
+  if (!existingDraft) return interaction.reply({ content: 'This setup form expired. Start again from the Staff Center.', ephemeral: true });
+  if (existingDraft.publishing) return interaction.reply({ content: 'This event is already being published.', ephemeral: true });
+  if (kind === 'rp' && existingDraft.managementOnly && !isManagement(member, interaction.guild, ctx.db)) {
+    return interaction.reply({ content: 'Management access is required to select a type for a session hosted by another staff member.', ephemeral: true });
+  }
   const draft = updateDraft(ctx.db, table, draftId, interaction.user.id, { [key]: selectedType });
   if (!draft) return interaction.reply({ content: 'This setup form expired. Start again from the Staff Center.', ephemeral: true });
   if (kind === 'event') return interaction.showModal(createEventDescriptionModal(draftId));
@@ -888,6 +1092,9 @@ async function handleOperationButton(interaction, ctx) {
   const id = interaction.customId;
   if (id.startsWith('gv:center:event:')) return handleEventIdButton(interaction, ctx);
   if (id === 'gv:center:event:create') return handleEventStart(interaction, ctx);
+  if (id.startsWith('gv:rp:preview:')) return previewSessionDraft(interaction, ctx, id.split(':').at(-1));
+  if (id.startsWith('gv:rp:confirm:')) return submitSessionDraft(interaction, ctx, id.split(':').at(-1));
+  if (id.startsWith('gv:rp:cancel:')) return cancelSessionDraft(interaction, ctx, id.split(':').at(-1));
   if (id.startsWith('gv:event:publish:')) return submitEventDraft(interaction, ctx, id.split(':').at(-1));
   if (id.startsWith('gv:rp:publish:')) return submitSessionDraft(interaction, ctx, id.split(':').at(-1));
   if (id.startsWith('gv:rp:')) return handleSessionButton(interaction, ctx);
@@ -947,7 +1154,8 @@ async function processEventTasks(client, db, now = new Date()) {
       fifteen_minutes: '🚨 EVENT STARTING SOON',
       started: '🎉 THE EVENT IS NOW STARTING',
     };
-    const message = `${titles[event.reminder_type]}\n\n**${event.name}** • \`${event.event_code}\`\n${event.reminder_type === 'started' ? `Join <#${event.voice_channel_id}> now.` : `Starts <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:R> in <#${event.voice_channel_id}>.`}\nHost: <@${event.host_id}>`;
+    const voiceDestination = event.voice_channel_id ? `<#${event.voice_channel_id}>` : 'the event announcement';
+    const message = `${titles[event.reminder_type]}\n\n**${event.name}** • \`${event.event_code}\`\n${event.reminder_type === 'started' ? `Join ${voiceDestination} now.` : `Starts <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:R> in ${voiceDestination}.`}\nHost: <@${event.host_id}>`;
     let delivered = false;
     try {
       const channel = event.announcement_channel_id && await client.channels.fetch(event.announcement_channel_id);
@@ -962,20 +1170,23 @@ async function processEventTasks(client, db, now = new Date()) {
     } catch (error) { console.error(`Could not send ${event.reminder_type} reminder for ${event.event_code}:`, error.message); }
     finishEventReminder(db, event.id, event.reminder_type, delivered);
     if (event.reminder_type === 'started') {
-      const log = makeEmbed(config.EMBED_COLORS.info, '🎉 GV GR EVENT STARTED', `\`${event.event_code}\` • ${event.name}\nHost: <@${event.host_id}>\nStarted: <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:F>`);
-      await logStaffAction(client, db, { embeds: [log] });
-      recordEventHistory(db, event.id, event.host_id, 'started', {}, now.toISOString());
+      if (delivered) {
+        const log = makeEmbed(config.EMBED_COLORS.info, '🎉 GV GR EVENT STARTED', `\`${event.event_code}\` • ${event.name}\nHost: <@${event.host_id}>\nStarted: <t:${Math.floor(Date.parse(event.starts_at) / 1000)}:F>`);
+        await logStaffAction(client, db, { embeds: [log] });
+        recordEventHistory(db, event.id, event.host_id, 'started', {}, now.toISOString());
+      }
     }
   }
 
   const completedEvents = db.prepare(`SELECT * FROM events WHERE status = 'scheduled' AND starts_at <= ?`).all(now.toISOString());
   for (const event of completedEvents) {
-    const endAt = Date.parse(event.starts_at) + event.duration_minutes * 60_000;
-    if (endAt > now.getTime()) continue;
-    const result = db.prepare("UPDATE events SET status = 'completed' WHERE id = ? AND status = 'scheduled'").run(event.id);
-    if (!result.changes) continue;
-    recordEventHistory(db, event.id, event.host_id, 'completed', {}, now.toISOString());
-    await logStaffAction(client, db, { embeds: [makeEmbed(config.EMBED_COLORS.info, '✅ GV GR EVENT COMPLETED', `\`${event.event_code}\` • ${event.name}\nHost: <@${event.host_id}>\nEnded: <t:${Math.floor(endAt / 1000)}:F>`)] });
+    const completed = completeEventRecord(db, event.id, now.toISOString());
+    if (!completed) continue;
+    await updateEventAnnouncement(client, completed, {
+      embeds: [eventEmbed(completed).setTitle('✅ GV GR EVENT COMPLETED')],
+      components: eventAnnouncementComponents(completed.id, true),
+    });
+    await logStaffAction(client, db, { embeds: [makeEmbed(config.EMBED_COLORS.info, '✅ GV GR EVENT COMPLETED', `\`${completed.event_code}\` • ${completed.name}\nHost: <@${completed.host_id}>\nEnded: <t:${Math.floor(Date.parse(completed.ended_at) / 1000)}:F>`)] });
   }
 
   const startingSessions = db.prepare(`SELECT id FROM sessions
@@ -1014,18 +1225,25 @@ module.exports = {
   eventAnnouncementComponents,
   eventEmbed,
   eventManageComponents,
+  cancelScheduledEvent,
+  getEventAnnouncementChannel,
   makeGraphic,
   handleEventButton,
   handleOperationButton,
   handleOperationModal,
   handleOperationSelect,
   handleStaffCenterControl,
-  createSessionHistoryEmbed,
+  getSession,
   openRpControls,
+  previewSessionDraft,
   openSessionCreation,
+  publishSession,
+  publishEventAnnouncement,
   processEventTasks,
   parseSessionStartAt,
   sessionEmbed,
   sessionControlComponents,
   sessionPublicComponents,
+  updateSessionAnnouncement,
+  withSessionSettings,
 };

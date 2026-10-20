@@ -3,13 +3,15 @@ const { mkdtempSync, rmSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { ChannelType } = require('discord.js');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
 const { handleButton } = require('../src/buttons');
-const { createEvent, createSession } = require('../src/services/operations');
+const { handleOperationsCommand } = require('../src/commands/operations');
+const { createDraft, createEvent, createSession, updateDraft } = require('../src/services/operations');
 const {
-  createSessionHistoryEmbed,
   eventManageComponents,
+  handleOperationButton,
   handleOperationModal,
   handleOperationSelect,
   handleStaffCenterControl,
@@ -40,7 +42,7 @@ test('Events panel exposes all requested management actions and staff can reach 
     actionRow.components.map((component) => component.data.custom_id));
   assert.ok(panelButtons.includes('gv:center:events'));
   assert.ok(panelButtons.includes('gv:center:rp:start'));
-  assert.ok(panelButtons.includes('gv:center:rp:history'));
+  assert.equal(panelButtons.includes('gv:center:rp:history'), false);
 
   const eventActions = eventManageComponents().flatMap((actionRow) =>
     actionRow.components.map((component) => component.data.custom_id));
@@ -77,7 +79,7 @@ test('Events panel exposes all requested management actions and staff can reach 
   assert.match(denied.content, /configured staff only/i);
 });
 
-test('session history shows persisted IDs, host, type, time, duration, and participants', (t) => {
+test('hiding RP History leaves completed session data and participants intact', (t) => {
   const db = openDatabase(t);
   db.prepare('INSERT INTO staff (user_id, username, role_name, first_seen_at) VALUES (?, ?, ?, ?)')
     .run('session-host', 'Host', 'Moderator', '2026-10-01T00:00:00.000Z');
@@ -91,13 +93,12 @@ test('session history shows persisted IDs, host, type, time, duration, and parti
   db.prepare(`INSERT INTO session_participants (session_id, user_id, username, joined_at) VALUES (?, ?, ?, ?)`)
     .run(sessionId, 'participant-1', 'Participant', '2026-10-04T18:10:00.000Z');
 
-  const embed = createSessionHistoryEmbed(db);
-  assert.match(embed.data.description, /GV-RP-0007/);
-  assert.match(embed.data.description, /Evening Patrol/);
-  assert.match(embed.data.description, /Police RP/);
-  assert.match(embed.data.description, /2h 0m/);
-  assert.match(embed.data.description, /1 participant/);
-  assert.match(embed.data.description, /<@session-host>/);
+  const session = db.prepare('SELECT session_code, name, status FROM sessions WHERE session_code = ?').get('GV-RP-0007');
+  const participants = db.prepare('SELECT user_id FROM session_participants WHERE session_id = ?').all(sessionId);
+  assert.deepEqual(session, { session_code: 'GV-RP-0007', name: 'Evening Patrol', status: 'completed' });
+  assert.deepEqual(participants, [{ user_id: 'participant-1' }]);
+  assert.equal(createStaffCenterComponents().flatMap((row) => row.components.map((component) => component.data.custom_id))
+    .some((customId) => customId.includes('rp:history')), false);
 });
 
 test('session embed separates scheduled and actual start and shows the configured join code', () => {
@@ -157,7 +158,17 @@ test('regular staff cannot open management-only event attendance controls', asyn
 test('staff event and RP session buttons flow through modal, type dropdown, and channel selection', async (t) => {
   const db = openDatabase(t);
   const staff = member('form-staff', config.STAFF_ROLE_IDS);
-  const guild = { ownerId: 'server-owner' };
+  const guild = {
+    ownerId: 'server-owner',
+    members: { fetch: async (userId) => userId === staff.id ? {
+      ...staff,
+      user: { id: staff.id, username: 'FormStaff' },
+    } : null },
+    channels: { fetch: async (channelId) => ({
+      id: channelId,
+      type: channelId.startsWith('1') ? ChannelType.GuildText : ChannelType.GuildVoice,
+    }) },
+  };
   const makeInteraction = (customId, values = {}) => ({
     customId,
     guild,
@@ -166,6 +177,7 @@ test('staff event and RP session buttons flow through modal, type dropdown, and 
     values: values.values ?? [],
     fields: { getTextInputValue: (field) => values.fields?.[field] ?? '' },
     reply: async (payload) => payload,
+    update: async (payload) => payload,
     showModal: async (modal) => modal,
   });
 
@@ -197,6 +209,132 @@ test('staff event and RP session buttons flow through modal, type dropdown, and 
   ]);
   const voicePrompt = await handleOperationSelect(makeInteraction(`gv:rp:type:${sessionDraftId}`, { values: ['Police RP'] }), { db });
   assert.equal(voicePrompt.components[0].components[0].data.custom_id, `gv:rp:channel:${sessionDraftId}:voice`);
+  const selectedVoice = await handleOperationSelect(makeInteraction(`gv:rp:channel:${sessionDraftId}:voice`, { values: ['223456789012345678'] }), { db });
+  assert.match(selectedVoice.content, /Voice channel selected/);
+
+  const eventDescriptionPrompt = await handleOperationModal(makeInteraction(`gv:event:create:${eventDraftId}:description`, {
+    fields: { description: 'Police patrol details.' },
+  }), { db });
+  const eventVoiceId = eventDescriptionPrompt.components[1].components[0].data.custom_id;
+  const eventVoice = await handleOperationSelect(makeInteraction(eventVoiceId, { values: ['223456789012345678'] }), { db });
+  assert.match(eventVoice.content, /Voice channel selected/);
+  const eventChannelId = eventVoice.components[0].components[0].data.custom_id;
+  const eventChannel = await handleOperationSelect(makeInteraction(eventChannelId, { values: ['123456789012345678'] }), { db });
+  assert.match(eventChannel.content, /Announcement channel selected/);
+});
+
+test('Start RP Session button and `/session start` open the shared authorized workflow', async (t) => {
+  const db = openDatabase(t);
+  const managementRole = '1556064708795306157';
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managementRole]));
+  const manager = member('session-manager', [managementRole]);
+  const host = member('session-host', config.STAFF_ROLE_IDS);
+  const members = new Map([
+    [manager.id, { ...manager, user: { id: manager.id, username: 'Manager' } }],
+    [host.id, { ...host, user: { id: host.id, username: 'Host' } }],
+  ]);
+  const guild = { ownerId: 'server-owner', members: { fetch: async (userId) => members.get(userId) ?? null } };
+  const makeInteraction = (customId) => ({
+    customId, guild, member: manager,
+    user: { id: manager.id, username: 'Manager' },
+    options: { getUser: () => ({ id: host.id, username: 'Host' }), getSubcommand: () => 'start' },
+    reply: async (payload) => payload,
+    showModal: async (modal) => modal,
+  });
+
+  const panelModal = await handleStaffCenterControl(makeInteraction('gv:center:rp:start'), { db });
+  const slashModal = await handleOperationsCommand({ ...makeInteraction(''), commandName: 'session' }, { db });
+  assert.match(panelModal.data.custom_id, /^gv:rp:create:[0-9a-f-]+$/);
+  assert.match(slashModal.data.custom_id, /^gv:rp:create:[0-9a-f-]+$/);
+  assert.notEqual(panelModal.data.custom_id, slashModal.data.custom_id);
+  const drafts = db.prepare('SELECT data_json FROM session_drafts ORDER BY rowid').all().map((row) => JSON.parse(row.data_json));
+  assert.equal(drafts.length, 2);
+  assert.equal(drafts.find((draft) => draft.managementOnly).hostId, host.id);
+  assert.equal(drafts.find((draft) => !draft.managementOnly).hostId, manager.id);
+
+  let denied;
+  await handleStaffCenterControl({
+    customId: 'gv:center:rp:start', guild, member: member('ordinary-user'),
+    user: { id: 'ordinary-user', username: 'Guest' },
+    reply: async (payload) => { denied = payload; },
+  }, { db });
+  assert.match(denied.content, /configured staff only/i);
+});
+
+test('RP session publish persists once and a repeated publish click cannot duplicate it', async (t) => {
+  const db = openDatabase(t);
+  const staff = member('publish-staff', config.STAFF_ROLE_IDS);
+  const guild = {
+    ownerId: 'server-owner',
+    members: { me: { id: 'session-bot' }, fetch: async (userId) => userId === staff.id ? { ...staff, user: { id: staff.id, username: 'Publisher' } } : null },
+  };
+  const draftId = createDraft(db, 'session_drafts', staff.id, {
+    name: 'Night Patrol', description: 'Community patrol.', activity: 'Patrol', rpType: 'Police RP',
+    expectedDuration: '1 hour', voiceChannelId: '123456789012345678', scheduledStartAt: new Date(Date.now() + 3600_000).toISOString(),
+    timeZone: 'UTC', hostId: staff.id, hostName: 'Publisher', startLabel: '6:30 PM',
+  });
+  updateDraft(db, 'session_drafts', draftId, staff.id, { voiceChannelId: '123456789012345678' });
+  const sent = [];
+  const client = { channels: { fetch: async (channelId) => ({
+    id: channelId,
+    guildId: guild.id,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    send: async (payload) => { sent.push(payload); return { id: `message-${sent.length}`, channelId }; },
+  }) } };
+  let final;
+  const interaction = {
+    customId: `gv:rp:preview:${draftId}`, guild, member: staff,
+    user: { id: staff.id, username: 'Publisher' }, client,
+    deferUpdate: async () => {},
+    deferReply: async () => {},
+    editReply: async (payload) => { final = payload; return payload; },
+    reply: async (payload) => { final = payload; return payload; },
+    update: async (payload) => { final = payload; return payload; },
+  };
+
+  await handleOperationButton(interaction, { db });
+  assert.match(final.content, /Preview for \*\*Night Patrol\*\*/);
+  const confirmId = final.components[0].components.find((button) => button.data.custom_id?.startsWith('gv:rp:confirm:')).data.custom_id;
+  interaction.customId = confirmId;
+  await handleOperationButton(interaction, { db });
+  assert.match(final.content, /GV-RP-0001/);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE status = 'active'").get().count, 1);
+  assert.equal(db.prepare('SELECT channel_id, message_id FROM sessions WHERE id = 1').get().message_id, 'message-1');
+  const sentMessages = sent.length;
+  await handleOperationButton(interaction, { db });
+  assert.match(final.content, /form expired/i);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 1);
+  assert.equal(sent.length, sentMessages);
+});
+
+test('selected-host session drafts recheck management access at each publish step', async (t) => {
+  const db = openDatabase(t);
+  const staff = member('downgraded-manager', config.STAFF_ROLE_IDS);
+  const guild = { ownerId: 'server-owner' };
+  const draftId = createDraft(db, 'session_drafts', staff.id, {
+    name: 'Management Hosted RP', description: 'Selected host session.', activity: 'Patrol',
+    rpType: 'Police RP', expectedDuration: '1 hour', voiceChannelId: '123456789012345678',
+    scheduledStartAt: new Date(Date.now() + 3600_000).toISOString(), timeZone: 'UTC',
+    hostId: 'selected-host', hostName: 'SelectedHost', managementOnly: true,
+  });
+  const makeInteraction = (customId, values = []) => ({
+    customId, guild, member: staff,
+    user: { id: staff.id, username: 'Former Manager' },
+    values,
+    reply: async (payload) => payload,
+    update: async (payload) => payload,
+  });
+
+  const type = await handleOperationSelect(makeInteraction(`gv:rp:type:${draftId}`, ['Police RP']), { db });
+  assert.match(type.content, /Management access is required/i);
+  const channel = await handleOperationSelect(makeInteraction(`gv:rp:channel:${draftId}:voice`, ['123456789012345678']), { db });
+  assert.match(channel.content, /Management access is required/i);
+  const preview = await handleOperationButton(makeInteraction(`gv:rp:preview:${draftId}`), { db });
+  assert.match(preview.content, /Management access is required/i);
+  const confirm = await handleOperationButton(makeInteraction(`gv:rp:confirm:${draftId}`), { db });
+  assert.match(confirm.content, /Management access is required/i);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 0);
 });
 
 test('public event RSVP and RP session Join/Leave buttons reach persistent handlers', async (t) => {
@@ -222,6 +360,7 @@ test('public event RSVP and RP session Join/Leave buttons reach persistent handl
       customId,
       user: { id: userId, username: userId },
       client,
+      deferUpdate: async () => {},
       deferReply: async () => {},
       editReply: async (payload) => { response = payload; },
       reply: async (payload) => { response = payload; },

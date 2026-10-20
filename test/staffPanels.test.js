@@ -132,7 +132,6 @@ test('Staff Center buttons and report reminder open the expected private flows',
     'gv:center:events',
     'gv:center:rp:start',
     'gv:center:rp:controls',
-    'gv:center:rp:history',
   ]);
   assert.ok(buttonIds.every((customId) => customId.startsWith('gv:center:')));
 

@@ -5,12 +5,22 @@ const path = require('node:path');
 const test = require('node:test');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
-const { handleOperationButton, processEventTasks } = require('../src/commands/events');
+const { handleOperationsCommand } = require('../src/commands/operations');
+const { handleOperationButton, handleOperationModal, processEventTasks } = require('../src/commands/events');
 const {
   claimEventReminder,
+  cancelEventRecord,
+  claimEventAnnouncement,
+  completeEventAnnouncement,
+  completeEventRecord,
   createEvent,
   createSession,
+  editEvent,
+  endSessionRecord,
   finishEventReminder,
+  getCurrentSession,
+  getUpcomingEvents,
+  releaseEventAnnouncement,
   getDueEventReminders,
   parseDurationMinutes,
   parseStartAt,
@@ -77,6 +87,197 @@ test('events keep unique stable IDs and allow one changeable RSVP per user', (t)
   assert.deepEqual(persisted, { event_code: 'GV-EV-0001', name: 'Night Patrol RP', time_zone: 'America/Chicago' });
 });
 
+test('shared event cancel and completion transitions are idempotent and retain history', (t) => {
+  const { db } = openDatabase(t);
+  const base = {
+    name: 'Service Event', eventType: 'Other', durationMinutes: 60, description: 'Service test',
+    hostId: 'event-host', hostName: 'Host', voiceChannelId: null,
+    announcementChannelId: '223456789012345678',
+  };
+  const cancelled = createEvent(db, { ...base, startsAt: '2026-10-22T18:00:00.000Z' }, '2026-10-20T12:00:00.000Z');
+  assert.equal(getUpcomingEvents(db, new Date('2026-10-20T12:00:00.000Z')).some((event) => event.id === cancelled.id), true);
+  assert.equal(cancelEventRecord(db, cancelled.id, 'manager', '2026-10-20T12:01:00.000Z').status, 'cancelled');
+  assert.equal(cancelEventRecord(db, cancelled.id, 'manager', '2026-10-20T12:02:00.000Z'), null);
+
+  const inProgress = createEvent(db, { ...base, name: 'In Progress', startsAt: '2026-10-20T11:30:00.000Z' }, '2026-10-20T10:00:00.000Z');
+  assert.equal(getUpcomingEvents(db, new Date('2026-10-20T12:00:00.000Z')).some((event) => event.id === inProgress.id), true);
+  assert.equal(getUpcomingEvents(db, new Date('2026-10-20T12:30:00.000Z')).some((event) => event.id === inProgress.id), false);
+
+  const completed = createEvent(db, { ...base, name: 'Elapsed Event', startsAt: '2026-10-20T10:00:00.000Z' }, '2026-10-20T09:00:00.000Z');
+  assert.equal(completeEventRecord(db, completed.id, '2026-10-20T10:59:59.000Z'), null);
+  const result = completeEventRecord(db, completed.id, '2026-10-20T11:00:00.000Z');
+  assert.equal(result.status, 'completed');
+  assert.equal(result.ended_at, '2026-10-20T11:00:00.000Z');
+  assert.equal(completeEventRecord(db, completed.id, '2026-10-20T12:00:00.000Z'), null);
+  assert.deepEqual(db.prepare('SELECT action FROM event_history WHERE event_id = ? ORDER BY id').all(completed.id), [
+    { action: 'created' }, { action: 'completed' },
+  ]);
+  assert.equal(getUpcomingEvents(db, new Date('2026-10-20T12:00:00.000Z')).some((event) => [cancelled.id, completed.id].includes(event.id)), false);
+});
+
+test('event announcement claims prevent concurrent sends and only allow definite-failure release', (t) => {
+  const { db } = openDatabase(t);
+  const event = createEvent(db, {
+    name: 'Claimed Announcement', eventType: 'Other', startsAt: '2026-10-22T18:00:00.000Z',
+    durationMinutes: 120, description: '', hostId: 'host', hostName: 'Host',
+    announcementChannelId: '223456789012345678',
+  }, '2026-10-20T12:00:00.000Z');
+  assert.equal(claimEventAnnouncement(db, event.id), true);
+  assert.equal(claimEventAnnouncement(db, event.id), false);
+  assert.equal(db.prepare('SELECT announcement_message_id FROM events WHERE id = ?').get(event.id).announcement_message_id, 'pending');
+  assert.equal(releaseEventAnnouncement(db, event.id), true);
+  assert.equal(claimEventAnnouncement(db, event.id), true);
+  assert.equal(completeEventAnnouncement(db, event.id, 'published-message'), true);
+  assert.equal(claimEventAnnouncement(db, event.id), false);
+  assert.equal(db.prepare('SELECT announcement_message_id FROM events WHERE id = ?').get(event.id).announcement_message_id, 'published-message');
+});
+
+test('rescheduling an event reopens its existing reminder slots without deleting records', (t) => {
+  const { db } = openDatabase(t);
+  const event = createEvent(db, {
+    name: 'Rescheduled Patrol', eventType: 'Police RP', startsAt: '2026-10-20T14:00:00.000Z',
+    durationMinutes: 60, description: 'Patrol', hostId: 'host', hostName: 'Host',
+    voiceChannelId: '123456789012345678', announcementChannelId: '223456789012345678',
+  }, '2026-10-20T12:00:00.000Z');
+  claimEventReminder(db, event.id, 'one_hour', '2026-10-20T13:00:00.000Z');
+  finishEventReminder(db, event.id, 'one_hour', true);
+
+  const updated = editEvent(db, event.event_code, { starts_at: '2026-10-20T16:00:00.000Z' }, 'manager', '2026-10-20T13:05:00.000Z');
+  assert.equal(updated.starts_at, '2026-10-20T16:00:00.000Z');
+  assert.deepEqual(db.prepare('SELECT reminder_type, delivery_status, attempted_at FROM event_reminders WHERE event_id = ?').get(event.id), {
+    reminder_type: 'one_hour', delivery_status: 'failed', attempted_at: '2026-10-20T13:05:00.000Z',
+  });
+  assert.deepEqual(getDueEventReminders(db, new Date('2026-10-20T15:00:00.000Z')).map((reminder) => reminder.reminder_type), ['one_hour']);
+  assert.equal(db.prepare("SELECT action FROM event_history WHERE event_id = ? ORDER BY id DESC LIMIT 1").get(event.id).action, 'edited');
+});
+
+test('slash event commands use shared service, validate channel permissions, and cancel the published panel', async (t) => {
+  const { db } = openDatabase(t);
+  const managerRole = '1556064708795306157';
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRole]));
+  const manager = { id: 'event-manager', roles: { cache: new Map([[managerRole, {}]]) } };
+  const serverId = config.SERVER_ID;
+  const channelId = config.EVENT_CHANNEL_ID;
+  const eventDateTime = new Date(Date.now() + 2 * 86400_000).toISOString();
+  let canPublish = false;
+  let sends = 0;
+  let eventMessage;
+  const channel = {
+    id: channelId, guildId: serverId,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => canPublish }),
+    send: async (payload) => {
+      sends += 1;
+      if (payload.components?.length) {
+        eventMessage = { id: 'event-announcement', channelId, edit: async (editPayload) => { eventMessage.edited = editPayload; } };
+        return eventMessage;
+      }
+      return { id: `log-${sends}`, channelId };
+    },
+    messages: { fetch: async () => eventMessage },
+  };
+  const client = { user: { id: 'bot' }, channels: { fetch: async () => channel } };
+  const guild = {
+    id: serverId, ownerId: 'server-owner', members: {
+      me: { id: 'bot' }, fetch: async () => manager,
+    }, channels: { fetch: async () => channel },
+  };
+  const command = (action) => ({
+    commandName: 'event', guild, client,
+    user: { id: manager.id, username: 'Manager' },
+    options: {
+      getSubcommand: () => action,
+      getString: (key) => ({ name: 'Slash Event', datetime: eventDateTime, description: 'A scheduled event.' })[key],
+      getInteger: () => 1,
+    },
+    deferReply: async () => {},
+    editReply: async (payload) => payload,
+    reply: async (payload) => payload,
+  });
+
+  const blocked = await handleOperationsCommand(command('create'), { db, client, config });
+  assert.match(blocked.content, /permissions/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 0);
+
+  canPublish = true;
+  const created = await handleOperationsCommand(command('create'), { db, client, config });
+  assert.match(created.content, /GV-EV-0001 scheduled and announced/);
+  assert.equal(db.prepare('SELECT event_code, announcement_message_id FROM events').get().announcement_message_id, 'event-announcement');
+  assert.equal(eventMessage.edited, undefined);
+  const listed = await handleOperationsCommand(command('list'), { db, client, config });
+  assert.match(listed.embeds[0].data.description, /GV-EV-0001 • Slash Event/);
+
+  const cancelled = await handleOperationsCommand(command('cancel'), { db, client, config });
+  assert.match(cancelled.content, /GV-EV-0001 cancelled/);
+  assert.equal(db.prepare('SELECT status FROM events WHERE id = 1').get().status, 'cancelled');
+  assert.ok(eventMessage.edited.components[0].components[0].data.disabled);
+});
+
+test('a slash-created event with a failed announcement can be published later without a duplicate record', async (t) => {
+  const { db } = openDatabase(t);
+  const managerRole = '1556064708795306157';
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRole]));
+  const manager = { id: 'retry-manager', roles: { cache: new Map([[managerRole, {}]]) } };
+  const dateTime = new Date(Date.now() + 2 * 86400_000).toISOString();
+  let failAnnouncement = true;
+  const sent = [];
+  const channel = {
+    id: config.EVENT_CHANNEL_ID, guildId: config.SERVER_ID,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    send: async (payload) => {
+      if (payload.components?.length && failAnnouncement) {
+        failAnnouncement = false;
+        throw Object.assign(new Error('definite permission rejection'), { status: 403 });
+      }
+      const message = { id: `sent-${sent.length + 1}`, channelId: config.EVENT_CHANNEL_ID, edit: async (editPayload) => { message.edited = editPayload; } };
+      sent.push({ payload, message });
+      return message;
+    },
+    messages: { fetch: async (id) => sent.find((entry) => entry.message.id === id)?.message },
+  };
+  const client = { user: { id: 'bot' }, channels: { fetch: async () => channel } };
+  const guild = { id: config.SERVER_ID, ownerId: 'owner', members: { me: { id: 'bot' }, fetch: async () => manager } };
+  const create = await handleOperationsCommand({
+    commandName: 'event', guild, client, user: { id: manager.id, username: 'Manager' },
+    options: {
+      getSubcommand: () => 'create',
+      getString: (key) => ({ name: 'Retry Event', datetime: dateTime, description: 'Recoverable announcement.' })[key],
+    },
+    deferReply: async () => {},
+    editReply: async (payload) => payload,
+    reply: async (payload) => payload,
+  }, { db, client, config });
+  assert.match(create.content, /Event GV-EV-0001 was saved, but I could not announce it/i);
+  const saved = db.prepare('SELECT * FROM events').get();
+  assert.ok(saved.event_code);
+  assert.equal(saved.announcement_message_id, null);
+
+  const openEdit = await handleOperationModal({
+    customId: 'gv:event:manage:edit', guild, member: manager,
+    user: { id: manager.id, username: 'Manager' },
+    fields: { getTextInputValue: () => saved.event_code },
+    showModal: async (modal) => modal,
+    reply: async (payload) => payload,
+  }, { db });
+  const updated = new Date(dateTime);
+  const editResult = await handleOperationModal({
+    customId: openEdit.data.custom_id, guild, member: manager, client,
+    user: { id: manager.id, username: 'Manager' },
+    fields: { getTextInputValue: (key) => ({
+      name: 'Retry Event', type: 'Other', date: updated.toISOString().slice(0, 10),
+      time: updated.toISOString().slice(11, 16), duration: '2 hours',
+    })[key] },
+    reply: async (payload) => payload,
+  }, { db });
+  assert.match(editResult.content, /has been updated/);
+  const after = db.prepare('SELECT event_code, announcement_message_id FROM events').get();
+  assert.equal(after.event_code, saved.event_code);
+  assert.ok(after.announcement_message_id);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+  assert.equal(sent.filter((entry) => entry.payload.components?.length).length, 1);
+});
+
 test('event reminder windows are distinct, deduplicated, retry failed sends, and ignore cancelled events', (t) => {
   const { db } = openDatabase(t);
   const event = createEvent(db, {
@@ -132,6 +333,27 @@ test('a concurrently cancelled event is rechecked before reminder delivery', asy
   assert.equal(db.prepare('SELECT status FROM events WHERE id = ?').get(event.id).status, 'cancelled');
 });
 
+test('failed event-start reminders do not write repeated started-history entries', async (t) => {
+  const { db } = openDatabase(t);
+  const now = new Date('2026-10-20T18:00:00.000Z');
+  const event = createEvent(db, {
+    name: 'Reminder Retry', eventType: 'Other', startsAt: now.toISOString(), durationMinutes: 60,
+    description: 'Retry history check', hostId: 'host', hostName: 'Host',
+    voiceChannelId: null, announcementChannelId: '223456789012345678',
+  }, '2026-10-19T18:00:00.000Z');
+  const attempted = [];
+  const client = { channels: { fetch: async () => ({
+    isTextBased: () => true,
+    send: async (payload) => { attempted.push(payload); throw new Error('mock send denied'); },
+  }) } };
+
+  await processEventTasks(client, db, now);
+  await processEventTasks(client, db, new Date(now.getTime() + 60_000));
+  assert.doesNotMatch(attempted[0].embeds[0].data.description, /<#null>/);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM event_history WHERE event_id = ? AND action = 'started'").get(event.id).count, 0);
+  assert.equal(db.prepare("SELECT delivery_status FROM event_reminders WHERE event_id = ? AND reminder_type = 'started'").get(event.id).delivery_status, 'failed');
+});
+
 test('scheduled sessions persist, generate unique IDs, and track join/leave without duplicates', (t) => {
   const store = openDatabase(t);
   let db = store.db;
@@ -158,6 +380,66 @@ test('scheduled sessions persist, generate unique IDs, and track join/leave with
   db = store.reopen();
   const persisted = db.prepare('SELECT session_code, lifecycle_status, started_at, time_zone FROM sessions WHERE id = ?').get(session.id);
   assert.deepEqual(persisted, { session_code: 'GV-RP-0001', lifecycle_status: 'scheduled', started_at: '2026-10-05T18:30:00.000Z', time_zone: 'America/Chicago' });
+});
+
+test('shared session end refuses scheduled sessions and atomically accounts for pauses', (t) => {
+  const { db } = openDatabase(t);
+  const startedAt = new Date('2026-10-20T12:00:00.000Z');
+  const scheduled = createSession(db, {
+    name: 'Scheduled Patrol', activity: 'Patrol', hostId: 'host-one', hostName: 'Host',
+    rpType: 'Police RP', expectedDuration: '2 hours', voiceChannelId: '123456789012345678',
+    announcementChannelId: '223456789012345678', scheduledStartAt: '2026-10-20T13:00:00.000Z',
+  }, startedAt.toISOString());
+  assert.equal(getCurrentSession(db).id, scheduled.id);
+  assert.equal(endSessionRecord(db, scheduled.id, '2026-10-20T12:30:00.000Z'), null);
+  assert.equal(db.prepare('SELECT lifecycle_status FROM sessions WHERE id = ?').get(scheduled.id).lifecycle_status, 'scheduled');
+
+  db.prepare("UPDATE sessions SET status = 'completed', lifecycle_status = 'cancelled', ended_at = ? WHERE id = ?")
+    .run('2026-10-20T12:31:00.000Z', scheduled.id);
+  const active = createSession(db, {
+    name: 'Paused Patrol', activity: 'Patrol', hostId: 'host-two', hostName: 'Host',
+    rpType: 'Police RP', expectedDuration: '2 hours', voiceChannelId: '123456789012345678',
+    announcementChannelId: '223456789012345678', scheduledStartAt: startedAt.toISOString(),
+  }, startedAt.toISOString());
+  db.prepare("UPDATE sessions SET lifecycle_status = 'paused', paused_at = ?, paused_seconds = 5 WHERE id = ?")
+    .run('2026-10-20T12:00:10.000Z', active.id);
+
+  const ended = endSessionRecord(db, active.id, '2026-10-20T12:00:30.000Z');
+  assert.equal(ended.lifecycle_status, 'completed');
+  assert.equal(ended.duration_seconds, 5);
+  assert.equal(ended.paused_seconds, 25);
+  assert.equal(endSessionRecord(db, active.id, '2026-10-20T12:01:00.000Z'), null);
+});
+
+test('`/session status` reports the shared session and `/session end` completes it once', async (t) => {
+  const { db } = openDatabase(t);
+  const managerRole = '1556064708795306157';
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRole]));
+  const manager = { id: 'session-manager', roles: { cache: new Map([[managerRole, {}]]) } };
+  const guild = { id: 'session-guild', ownerId: 'server-owner', members: { fetch: async () => manager } };
+  const session = createSession(db, {
+    name: 'Shared Status Patrol', description: 'Evening patrol.', activity: 'Patrol',
+    hostId: 'session-host', hostName: 'Host', rpType: 'Police RP', expectedDuration: '1 hour',
+    voiceChannelId: '123456789012345678', announcementChannelId: '223456789012345678',
+  });
+  const client = { channels: { fetch: async () => ({ isTextBased: () => true, send: async () => ({}) }) } };
+  const command = (action) => ({
+    commandName: 'session', guild, client,
+    user: { id: manager.id, username: 'Manager' },
+    options: { getSubcommand: () => action },
+    reply: async (payload) => payload,
+  });
+
+  const status = await handleOperationsCommand(command('status'), { db });
+  assert.equal(status.ephemeral, true);
+  assert.match(status.embeds[0].data.description, /Shared Status Patrol/i);
+  assert.match(status.embeds[0].data.description, /GV-RP-0001/);
+
+  const ended = await handleOperationsCommand(command('end'), { db });
+  assert.match(ended.content, /Session GV-RP-0001 ended/);
+  assert.equal(db.prepare('SELECT status FROM sessions WHERE id = ?').get(session.id).status, 'completed');
+  const repeated = await handleOperationsCommand(command('end'), { db });
+  assert.match(repeated.content, /There is no active RP session/);
 });
 
 test('background tasks start/complete events and sessions and refresh their public posts', async (t) => {

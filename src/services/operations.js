@@ -94,8 +94,9 @@ function createEvent(db, data, now = new Date().toISOString()) {
       (name, description, host_id, host_name, starts_at, status, created_at, event_type, duration_minutes,
        voice_channel_id, announcement_channel_id, time_zone)
       VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?)`)
-      .run(data.name, data.description, data.hostId, data.hostName, data.startsAt, now,
-        data.eventType, data.durationMinutes, data.voiceChannelId, data.announcementChannelId, data.timeZone ?? 'UTC');
+      .run(data.name, data.description ?? '', data.hostId, data.hostName, data.startsAt, now,
+        data.eventType ?? 'Other', data.durationMinutes ?? 120, data.voiceChannelId ?? null,
+        data.announcementChannelId ?? null, data.timeZone ?? 'UTC');
     const id = Number(result.lastInsertRowid);
     const eventCode = nextPublicId('GV-EV', id);
     db.prepare('UPDATE events SET event_code = ? WHERE id = ?').run(eventCode, id);
@@ -105,16 +106,71 @@ function createEvent(db, data, now = new Date().toISOString()) {
   return create();
 }
 
+function claimEventAnnouncement(db, eventId) {
+  return db.prepare(`UPDATE events SET announcement_message_id = 'pending'
+    WHERE id = ? AND status = 'scheduled' AND announcement_message_id IS NULL`).run(eventId).changes > 0;
+}
+
+function completeEventAnnouncement(db, eventId, messageId) {
+  return db.prepare(`UPDATE events SET announcement_message_id = ?
+    WHERE id = ? AND announcement_message_id = 'pending'`).run(messageId, eventId).changes > 0;
+}
+
+function releaseEventAnnouncement(db, eventId) {
+  return db.prepare(`UPDATE events SET announcement_message_id = NULL
+    WHERE id = ? AND announcement_message_id = 'pending'`).run(eventId).changes > 0;
+}
+
 function editEvent(db, eventCode, updates, actorId, now = new Date().toISOString()) {
-  const event = db.prepare("SELECT * FROM events WHERE event_code = ? AND status = 'scheduled'").get(eventCode);
-  if (!event) return null;
-  const merged = { ...event, ...updates };
-  db.prepare(`UPDATE events SET name = ?, event_type = ?, starts_at = ?, duration_minutes = ?, description = ?,
-    host_id = ?, host_name = ?, voice_channel_id = ?, announcement_channel_id = ?, time_zone = ?, edited_at = ? WHERE id = ?`)
-    .run(merged.name, merged.event_type, merged.starts_at, merged.duration_minutes, merged.description,
-      merged.host_id, merged.host_name, merged.voice_channel_id, merged.announcement_channel_id, merged.time_zone ?? 'UTC', now, event.id);
-  recordEventHistory(db, event.id, actorId, 'edited', { eventCode, changes: updates }, now);
-  return db.prepare('SELECT * FROM events WHERE id = ?').get(event.id);
+  const edit = db.transaction(() => {
+    const event = db.prepare("SELECT * FROM events WHERE event_code = ? AND status = 'scheduled'").get(eventCode);
+    if (!event) return null;
+    const merged = { ...event, ...updates };
+    const rescheduled = merged.starts_at !== event.starts_at;
+    db.prepare(`UPDATE events SET name = ?, event_type = ?, starts_at = ?, duration_minutes = ?, description = ?,
+      host_id = ?, host_name = ?, voice_channel_id = ?, announcement_channel_id = ?, time_zone = ?, edited_at = ? WHERE id = ?`)
+      .run(merged.name, merged.event_type, merged.starts_at, merged.duration_minutes, merged.description,
+        merged.host_id, merged.host_name, merged.voice_channel_id, merged.announcement_channel_id, merged.time_zone ?? 'UTC', now, event.id);
+    if (rescheduled) {
+      db.prepare("UPDATE event_reminders SET delivery_status = 'failed', attempted_at = ? WHERE event_id = ?")
+        .run(now, event.id);
+    }
+    recordEventHistory(db, event.id, actorId, 'edited', { eventCode, changes: updates }, now);
+    return db.prepare('SELECT * FROM events WHERE id = ?').get(event.id);
+  });
+  return edit();
+}
+
+function cancelEventRecord(db, eventId, actorId, now = new Date().toISOString()) {
+  const cancel = db.transaction(() => {
+    const event = db.prepare("SELECT * FROM events WHERE id = ? AND status = 'scheduled'").get(eventId);
+    if (!event) return null;
+    const result = db.prepare("UPDATE events SET status = 'cancelled' WHERE id = ? AND status = 'scheduled'").run(eventId);
+    if (!result.changes) return null;
+    recordEventHistory(db, eventId, actorId, 'cancelled', {}, now);
+    return db.prepare('SELECT * FROM events WHERE id = ?').get(eventId);
+  });
+  return cancel();
+}
+
+function completeEventRecord(db, eventId, now = new Date().toISOString()) {
+  const complete = db.transaction(() => {
+    const event = db.prepare("SELECT * FROM events WHERE id = ? AND status = 'scheduled'").get(eventId);
+    if (!event) return null;
+    const endedAt = Date.parse(event.starts_at) + event.duration_minutes * 60_000;
+    if (!Number.isFinite(endedAt) || endedAt > Date.parse(now)) return null;
+    const result = db.prepare("UPDATE events SET status = 'completed' WHERE id = ? AND status = 'scheduled'").run(eventId);
+    if (!result.changes) return null;
+    recordEventHistory(db, eventId, event.host_id, 'completed', {}, now);
+    return { ...db.prepare('SELECT * FROM events WHERE id = ?').get(eventId), ended_at: new Date(endedAt).toISOString() };
+  });
+  return complete();
+}
+
+function getUpcomingEvents(db, now = new Date()) {
+  return db.prepare(`SELECT * FROM events WHERE status = 'scheduled'
+    AND julianday(starts_at) + (duration_minutes / 1440.0) > julianday(?)
+    ORDER BY starts_at ASC LIMIT 10`).all(now.toISOString());
 }
 
 function setEventAttendance(db, eventId, userId, username, response, now = new Date().toISOString()) {
@@ -152,6 +208,28 @@ function createSession(db, data, now = new Date().toISOString()) {
     return db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
   });
   return create();
+}
+
+function getCurrentSession(db) {
+  return db.prepare("SELECT * FROM sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1").get() ?? null;
+}
+
+function endSessionRecord(db, sessionId, now = new Date().toISOString()) {
+  const end = db.transaction(() => {
+    const session = db.prepare('SELECT * FROM sessions WHERE id = ? AND status = \'active\'').get(sessionId);
+    if (!session || !['active', 'paused'].includes(session.lifecycle_status)) return null;
+    const actualStart = session.actual_started_at ?? session.started_at;
+    const pausedNow = session.lifecycle_status === 'paused' && session.paused_at
+      ? Math.max(0, Math.floor((Date.parse(now) - Date.parse(session.paused_at)) / 1000)) : 0;
+    const durationSeconds = Math.max(0, Math.floor((Date.parse(now) - Date.parse(actualStart)) / 1000)
+      - (session.paused_seconds ?? 0) - pausedNow);
+    const result = db.prepare(`UPDATE sessions SET status = 'completed', lifecycle_status = 'completed',
+      ended_at = ?, duration_seconds = ?, paused_seconds = paused_seconds + ?
+      WHERE id = ? AND status = 'active' AND lifecycle_status IN ('active', 'paused')`)
+      .run(now, durationSeconds, pausedNow, sessionId);
+    return result.changes ? db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) : null;
+  });
+  return end();
 }
 
 function setSessionParticipation(db, sessionId, userId, username, joining, now = new Date().toISOString()) {
@@ -236,18 +314,26 @@ module.exports = {
   EVENT_TYPES,
   RP_TYPES,
   claimEventReminder,
+  cancelEventRecord,
+  claimEventAnnouncement,
+  completeEventAnnouncement,
+  completeEventRecord,
   createDraft,
   createEvent,
   createSession,
+  endSessionRecord,
   deleteDraft,
   editEvent,
   finishEventReminder,
   formatDurationMinutes,
   getDraft,
+  getUpcomingEvents,
+  getCurrentSession,
   getDueEventReminders,
   nextPublicId,
   parseDurationMinutes,
   parseStartAt,
+  releaseEventAnnouncement,
   recordEventHistory,
   setEventAttendance,
   setSessionParticipation,

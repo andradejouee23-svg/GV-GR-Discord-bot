@@ -82,6 +82,9 @@ function managementComponents() {
       new ButtonBuilder().setCustomId('mgmt:leaderboard').setLabel('Weekly Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mgmt:send_custom').setLabel('Send Custom').setEmoji('📨').setStyle(ButtonStyle.Success),
+    ),
+    new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId('mgmt:staff_history').setPlaceholder('View a staff member’s history'),
     ),
   ];
@@ -373,6 +376,7 @@ async function handleManagementButton(interaction, ctx) {
     case 'mgmt:reports': return interaction.update({ embeds: [reportEmbed(ctx.db)], components: managementComponents() });
     case 'mgmt:activity': return interaction.update({ embeds: [activityEmbed(ctx.db)], components: managementComponents() });
     case 'mgmt:leaderboard': return interaction.update({ embeds: [weeklyLeaderboardEmbed(ctx.db)], components: managementComponents() });
+    case 'mgmt:send_custom': return require('../commands/announcements').startCustomAnnouncement(interaction, ctx);
     default: return interaction.reply({ content: 'Unknown management control.', ephemeral: true });
   }
 }
