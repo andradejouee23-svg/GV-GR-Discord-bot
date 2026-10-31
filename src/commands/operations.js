@@ -19,6 +19,7 @@ const {
   unixTime,
 } = require('../utils/discord');
 const { ensureManagement } = require('./staff');
+const { openAnnouncementManager } = require('./announcementManager');
 
 function makeSessionModal(host) {
   return new ModalBuilder()
@@ -49,7 +50,7 @@ async function startSessionCommand(interaction, ctx) {
   }
   const current = ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get();
   if (current) return interaction.reply({ content: `Session #${current.id} is already active. End it before starting another.`, ephemeral: true });
-  return interaction.showModal(makeSessionModal(host));
+  return openAnnouncementManager(interaction, ctx, { hostId: host.id, authorized: true });
 }
 
 async function submitSessionModal(interaction, ctx) {

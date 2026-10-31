@@ -119,6 +119,124 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       value TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS announcement_drafts (
+      id TEXT PRIMARY KEY,
+      actor_id TEXT NOT NULL,
+      data_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('draft', 'publishing', 'published', 'failed', 'cancelled', 'expired')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      channel_id TEXT,
+      message_id TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS announcement_drafts_expiry
+      ON announcement_drafts(status, expires_at);
+
+    CREATE TABLE IF NOT EXISTS vehicle_application_drafts (
+      id TEXT PRIMARY KEY,
+      applicant_id TEXT NOT NULL,
+      data_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS vehicle_application_drafts_expiry
+      ON vehicle_application_drafts(expires_at);
+
+    CREATE TABLE IF NOT EXISTS vehicle_applications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      applicant_id TEXT NOT NULL,
+      roblox_username TEXT NOT NULL,
+      make_model TEXT NOT NULL,
+      plate TEXT NOT NULL,
+      plate_normalized TEXT NOT NULL,
+      plate_key TEXT NOT NULL,
+      registration_state TEXT NOT NULL,
+      color TEXT NOT NULL,
+      vehicle_year INTEGER NOT NULL,
+      image_url TEXT,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'denied', 'revoked', 'expired')),
+      created_at TEXT NOT NULL,
+      reviewed_at TEXT,
+      reviewer_id TEXT,
+      decision_reason TEXT,
+      registration_code TEXT UNIQUE,
+      expires_at TEXT,
+      review_channel_id TEXT,
+      review_message_id TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS one_pending_vehicle_per_applicant
+      ON vehicle_applications(applicant_id) WHERE status = 'pending';
+
+    CREATE UNIQUE INDEX IF NOT EXISTS one_pending_or_active_vehicle_plate
+      ON vehicle_applications(plate_key) WHERE status IN ('pending', 'approved');
+
+    CREATE INDEX IF NOT EXISTS vehicle_applications_applicant_status
+      ON vehicle_applications(applicant_id, status, created_at);
+
+    CREATE TABLE IF NOT EXISTS vehicle_registration_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      application_id INTEGER NOT NULL REFERENCES vehicle_applications(id),
+      actor_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS vehicle_registration_history_application
+      ON vehicle_registration_history(application_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS temporary_admin_applications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      applicant_id TEXT NOT NULL,
+      applicant_name TEXT NOT NULL,
+      application_title TEXT NOT NULL,
+      application_description TEXT NOT NULL,
+      questions_json TEXT NOT NULL,
+      answers_json TEXT NOT NULL,
+      requested_role_id TEXT NOT NULL,
+      duration_hours INTEGER NOT NULL CHECK(duration_hours BETWEEN 1 AND 8760),
+      status TEXT NOT NULL CHECK(status IN ('pending', 'approving', 'approved', 'expiring', 'denied', 'expired')),
+      created_at TEXT NOT NULL,
+      reviewed_at TEXT,
+      reviewer_id TEXT,
+      decision_reason TEXT,
+      expires_at TEXT,
+      review_channel_id TEXT,
+      review_message_id TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS one_temporary_admin_application_per_applicant
+      ON temporary_admin_applications(applicant_id) WHERE status IN ('pending', 'approving', 'approved', 'expiring');
+
+    CREATE INDEX IF NOT EXISTS temporary_admin_applications_history
+      ON temporary_admin_applications(applicant_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS temporary_admin_application_drafts (
+      id TEXT PRIMARY KEY,
+      applicant_id TEXT NOT NULL,
+      settings_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS temporary_admin_application_drafts_expiry
+      ON temporary_admin_application_drafts(expires_at);
+
+    CREATE TABLE IF NOT EXISTS temporary_admin_application_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      application_id INTEGER NOT NULL REFERENCES temporary_admin_applications(id),
+      actor_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS temporary_admin_application_history_application
+      ON temporary_admin_application_history(application_id, created_at);
+
     CREATE TABLE IF NOT EXISTS staff_profiles (
       user_id TEXT PRIMARY KEY REFERENCES staff(user_id),
       status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'break', 'suspended', 'demoted', 'removed')),

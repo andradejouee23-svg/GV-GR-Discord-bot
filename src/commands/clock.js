@@ -1,4 +1,5 @@
 const config = require('../../config');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { getOnDuty } = require('../services/clock');
 const { checkInStaff, checkOutStaff } = require('../services/staffRewards');
 const { formatDuration } = require('../utils/format');
@@ -20,7 +21,14 @@ const {
 } = require('../utils/discord');
 
 function createPanelComponents() {
-  return createStaffCenterComponents();
+  return [
+    ...createStaffCenterComponents(),
+    new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId('gv:ann:open')
+      .setLabel('Create Announcement')
+      .setEmoji('📣')
+      .setStyle(ButtonStyle.Primary)),
+  ];
 }
 
 function canRefreshStaffPanel(member, guild, db) {

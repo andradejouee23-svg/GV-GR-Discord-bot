@@ -1,0 +1,300 @@
+const assert = require('node:assert/strict');
+const { mkdtempSync, rmSync } = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const config = require('../config');
+const { createDatabase } = require('../src/database');
+const { handleVehicleButton, handleVehicleCommand, handleVehicleModal, processVehicleExpirations, registrationCode, savePendingApplication } = require('../src/commands/vehicles');
+const { setConfigValue } = require('../src/utils/discord');
+
+const managerId = 'vehicle-manager';
+const applicantId = 'vehicle-applicant';
+const roleId = '1556064708795306157';
+const reviewChannelId = '1666064708795306156';
+const panelChannelId = '1666064708795306157';
+
+function createEnvironment(t) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-vehicles-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([roleId]));
+  setConfigValue(db, 'VEHICLE_REVIEW_CHANNEL_ID', reviewChannelId);
+  setConfigValue(db, 'VEHICLE_REGISTRATION_CHANNEL_ID', panelChannelId);
+
+  const manager = { id: managerId, roles: { cache: new Map([[roleId, { name: 'Admin' }]]) } };
+  const guild = {
+    id: config.SERVER_ID,
+    ownerId: 'server-owner',
+    members: {
+      me: {},
+      fetch: async (id) => id === managerId ? manager : null,
+    },
+  };
+  const reviewPosts = [];
+  const panelPosts = [];
+  const panelEdits = [];
+  const reviewEdits = [];
+  const dms = [];
+  const reviewChannel = {
+    id: reviewChannelId,
+    guildId: guild.id,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    send: async (payload) => {
+      reviewPosts.push(payload);
+      return { id: String(1776064708795306156 + reviewPosts.length) };
+    },
+    messages: {
+      fetch: async () => ({ edit: async (payload) => { reviewEdits.push(payload); return payload; } }),
+    },
+  };
+  const panelChannel = {
+    id: panelChannelId,
+    guildId: guild.id,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    send: async (payload) => {
+      panelPosts.push(payload);
+      return { id: '1776064708795306199' };
+    },
+    messages: {
+      fetch: async () => ({ edit: async (payload) => { panelEdits.push(payload); return { id: '1776064708795306199' }; } }),
+    },
+  };
+  const client = {
+    channels: { fetch: async (id) => id === reviewChannelId ? reviewChannel : id === panelChannelId ? panelChannel : null },
+    users: {
+      fetch: async (id) => ({ send: async (payload) => { dms.push({ id, payload }); } }),
+    },
+  };
+  return { db, guild, client, reviewPosts, panelPosts, panelEdits, reviewEdits, dms };
+}
+
+function makeApplicationData(overrides = {}) {
+  return {
+    robloxUsername: 'GreenvilleDriver',
+    makeModel: '2022 Falcon Cruiser',
+    plate: 'GV 1234',
+    registrationState: 'Wisconsin',
+    color: 'Blue',
+    vehicleYear: 2022,
+    imageUrl: null,
+    ...overrides,
+  };
+}
+
+function managerInteraction(env, properties = {}) {
+  return {
+    guild: env.guild,
+    client: env.client,
+    user: { id: managerId, username: 'Manager' },
+    ...properties,
+  };
+}
+
+test('panel posts and refreshes; applicants submit a validated application with an optional image', async (t) => {
+  const env = createEnvironment(t);
+  const { db, guild, client } = env;
+  const panelCommand = managerInteraction(env, {
+    commandName: 'vehicle',
+    options: { getSubcommand: () => 'panel' },
+    reply: async (payload) => payload,
+  });
+  const firstPanel = await handleVehicleCommand(panelCommand, { db });
+  const secondPanel = await handleVehicleCommand(panelCommand, { db });
+  assert.match(firstPanel.content, /posted/);
+  assert.match(secondPanel.content, /refreshed/);
+  assert.equal(env.panelPosts.length, 1);
+  assert.equal(env.panelEdits.length, 1);
+  assert.deepEqual(env.panelPosts[0].components[0].components.map((button) => button.data.label), [
+    'Register Vehicle', 'My Registered Vehicles',
+  ]);
+
+  let firstModal;
+  await handleVehicleButton({
+    customId: 'gv:vehicle:register',
+    showModal: async (modal) => { firstModal = modal; return modal; },
+  }, { db });
+  assert.equal(firstModal.toJSON().custom_id, 'gv:vehicle:apply:basic');
+  const basicFields = {
+    roblox: 'GreenvilleDriver',
+    vehicle: '2022 Falcon Cruiser',
+    plate: 'GV 1234',
+    state: 'Wisconsin',
+    color: 'Blue',
+  };
+  const submitBasic = async (id = applicantId) => {
+    let reply;
+    await handleVehicleModal({
+      customId: 'gv:vehicle:apply:basic',
+      user: { id },
+      fields: { getTextInputValue: (key) => basicFields[key] },
+      reply: async (payload) => { reply = payload; return payload; },
+    }, { db });
+    return reply;
+  };
+  const continuation = await submitBasic();
+  assert.match(continuation.content, /Add the year/);
+  const continueId = continuation.components[0].components[0].data.custom_id;
+  let detailModal;
+  await handleVehicleButton({
+    customId: continueId,
+    user: { id: applicantId },
+    showModal: async (modal) => { detailModal = modal; return modal; },
+    reply: async (payload) => payload,
+  }, { db });
+  const modalJson = detailModal.toJSON();
+  assert.equal(modalJson.components[1].type, 18);
+  assert.equal(modalJson.components[1].component.type, 19);
+
+  const attachment = {
+    contentType: 'image/png',
+    size: 1024,
+    url: 'https://cdn.discordapp.com/attachments/1/2/vehicle.png',
+  };
+  const submitDetails = async (file) => {
+    let reply;
+    await handleVehicleModal({
+      customId: `gv:vehicle:apply:details:${continueId.split(':').at(-1)}`,
+      user: { id: applicantId },
+      guild,
+      client,
+      fields: {
+        getTextInputValue: () => '2022',
+        getUploadedFiles: () => file ? { first: () => file } : null,
+      },
+      reply: async (payload) => { reply = payload; return payload; },
+    }, { db });
+    return reply;
+  };
+  const oversized = await submitDetails({ ...attachment, size: 9 * 1024 * 1024 });
+  assert.match(oversized.content, /no larger than 8 MB/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM vehicle_applications').get().count, 0);
+
+  const submitted = await submitDetails(attachment);
+  assert.match(submitted.content, /sent to staff for review/);
+  assert.equal(env.reviewPosts.length, 1);
+  assert.equal(env.reviewPosts[0].embeds[0].data.image.url, attachment.url);
+  assert.match(env.reviewPosts[0].embeds[0].data.title, /GV-APP-000001/);
+  assert.equal(env.reviewPosts[0].components[0].components.length, 2);
+  const application = db.prepare('SELECT * FROM vehicle_applications').get();
+  assert.equal(application.status, 'pending');
+  assert.equal(application.image_url, attachment.url);
+  assert.equal(application.review_message_id, String(1776064708795306157));
+  assert.equal(db.prepare('SELECT action FROM vehicle_registration_history WHERE application_id = ?').get(application.id).action, 'submitted');
+
+  const repeatApplicant = await submitBasic();
+  assert.match(repeatApplicant.content, /already have a vehicle application pending/);
+  const repeatPlate = await submitBasic('another-applicant');
+  assert.match(repeatPlate.content, /plate is already pending review/);
+});
+
+test('only management can decide applications; decisions are persisted and applicants are notified', async (t) => {
+  const env = createEnvironment(t);
+  const { db, guild, client } = env;
+  const approvedId = savePendingApplication(db, applicantId, makeApplicationData(), reviewChannelId);
+  const deniedId = savePendingApplication(db, 'another-player', makeApplicationData({ plate: 'GV 7777' }), reviewChannelId);
+  for (const id of [approvedId, deniedId]) {
+    db.prepare('UPDATE vehicle_applications SET review_message_id = ? WHERE id = ?').run(String(1776064708795306200 + id), id);
+  }
+
+  let deniedReply;
+  await handleVehicleButton({
+    ...managerInteraction(env, { user: { id: 'unauthorized-player', username: 'Player' } }),
+    customId: `gv:vehicle:approve:${approvedId}`,
+    reply: async (payload) => { deniedReply = payload; return payload; },
+  }, { db });
+  assert.match(deniedReply.content, /management roles only/i);
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(approvedId).status, 'pending');
+
+  let approvalUpdate;
+  await handleVehicleButton({
+    ...managerInteraction(env, { customId: `gv:vehicle:approve:${approvedId}` }),
+    update: async (payload) => { approvalUpdate = payload; return payload; },
+  }, { db });
+  const approved = db.prepare('SELECT * FROM vehicle_applications WHERE id = ?').get(approvedId);
+  assert.equal(approved.status, 'approved');
+  assert.equal(approved.registration_code, registrationCode(approvedId));
+  assert.match(approvalUpdate.embeds[0].data.title, /Approved/);
+  assert.equal(env.dms.length, 1);
+  assert.match(env.dms[0].payload.embeds[0].data.description, /Active/);
+
+  let denialModal;
+  await handleVehicleButton({
+    ...managerInteraction(env, { customId: `gv:vehicle:deny:${deniedId}` }),
+    showModal: async (modal) => { denialModal = modal; return modal; },
+  }, { db });
+  assert.equal(denialModal.toJSON().custom_id, `gv:vehicle:deny_submit:${deniedId}`);
+  env.client.users.fetch = async () => { throw new Error('DMs are unavailable'); };
+  let denialReply;
+  await handleVehicleModal({
+    ...managerInteraction(env, { customId: `gv:vehicle:deny_submit:${deniedId}` }),
+    fields: { getTextInputValue: () => 'Plate details do not match.' },
+    reply: async (payload) => { denialReply = payload; return payload; },
+  }, { db });
+  const denied = db.prepare('SELECT * FROM vehicle_applications WHERE id = ?').get(deniedId);
+  assert.equal(denied.status, 'denied');
+  assert.equal(denied.decision_reason, 'Plate details do not match.');
+  assert.match(env.reviewEdits.at(-1).embeds[0].data.title, /Denied/);
+  assert.match(denialReply.content, /notified in the registration channel/);
+  assert.equal(env.panelPosts.at(-1).content, '<@another-player>');
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM vehicle_registration_history WHERE action IN ('approved', 'denied')").get().count, 2);
+});
+
+test('management can search, update, revoke, expire, and inspect registrations', async (t) => {
+  const env = createEnvironment(t);
+  const { db } = env;
+  const firstId = savePendingApplication(db, applicantId, makeApplicationData(), reviewChannelId);
+  const secondId = savePendingApplication(db, 'other-player', makeApplicationData({ plate: 'OTHER 2' }), reviewChannelId);
+  for (const id of [firstId, secondId]) {
+    db.prepare("UPDATE vehicle_applications SET status = 'approved', reviewed_at = ?, reviewer_id = ?, registration_code = ? WHERE id = ?")
+      .run('2026-10-30T12:00:00.000Z', managerId, registrationCode(id), id);
+  }
+
+  const command = (action, options, userId = managerId) => managerInteraction(env, {
+    commandName: 'vehicle',
+    user: { id: userId, username: 'Manager' },
+    options: { getSubcommand: () => action, ...options },
+    reply: async (payload) => payload,
+  });
+  const duplicatePlate = await handleVehicleCommand(command('update', {
+    getInteger: (name) => name === 'id' ? firstId : null,
+    getString: (name) => name === 'plate' ? 'OTHER 2' : null,
+    getBoolean: () => false,
+  }), { db });
+  assert.match(duplicatePlate.content, /already uses that plate/);
+
+  const updated = await handleVehicleCommand(command('update', {
+    getInteger: (name) => name === 'id' ? firstId : null,
+    getString: (name) => ({ plate: 'UPDATED 1' }[name] ?? null),
+    getBoolean: () => false,
+  }), { db });
+  assert.match(updated.content, /updated/i);
+  assert.equal(db.prepare('SELECT plate FROM vehicle_applications WHERE id = ?').get(firstId).plate, 'UPDATED 1');
+
+  const playerVehicles = await handleVehicleCommand(command('mine', {}, applicantId), { db });
+  assert.match(playerVehicles.embeds[0].data.description, /UPDATED 1/);
+  const search = await handleVehicleCommand(command('search', { getString: () => 'updated1' }), { db });
+  assert.match(search.embeds[0].data.description, /UPDATED 1/);
+
+  const expiration = await handleVehicleCommand(command('expiration', {
+    getInteger: () => secondId,
+    getString: () => '2027-01-01T00:00:00Z',
+  }), { db });
+  assert.match(expiration.content, /expires/);
+  assert.equal(processVehicleExpirations(db, new Date('2027-01-02T00:00:00.000Z')), 1);
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(secondId).status, 'expired');
+
+  const revoked = await handleVehicleCommand(command('revoke', {
+    getInteger: () => firstId,
+    getString: () => 'No longer in service.',
+  }), { db });
+  assert.match(revoked.content, /revoked/);
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(firstId).status, 'revoked');
+  const history = await handleVehicleCommand(command('history', { getUser: () => ({ id: applicantId, username: 'Driver' }) }), { db });
+  assert.match(history.embeds[0].data.description, /UPDATED|REVOKED|EXPIRATION_CHANGED/i);
+});

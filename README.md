@@ -35,6 +35,12 @@ To copy IDs in Discord, open **User Settings → Advanced → Developer Mode**. 
 
 Create text channels for staff activity/logs, reports, sessions, events, and announcements. Set channel permission overrides so `@everyone` cannot view the private reports channel and only trusted staff (plus the bot) can view it. Apply the same restriction to any channel where staff logs should remain private. The bot needs to view and send messages in each channel it uses. The staff activity channel is also where `/staff-panel` posts its reusable panel.
 
+For vehicle registration, create a public registration-panel channel and a staff-only vehicle-review channel. Set both with `/staffconfig channel`, then use `/vehicle panel` to post or refresh the registration panel. The bot needs View Channel, Send Messages, and Embed Links permissions in both channels.
+
+For Temporary Admin applications, management runs `/tempadmin configure` to set the application role, private review channel, duration, title, description, and up to five questions. Then run `/tempadmin panel channel:<text-channel>` to post or refresh the public application panel. The bot needs Manage Roles, View Channel, Send Messages, and Embed Links permissions in the review channel, and its highest role must be above the temporary role. Applicants can privately review decisions with `/tempadmin history`.
+
+For Town Jobs, management configures the panel with `/townjobs configure`, adds arbitrary role buttons with `/townjobs add`, and publishes or refreshes it with `/townjobs panel`. Configure the bot with Manage Roles and place its highest role above every selectable job role. The current configurable job list is available through the Town Jobs module's `getTownJobOptions` helper for future salary eligibility; jobs are not hardcoded.
+
 After first setup, a configured Owner or Co-Owner can update channels and role groups using `/staffconfig channel` and `/staffconfig role`. These overrides are saved in SQLite. The initial Owner role still needs to be set in `config.js` so someone can run that command.
 
 ## 3. Enable Intents and Invite the Bot
@@ -44,10 +50,11 @@ In the Developer Portal, open **Bot → Privileged Gateway Intents** and enable 
 Invite the bot from **OAuth2 → URL Generator**. Select the `bot` and `applications.commands` scopes, then grant these bot permissions:
 
 - View Channels, Send Messages, Embed Links, and Read Message History
+- Manage Roles for Temporary Admin approvals; the bot's highest role must be above the configured temporary role
 - View Audit Log, for identifying who deleted a message
 - Kick Members, Ban Members, and Moderate Members, for `/mod kick`, `/mod ban`, and `/mod timeout`
 
-The equivalent least-privilege permissions integer is `1099511712902`. An invite URL can be formed as:
+The equivalent least-privilege permissions integer is `1099780148358`. An invite URL can be formed as:
 
 ```text
 https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=1099511712902&scope=bot%20applications.commands
@@ -101,6 +108,9 @@ npm test
 - `/mod warn`, `/mod kick`, `/mod ban`, and `/mod timeout` record player moderation. Kick/ban/timeout also call Discord's moderation API.
 - `/staffannounce` posts to the configured announcement channel.
 - `/staffconfig channel` and `/staffconfig role` configure channels/role groups (Owner/Co-Owner only).
+- `/vehicle panel` posts the registration panel. Players use its buttons or `/vehicle mine`; management can search, review, update, revoke, set expiration, and inspect registration history.
+- `/tempadmin panel` posts the application panel; `/tempadmin configure` sets the application questions, review channel, assigned role, and role duration. `/tempadmin history` shows private application history.
+- `/townjobs configure`, `/townjobs add`, `/townjobs edit`, `/townjobs remove`, `/townjobs list`, and `/townjobs panel` manage the customizable Town Jobs role panel.
 
 ## Project Files
 
@@ -111,6 +121,9 @@ npm test
 - `src/commands/clock.js`: Staff panel, clock buttons, status, activity, and leaderboard.
 - `src/commands/staff.js`: Warnings, private notes/history, announcements, and owner configuration.
 - `src/commands/operations.js`: RP sessions and scheduled events.
+- `src/commands/vehicles.js`: Vehicle applications, staff review, and registration management.
+- `src/commands/tempAdmin.js`: Temporary Admin application configuration, review, role assignment, history, and expiration.
+- `src/commands/townJobs.js`: Configurable Town Jobs panel and shared job-role catalog.
 - `src/commands/safety.js`: Player reports and moderation commands.
 - `src/buttons/index.js`: Dispatches panel, session, and report buttons.
 - `src/events/messageDelete.js`: Logs message author, channel, and time when deletion logging is enabled.

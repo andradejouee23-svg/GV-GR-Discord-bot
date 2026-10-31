@@ -14,6 +14,10 @@ const { commands } = require('./commands/definitions');
 const { handleButton } = require('./buttons');
 const { handleClockCommand } = require('./commands/clock');
 const { handleOperationsCommand, submitSessionModal } = require('./commands/operations');
+const { handleAnnouncementManagerInteraction } = require('./commands/announcementManager');
+const { handleVehicleCommand, handleVehicleModal, processVehicleExpirations } = require('./commands/vehicles');
+const { handleTempAdminCommand, handleTempAdminModal, processTemporaryAdminExpirations } = require('./commands/tempAdmin');
+const { handleTownJobsCommand } = require('./commands/townJobs');
 const { handleSafetyCommand, submitReport } = require('./commands/safety');
 const { handleStaffCommand } = require('./commands/staff');
 const {
@@ -65,6 +69,8 @@ if (requireSetup()) {
       await processDailyReportReminders(client, db);
       await processWeeklyGoalReminders(client, db);
       await processStaffOfWeek(client, db);
+      processVehicleExpirations(db);
+      await processTemporaryAdminExpirations(client, db);
     } catch (error) {
       console.error('Staff background task failed:', error);
     }
@@ -126,7 +132,7 @@ if (requireSetup()) {
       }
 
       if (interaction.isChatInputCommand()) {
-        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleSafetyCommand];
+        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleTownJobsCommand, handleSafetyCommand];
         for (const handler of handlers) {
           const result = await handler(interaction, context);
           if (result !== null && result !== undefined) return;
@@ -149,6 +155,14 @@ if (requireSetup()) {
         if (interaction.customId.startsWith('owner:')) return handleOwnerButton(interaction, context);
         return handleButton(interaction, context);
       }
+      if (interaction.customId?.startsWith('gv:ann:') && (
+        interaction.isStringSelectMenu()
+        || interaction.isUserSelectMenu()
+        || interaction.isChannelSelectMenu()
+        || interaction.isRoleSelectMenu()
+      )) {
+        return handleAnnouncementManagerInteraction(interaction, context);
+      }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:daily:rating:')) {
         return handleDailyReportSelect(interaction, context);
       }
@@ -166,6 +180,9 @@ if (requireSetup()) {
         if (interaction.customId === 'gv:report_submit') return submitReport(interaction, context);
         if (interaction.customId.startsWith('gv:daily:submit:')) return handleDailyReportModal(interaction, context);
         if (interaction.customId.startsWith('gv:session_start:')) return submitSessionModal(interaction, context);
+        if (interaction.customId.startsWith('gv:ann:')) return handleAnnouncementManagerInteraction(interaction, context);
+        if (interaction.customId.startsWith('gv:vehicle:')) return handleVehicleModal(interaction, context);
+        if (interaction.customId.startsWith('gv:tempadmin:')) return handleTempAdminModal(interaction, context);
         if (interaction.customId.startsWith('owner:modal:')) return handleOwnerActionModal(interaction, context);
         if (interaction.customId.startsWith('mgmt:shift_modal:')) return handleManagementShiftModal(interaction, context);
       }

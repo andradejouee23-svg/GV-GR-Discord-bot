@@ -25,6 +25,18 @@ module.exports = {
   REPORT_CHANNEL_ID: '1556060722537177228',
   SESSION_CHANNEL_ID: '1556060722537177228',
   EVENT_CHANNEL_ID: '1556060722537177228',
+  VEHICLE_REGISTRATION_CHANNEL_ID: null,
+  VEHICLE_REVIEW_CHANNEL_ID: null,
+  TEMP_ADMIN_APPLICATION_TITLE: 'Temporary Admin Application',
+  TEMP_ADMIN_APPLICATION_DESCRIPTION: 'Apply for a temporary GV GR administration role. Complete each question thoughtfully. Management will review your application.',
+  TEMP_ADMIN_APPLICATION_QUESTIONS: [
+    'Why are you applying for Temporary Admin?',
+    'Describe your moderation experience.',
+    'How would you respond to rule-breaking?',
+  ],
+  TEMP_ADMIN_DURATION_HOURS: 72,
+  TEMP_ADMIN_ROLE_ID: null,
+  TEMP_ADMIN_REVIEW_CHANNEL_ID: null,
 
   EMBED_COLORS: {
     active: 0x36a765,
