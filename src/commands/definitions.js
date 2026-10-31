@@ -97,6 +97,9 @@ const commands = [
           { name: 'Events', value: 'EVENT_CHANNEL_ID' },
           { name: 'Vehicle registration panel', value: 'VEHICLE_REGISTRATION_CHANNEL_ID' },
           { name: 'Vehicle application review', value: 'VEHICLE_REVIEW_CHANNEL_ID' },
+          { name: 'Welcome messages', value: 'WELCOME_CHANNEL_ID' },
+          { name: 'How to Join channel', value: 'HOW_TO_JOIN_CHANNEL_ID' },
+          { name: 'Server Rules channel', value: 'SERVER_RULES_CHANNEL_ID' },
         ))
       .addChannelOption((option) => option.setName('channel').setDescription('Text channel').setRequired(true).addChannelTypes(ChannelType.GuildText)))
     .addSubcommand((subcommand) => subcommand.setName('role').setDescription('Add or remove a configured role.')
@@ -199,6 +202,42 @@ const commands = [
     .addSubcommand((subcommand) => subcommand.setName('list').setDescription('List configured job buttons.'))
     .addSubcommand((subcommand) => subcommand.setName('panel').setDescription('Publish or update the Town Jobs panel.')
       .addChannelOption((option) => option.setName('channel').setDescription('Override the configured panel channel').addChannelTypes(ChannelType.GuildText))),
+  new SlashCommandBuilder()
+    .setName('economy')
+    .setDescription('Open your GV GR virtual economy account.')
+    .addSubcommand((subcommand) => subcommand.setName('panel').setDescription('Post or refresh the Economy Panel (management).'))
+    .addSubcommand((subcommand) => subcommand.setName('configure').setDescription('Configure the panel and Work rewards (management).')
+      .addChannelOption((option) => option.setName('channel').setDescription('Economy panel channel'))
+      .addIntegerOption((option) => option.setName('minimum-reward').setDescription('Minimum Work reward').setMinValue(1).setMaxValue(1000000))
+      .addIntegerOption((option) => option.setName('maximum-reward').setDescription('Maximum Work reward').setMinValue(1).setMaxValue(1000000))
+      .addIntegerOption((option) => option.setName('cooldown-minutes').setDescription('Work cooldown in minutes').setMinValue(1).setMaxValue(10080))
+      .addIntegerOption((option) => option.setName('delivery-minimum').setDescription('Minimum Delivery Rush reward').setMinValue(1).setMaxValue(1000000))
+      .addIntegerOption((option) => option.setName('delivery-maximum').setDescription('Maximum Delivery Rush reward').setMinValue(1).setMaxValue(1000000))
+      .addIntegerOption((option) => option.setName('delivery-cooldown-minutes').setDescription('Delivery Rush cooldown').setMinValue(1).setMaxValue(10080)))
+    .addSubcommand((subcommand) => subcommand.setName('wallet').setDescription('View your private economy wallet.'))
+    .addSubcommand((subcommand) => subcommand.setName('work').setDescription('Work for a virtual-money reward.')),
+  new SlashCommandBuilder()
+    .setName('salary')
+    .setDescription('Configure automatic Town Jobs salaries (management).')
+    .addSubcommand((subcommand) => subcommand.setName('add').setDescription('Set an eligible Town Job salary.')
+      .addRoleOption((option) => option.setName('role').setDescription('Configured Town Job role').setRequired(true))
+      .addIntegerOption((option) => option.setName('amount').setDescription('Amount paid every 30 minutes').setRequired(true).setMinValue(1).setMaxValue(1000000000)))
+    .addSubcommand((subcommand) => subcommand.setName('set').setDescription('Change an eligible role salary.')
+      .addRoleOption((option) => option.setName('role').setDescription('Town Job role').setRequired(true))
+      .addIntegerOption((option) => option.setName('amount').setDescription('Amount paid every 30 minutes').setRequired(true).setMinValue(1).setMaxValue(1000000000)))
+    .addSubcommand((subcommand) => subcommand.setName('remove').setDescription('Remove a role from salary eligibility.')
+      .addRoleOption((option) => option.setName('role').setDescription('Town Job role').setRequired(true)))
+    .addSubcommand((subcommand) => subcommand.setName('toggle').setDescription('Enable or disable a role salary.')
+      .addRoleOption((option) => option.setName('role').setDescription('Town Job role').setRequired(true))
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Enable this salary').setRequired(true)))
+    .addSubcommand((subcommand) => subcommand.setName('list').setDescription('View configured Town Jobs salaries.'))
+    .addSubcommand((subcommand) => subcommand.setName('policy').setDescription('Choose how multiple job salaries are paid.')
+      .addStringOption((option) => option.setName('mode').setDescription('Salary policy').setRequired(true)
+        .addChoices({ name: 'Highest eligible salary', value: 'highest' }, { name: 'Combine all eligible salaries', value: 'combined' })))
+    .addSubcommand((subcommand) => subcommand.setName('pause').setDescription('Pause automatic Town Jobs salaries.'))
+    .addSubcommand((subcommand) => subcommand.setName('resume').setDescription('Resume salaries with a fresh 30-minute schedule.'))
+    .addSubcommand((subcommand) => subcommand.setName('history').setDescription('View recent salary payments.')
+      .addRoleOption((option) => option.setName('role').setDescription('Filter by Town Job role'))),
 ].map((command) => command.toJSON());
 
 module.exports = { commands };

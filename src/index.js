@@ -18,6 +18,9 @@ const { handleAnnouncementManagerInteraction } = require('./commands/announcemen
 const { handleVehicleCommand, handleVehicleModal, processVehicleExpirations } = require('./commands/vehicles');
 const { handleTempAdminCommand, handleTempAdminModal, processTemporaryAdminExpirations } = require('./commands/tempAdmin');
 const { handleTownJobsCommand } = require('./commands/townJobs');
+const { handleEconomyCommand } = require('./commands/economy');
+const { handleSalaryCommand } = require('./commands/salaries');
+const { processTownJobsSalaries } = require('./services/economySalaries');
 const { handleSafetyCommand, submitReport } = require('./commands/safety');
 const { handleStaffCommand } = require('./commands/staff');
 const {
@@ -43,6 +46,7 @@ const {
   handleOwnerHistorySelect,
 } = require('./commands/staffManagement');
 const { logMessageDeletion } = require('./events/messageDelete');
+const { welcomeNewMember } = require('./events/memberJoin');
 
 function requireSetup() {
   const missing = [];
@@ -71,6 +75,7 @@ if (requireSetup()) {
       await processStaffOfWeek(client, db);
       processVehicleExpirations(db);
       await processTemporaryAdminExpirations(client, db);
+      await processTownJobsSalaries(client, db);
     } catch (error) {
       console.error('Staff background task failed:', error);
     }
@@ -132,7 +137,7 @@ if (requireSetup()) {
       }
 
       if (interaction.isChatInputCommand()) {
-        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleTownJobsCommand, handleSafetyCommand];
+        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
         for (const handler of handlers) {
           const result = await handler(interaction, context);
           if (result !== null && result !== undefined) return;
@@ -203,6 +208,14 @@ if (requireSetup()) {
       await logMessageDeletion(message, client, db);
     } catch (error) {
       console.error('Message deletion logging failed:', error);
+    }
+  });
+
+  client.on(Events.GuildMemberAdd, async (member) => {
+    try {
+      await welcomeNewMember(member, db, client);
+    } catch (error) {
+      console.error('Welcome message delivery failed:', error);
     }
   });
 

@@ -4,10 +4,15 @@ const { handleAnnouncementManagerInteraction } = require('../commands/announceme
 const { handleVehicleButton } = require('../commands/vehicles');
 const { handleTempAdminButton } = require('../commands/tempAdmin');
 const { handleTownJobButton } = require('../commands/townJobs');
+const { handleEconomyButton } = require('../commands/economy');
 const { updateReport } = require('../commands/safety');
 const { handleDailyReportReminder, handleStaffCenterButton, handleShiftReminder } = require('../commands/staffCenter');
 
 async function handleButton(interaction, ctx) {
+  if (interaction.customId.startsWith('gv:economy:')) {
+    return handleEconomyButton(interaction, ctx);
+  }
+
   if (interaction.customId.startsWith('gv:townjobs:')) {
     return handleTownJobButton(interaction, ctx);
   }

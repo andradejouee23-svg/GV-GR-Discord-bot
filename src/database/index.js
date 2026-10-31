@@ -237,6 +237,81 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     CREATE INDEX IF NOT EXISTS temporary_admin_application_history_application
       ON temporary_admin_application_history(application_id, created_at);
 
+    CREATE TABLE IF NOT EXISTS economy_accounts (
+      user_id TEXT PRIMARY KEY,
+      wallet_balance INTEGER NOT NULL DEFAULT 0 CHECK(wallet_balance >= 0),
+      bank_balance INTEGER NOT NULL DEFAULT 0 CHECK(bank_balance >= 0),
+      lifetime_earnings INTEGER NOT NULL DEFAULT 0 CHECK(lifetime_earnings >= 0),
+      total_spent INTEGER NOT NULL DEFAULT 0 CHECK(total_spent >= 0),
+      total_transferred INTEGER NOT NULL DEFAULT 0 CHECK(total_transferred >= 0),
+      created_at TEXT NOT NULL,
+      last_work_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS economy_transactions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      related_user_id TEXT,
+      type TEXT NOT NULL,
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      wallet_after INTEGER NOT NULL CHECK(wallet_after >= 0),
+      bank_after INTEGER NOT NULL DEFAULT 0 CHECK(bank_after >= 0),
+      created_at TEXT NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_transactions_user_created
+      ON economy_transactions(user_id, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS economy_transactions_type_created
+      ON economy_transactions(type, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS economy_job_salaries (
+      role_id TEXT PRIMARY KEY,
+      salary INTEGER NOT NULL CHECK(salary > 0),
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+      updated_by TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_job_salaries_enabled
+      ON economy_job_salaries(enabled, role_id);
+
+    CREATE TABLE IF NOT EXISTS economy_salary_schedules (
+      user_id TEXT PRIMARY KEY REFERENCES economy_accounts(user_id),
+      next_due_at TEXT NOT NULL,
+      last_paid_at TEXT,
+      last_role_ids_json TEXT NOT NULL DEFAULT '[]',
+      last_policy TEXT NOT NULL DEFAULT 'highest' CHECK(last_policy IN ('highest', 'combined'))
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_salary_schedules_due
+      ON economy_salary_schedules(next_due_at);
+
+    CREATE TABLE IF NOT EXISTS economy_delivery_games (
+      game_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      scenario TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'expired')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      route TEXT,
+      result_type TEXT,
+      reward INTEGER NOT NULL DEFAULT 0 CHECK(reward >= 0),
+      resolved_at TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS one_active_delivery_game_per_player
+      ON economy_delivery_games(user_id) WHERE status = 'active';
+
+    CREATE INDEX IF NOT EXISTS economy_delivery_games_user_created
+      ON economy_delivery_games(user_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS economy_delivery_cooldowns (
+      user_id TEXT PRIMARY KEY REFERENCES economy_accounts(user_id),
+      last_started_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS staff_profiles (
       user_id TEXT PRIMARY KEY REFERENCES staff(user_id),
       status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'break', 'suspended', 'demoted', 'removed')),
