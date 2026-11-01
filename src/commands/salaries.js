@@ -3,6 +3,7 @@ const { ensureManagement } = require('./staff');
 const { getTownJobOptions } = require('./townJobs');
 const { getConfigValue, makeEmbed, setConfigValue } = require('../utils/discord');
 const { isSalaryEnabled, getSalaryPolicy } = require('../services/economySalaries');
+const { recordEconomyAudit } = require('./economy');
 
 function configuredJobForRole(db, roleId) {
   return getTownJobOptions(db).find((job) => job.roleId === roleId);
@@ -52,6 +53,7 @@ async function addSalary(interaction, ctx) {
     INSERT INTO economy_job_salaries (role_id, salary, enabled, updated_by, updated_at)
     VALUES (?, ?, 1, ?, ?)
   `).run(role.id, amount, interaction.user.id, now);
+  recordEconomyAudit(ctx.db, { actorId: interaction.user.id, targetId: role.id, action: 'salary_added', newValue: String(amount), now });
   return interaction.reply({ content: `Enabled **${job.label}** salary at ${formatAmount(amount)} every 30 minutes.`, ephemeral: true });
 }
 
@@ -67,6 +69,7 @@ async function setSalary(interaction, ctx) {
   const result = ctx.db.prepare('UPDATE economy_job_salaries SET salary = ?, updated_by = ?, updated_at = ? WHERE role_id = ?')
     .run(amount, interaction.user.id, new Date().toISOString(), role.id);
   if (!result.changes) return interaction.reply({ content: 'This role has no salary entry. Use `/salary add` first.', ephemeral: true });
+  recordEconomyAudit(ctx.db, { actorId: interaction.user.id, targetId: role.id, action: 'salary_updated', newValue: String(amount) });
   return interaction.reply({ content: `Updated **${job.label}** salary to ${formatAmount(amount)} every 30 minutes.`, ephemeral: true });
 }
 
@@ -74,6 +77,7 @@ async function removeSalary(interaction, ctx) {
   if (!await ensureManagement(interaction, ctx.db)) return;
   const role = interaction.options.getRole('role', true);
   const result = ctx.db.prepare('DELETE FROM economy_job_salaries WHERE role_id = ?').run(role.id);
+  if (result.changes) recordEconomyAudit(ctx.db, { actorId: interaction.user.id, targetId: role.id, action: 'salary_removed' });
   return interaction.reply({ content: result.changes
     ? `Removed <@&${role.id}> from Town Jobs salary eligibility. Existing schedules are cleared on the next salary scan.`
     : 'That role has no salary entry.', ephemeral: true });
@@ -86,6 +90,7 @@ async function toggleSalary(interaction, ctx) {
   const result = ctx.db.prepare('UPDATE economy_job_salaries SET enabled = ?, updated_by = ?, updated_at = ? WHERE role_id = ?')
     .run(enabled ? 1 : 0, interaction.user.id, new Date().toISOString(), role.id);
   if (!result.changes) return interaction.reply({ content: 'That role has no salary entry. Use `/salary add` first.', ephemeral: true });
+  recordEconomyAudit(ctx.db, { actorId: interaction.user.id, targetId: role.id, action: 'salary_toggled', newValue: String(enabled) });
   return interaction.reply({ content: `Salary payments for <@&${role.id}> are now **${enabled ? 'enabled' : 'disabled'}**.`, ephemeral: true });
 }
 
@@ -96,6 +101,7 @@ async function setSalaryPolicy(interaction, ctx) {
     return interaction.reply({ content: 'Choose highest or combined salaries.', ephemeral: true });
   }
   setConfigValue(ctx.db, 'TOWN_JOBS_SALARY_POLICY', policy);
+  recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: 'salary_policy_changed', newValue: policy });
   return interaction.reply({ content: `Multiple-role salary policy is now **${policy === 'highest' ? 'highest eligible salary' : 'combined salaries'}**.`, ephemeral: true });
 }
 
@@ -106,6 +112,7 @@ async function pauseSalaries(interaction, ctx, enabled) {
     const nextDueAt = new Date(Date.now() + 30 * 60_000).toISOString();
     ctx.db.prepare('UPDATE economy_salary_schedules SET next_due_at = ?').run(nextDueAt);
   }
+  recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: enabled ? 'salaries_resumed' : 'salaries_paused', newValue: String(enabled) });
   return interaction.reply({ content: enabled
     ? 'Town Jobs salaries resumed. Existing schedules restart from now; no paused-period back pay will be issued.'
     : 'Town Jobs salary payments are paused. Wallets and existing payment history are unchanged.', ephemeral: true });

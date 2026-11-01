@@ -13,6 +13,7 @@ const {
   setConfigValue,
   validId,
 } = require('../utils/discord');
+const { applyPanelCustomization, ensurePanelHeader } = require('./panelEditor');
 
 const buttonStyles = {
   primary: ButtonStyle.Primary,
@@ -268,16 +269,24 @@ async function publishTownJobsPanel(interaction, ctx) {
     if (roleIds.has(job.roleId)) return interaction.reply({ content: 'Multiple buttons assign the same Discord role. Remove the duplicate before publishing.', ephemeral: true });
     roleIds.add(job.roleId);
   }
+  const customized = applyPanelCustomization(ctx.db, 'townjobs', makeJobEmbed(settings), makeJobComponents(settings.options));
   const payload = {
-    embeds: [makeJobEmbed(settings)],
-    components: makeJobComponents(settings.options),
+    embeds: [customized.embed],
+    components: customized.components,
     allowedMentions: { parse: [] },
   };
   let message;
-  const refreshed = settings.channelId === channel.id && validId(settings.messageId);
+  let savedMessageId = settings.messageId;
+  const header = await ensurePanelHeader(interaction.client, ctx.db, 'townjobs', channel);
+  if (header.created && savedMessageId) {
+    try { const previous = await channel.messages.fetch(savedMessageId); if (previous.author?.id === interaction.client.user?.id) await previous.delete(); } catch {}
+    setConfigValue(ctx.db, 'TOWN_JOBS_PANEL_MESSAGE_ID', null);
+    savedMessageId = null;
+  }
+  const refreshed = settings.channelId === channel.id && validId(savedMessageId);
   if (refreshed) {
     try {
-      const previous = await channel.messages.fetch(settings.messageId);
+      const previous = await channel.messages.fetch(savedMessageId);
       message = await previous.edit(payload);
     } catch {
       message = null;

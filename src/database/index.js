@@ -245,7 +245,8 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       total_spent INTEGER NOT NULL DEFAULT 0 CHECK(total_spent >= 0),
       total_transferred INTEGER NOT NULL DEFAULT 0 CHECK(total_transferred >= 0),
       created_at TEXT NOT NULL,
-      last_work_at TEXT
+      last_work_at TEXT,
+      last_daily_reward_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS economy_transactions (
@@ -265,6 +266,49 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
 
     CREATE INDEX IF NOT EXISTS economy_transactions_type_created
       ON economy_transactions(type, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS economy_shop_items (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      price INTEGER NOT NULL CHECK(price >= 0),
+      category TEXT NOT NULL DEFAULT 'General',
+      stock INTEGER NOT NULL DEFAULT 0 CHECK(stock >= 0),
+      image_url TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+      purchase_limit INTEGER,
+      deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0, 1)),
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_shop_items_enabled
+      ON economy_shop_items(enabled, category, price);
+
+    CREATE TABLE IF NOT EXISTS economy_inventory (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      item_id TEXT NOT NULL REFERENCES economy_shop_items(id),
+      item_name TEXT NOT NULL,
+      quantity INTEGER NOT NULL CHECK(quantity > 0),
+      purchased_at TEXT NOT NULL,
+      UNIQUE(user_id, item_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS economy_purchase_history (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      item_id TEXT NOT NULL REFERENCES economy_shop_items(id),
+      item_name TEXT NOT NULL,
+      quantity INTEGER NOT NULL CHECK(quantity > 0),
+      price INTEGER NOT NULL CHECK(price >= 0),
+      total_cost INTEGER NOT NULL CHECK(total_cost >= 0),
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_purchase_history_user_created
+      ON economy_purchase_history(user_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS economy_job_salaries (
       role_id TEXT PRIMARY KEY,
@@ -311,6 +355,183 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       user_id TEXT PRIMARY KEY REFERENCES economy_accounts(user_id),
       last_started_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS economy_cash_drops (
+      drop_id TEXT PRIMARY KEY,
+      schedule_key TEXT UNIQUE,
+      channel_id TEXT NOT NULL,
+      message_id TEXT,
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      max_claims INTEGER NOT NULL CHECK(max_claims > 0),
+      claim_count INTEGER NOT NULL DEFAULT 0 CHECK(claim_count >= 0),
+      status TEXT NOT NULL CHECK(status IN ('pending', 'open', 'claimed', 'expired')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_cash_drops_status_expiry
+      ON economy_cash_drops(status, expires_at);
+
+    CREATE TABLE IF NOT EXISTS economy_cash_drop_claims (
+      drop_id TEXT NOT NULL REFERENCES economy_cash_drops(drop_id),
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      claimed_at TEXT NOT NULL,
+      PRIMARY KEY (drop_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS economy_games (
+      game_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      game_type TEXT NOT NULL CHECK(game_type IN ('blackjack', 'coinflip', 'roulette', 'chicken')),
+      bet INTEGER NOT NULL CHECK(bet > 0),
+      status TEXT NOT NULL CHECK(status IN ('active', 'won', 'lost', 'push', 'expired')),
+      state_json TEXT NOT NULL DEFAULT '{}',
+      payout INTEGER NOT NULL DEFAULT 0 CHECK(payout >= 0),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS one_active_economy_game_per_player
+      ON economy_games(user_id) WHERE status = 'active';
+
+    CREATE INDEX IF NOT EXISTS economy_games_user_created
+      ON economy_games(user_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS blacklist_records (
+      record_id TEXT PRIMARY KEY,
+      roblox_username TEXT NOT NULL,
+      roblox_user_id TEXT,
+      discord_username TEXT NOT NULL,
+      discord_user_id TEXT,
+      reason TEXT NOT NULL,
+      evidence TEXT NOT NULL DEFAULT '',
+      duration_hours INTEGER,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'expired', 'removed')),
+      staff_notes TEXT NOT NULL DEFAULT '',
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT,
+      updated_at TEXT NOT NULL,
+      channel_id TEXT,
+      message_id TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS blacklist_records_status_created
+      ON blacklist_records(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS blacklist_records_roblox_id
+      ON blacklist_records(roblox_user_id);
+    CREATE INDEX IF NOT EXISTS blacklist_records_discord_id
+      ON blacklist_records(discord_user_id);
+    CREATE INDEX IF NOT EXISTS blacklist_records_roblox_name
+      ON blacklist_records(roblox_username COLLATE NOCASE);
+    CREATE INDEX IF NOT EXISTS blacklist_records_discord_name
+      ON blacklist_records(discord_username COLLATE NOCASE);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS blacklist_active_roblox_id
+      ON blacklist_records(roblox_user_id) WHERE status = 'active' AND roblox_user_id IS NOT NULL AND roblox_user_id != '';
+    CREATE UNIQUE INDEX IF NOT EXISTS blacklist_active_discord_id
+      ON blacklist_records(discord_user_id) WHERE status = 'active' AND discord_user_id IS NOT NULL AND discord_user_id != '';
+
+    CREATE TABLE IF NOT EXISTS blacklist_appeals (
+      appeal_id TEXT PRIMARY KEY,
+      record_id TEXT REFERENCES blacklist_records(record_id),
+      applicant_id TEXT NOT NULL,
+      roblox_username TEXT NOT NULL,
+      roblox_user_id TEXT NOT NULL DEFAULT '',
+      discord_username TEXT NOT NULL,
+      blacklist_record_id TEXT NOT NULL DEFAULT '',
+      reconsideration_reason TEXT NOT NULL,
+      incident_explanation TEXT NOT NULL,
+      return_reason TEXT NOT NULL,
+      evidence TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'denied', 'info_requested')),
+      reviewer_id TEXT,
+      decision_reason TEXT NOT NULL DEFAULT '',
+      management_notes TEXT NOT NULL DEFAULT '',
+      applicant_response TEXT NOT NULL DEFAULT '',
+      submitted_at TEXT NOT NULL,
+      reviewed_at TEXT,
+      review_channel_id TEXT,
+      review_message_id TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS blacklist_appeals_status_submitted
+      ON blacklist_appeals(status, submitted_at DESC);
+    CREATE INDEX IF NOT EXISTS blacklist_appeals_applicant
+      ON blacklist_appeals(applicant_id, submitted_at DESC);
+    CREATE INDEX IF NOT EXISTS blacklist_appeals_record
+      ON blacklist_appeals(record_id, submitted_at DESC);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS blacklist_one_open_appeal_per_applicant
+      ON blacklist_appeals(record_id, applicant_id) WHERE status IN ('pending', 'info_requested');
+
+    CREATE TABLE IF NOT EXISTS blacklist_form_drafts (
+      draft_id TEXT PRIMARY KEY,
+      actor_id TEXT NOT NULL,
+      draft_type TEXT NOT NULL CHECK(draft_type IN ('blacklist', 'appeal', 'edit')),
+      record_id TEXT,
+      stage INTEGER NOT NULL DEFAULT 1,
+      data_json TEXT NOT NULL DEFAULT '{}',
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS blacklist_form_drafts_expiry
+      ON blacklist_form_drafts(expires_at);
+
+    CREATE TABLE IF NOT EXISTS blacklist_record_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      record_id TEXT NOT NULL REFERENCES blacklist_records(record_id),
+      actor_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      changes_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS blacklist_record_history_record
+      ON blacklist_record_history(record_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS blacklist_appeal_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      appeal_id TEXT NOT NULL REFERENCES blacklist_appeals(appeal_id),
+      actor_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS blacklist_appeal_history_appeal
+      ON blacklist_appeal_history(appeal_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS panel_editor_configs (
+      panel_key TEXT PRIMARY KEY,
+      title TEXT,
+      description TEXT,
+      footer_text TEXT,
+      author_text TEXT,
+      color_hex TEXT,
+      header_image_url TEXT,
+      fields_json TEXT NOT NULL DEFAULT '[]',
+      button_labels_json TEXT NOT NULL DEFAULT '[]',
+      header_channel_id TEXT,
+      header_message_id TEXT,
+      updated_by TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS panel_editor_drafts (
+      draft_id TEXT PRIMARY KEY,
+      actor_id TEXT NOT NULL,
+      panel_key TEXT NOT NULL,
+      data_json TEXT NOT NULL DEFAULT '{}',
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS panel_editor_drafts_expiry
+      ON panel_editor_drafts(expires_at);
 
     CREATE TABLE IF NOT EXISTS staff_profiles (
       user_id TEXT PRIMARY KEY REFERENCES staff(user_id),
@@ -429,6 +650,42 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
 
     CREATE INDEX IF NOT EXISTS staff_audit_target_created
       ON staff_audit_logs(target_id, created_at);
+  `);
+
+  const accountColumns = new Set(db.pragma('table_info(economy_accounts)').map((column) => column.name));
+  if (!accountColumns.has('last_daily_reward_at')) {
+    db.exec('ALTER TABLE economy_accounts ADD COLUMN last_daily_reward_at TEXT');
+  }
+
+  const shopColumns = new Set(db.pragma('table_info(economy_shop_items)').map((column) => column.name));
+  if (!shopColumns.has('deleted')) {
+    db.exec('ALTER TABLE economy_shop_items ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0, 1))');
+  }
+
+  const applicationColumns = new Set(db.pragma('table_info(temporary_admin_applications)').map((column) => column.name));
+  const applicationMigrations = [
+    ['review_state', "TEXT NOT NULL DEFAULT 'pending'"],
+    ['management_notes', "TEXT NOT NULL DEFAULT ''"],
+    ['trial_started_at', 'TEXT'],
+    ['trial_duration_hours', 'INTEGER'],
+    ['assigned_manager_id', 'TEXT'],
+    ['trial_extensions', 'INTEGER NOT NULL DEFAULT 0'],
+    ['trial_outcome', 'TEXT'],
+    ['trial_reminder_sent_at', 'TEXT'],
+  ];
+  for (const [column, definition] of applicationMigrations) {
+    if (!applicationColumns.has(column)) db.exec(`ALTER TABLE temporary_admin_applications ADD COLUMN ${column} ${definition}`);
+  }
+  const applicationDraftColumns = new Set(db.pragma('table_info(temporary_admin_application_drafts)').map((column) => column.name));
+  if (!applicationDraftColumns.has('answers_json')) db.exec("ALTER TABLE temporary_admin_application_drafts ADD COLUMN answers_json TEXT NOT NULL DEFAULT '[]'");
+  if (!applicationDraftColumns.has('current_page')) db.exec('ALTER TABLE temporary_admin_application_drafts ADD COLUMN current_page INTEGER NOT NULL DEFAULT 0');
+  const panelEditorColumns = new Set(db.pragma('table_info(panel_editor_configs)').map((column) => column.name));
+  if (!panelEditorColumns.has('fields_json')) db.exec("ALTER TABLE panel_editor_configs ADD COLUMN fields_json TEXT NOT NULL DEFAULT '[]'");
+  const appealColumns = new Set(db.pragma('table_info(blacklist_appeals)').map((column) => column.name));
+  if (!appealColumns.has('applicant_response')) db.exec("ALTER TABLE blacklist_appeals ADD COLUMN applicant_response TEXT NOT NULL DEFAULT ''");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS temporary_admin_trial_expiration
+      ON temporary_admin_applications(status, expires_at, trial_reminder_sent_at);
   `);
 
   return db;

@@ -7,7 +7,7 @@ const config = require('../config');
 const { createDatabase } = require('../src/database');
 const { handleSalaryCommand } = require('../src/commands/salaries');
 const { getTownJobOptions } = require('../src/commands/townJobs');
-const { processTownJobsSalaries, salaryIntervalMs } = require('../src/services/economySalaries');
+const { calculateSalary, processTownJobsSalaries, salaryIntervalMs } = require('../src/services/economySalaries');
 const { setConfigValue } = require('../src/utils/discord');
 
 const managerRoleId = '1556064708795306157';
@@ -78,6 +78,16 @@ function commandInteraction(db, action, options = {}, userId = managerId) {
     get lastReply() { return lastReply; },
   };
 }
+
+test('highest policy selects the lower numeric role when salaries are tied', () => {
+  const roles = [
+    { role_id: '20000000000000000', salary: 100 },
+    { role_id: '100000000000000000', salary: 100 },
+    { role_id: '30000000000000000', salary: 90 },
+  ];
+  const winner = calculateSalary(roles, 'highest');
+  assert.equal(winner.role_id, '20000000000000000');
+});
 
 test('Town Jobs salaries start after 30 minutes and pay once per due schedule across restarts', async (t) => {
   const store = makeTempDatabase(t);
@@ -212,4 +222,5 @@ test('management configures roles, policy, pause/resume and history; players can
   assert.match(history.embeds[0].data.description, /125 GV Credits/);
   const remove = await handleSalaryCommand(commandInteraction(db, 'remove', { getRole: () => ({ id: roleA }) }), { db });
   assert.match(remove.content, /Removed/);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action LIKE 'economy_salary_%' OR action IN ('economy_salaries_paused', 'economy_salaries_resumed')").get().count, 8);
 });

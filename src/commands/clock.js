@@ -19,6 +19,7 @@ const {
   setConfigValue,
   unixTime,
 } = require('../utils/discord');
+const { applyPanelCustomization, ensurePanelHeader } = require('./panelEditor');
 
 function createPanelComponents() {
   return [
@@ -28,6 +29,10 @@ function createPanelComponents() {
       .setLabel('Create Announcement')
       .setEmoji('📣')
       .setStyle(ButtonStyle.Primary)),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:session_panel:start').setLabel('Start RP Session').setEmoji('🎙️').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('gv:session_panel:end').setLabel('End Session').setEmoji('🏁').setStyle(ButtonStyle.Danger),
+    ),
   ];
 }
 
@@ -93,9 +98,16 @@ async function publishPanel(interaction, ctx) {
     return interaction.reply({ content: 'I could not access the configured staff activity channel. Check the channel ID and my View Channel, Send Messages, and Embed Links permissions.', ephemeral: true });
   }
 
-  const payload = { embeds: [await buildPanelEmbed(ctx.db, interaction.guild)], components: createPanelComponents() };
+  const customized = applyPanelCustomization(ctx.db, 'staff', await buildPanelEmbed(ctx.db, interaction.guild), createPanelComponents());
+  const payload = { embeds: [customized.embed], components: customized.components };
   let message;
-  const savedMessageId = getConfigValue(ctx.db, 'panel_message');
+  let savedMessageId = getConfigValue(ctx.db, 'panel_message');
+  const header = await ensurePanelHeader(interaction.client, ctx.db, 'staff', channel);
+  if (header.created && savedMessageId) {
+    try { const previous = await channel.messages.fetch(savedMessageId); if (previous.author?.id === interaction.client.user?.id) await previous.delete(); } catch {}
+    setConfigValue(ctx.db, 'panel_message', null);
+    savedMessageId = null;
+  }
   if (savedMessageId) {
     try {
       const previous = await channel.messages.fetch(savedMessageId);

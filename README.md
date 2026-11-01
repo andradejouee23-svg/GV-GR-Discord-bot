@@ -39,13 +39,15 @@ For vehicle registration, create a public registration-panel channel and a staff
 
 For Temporary Admin applications, management runs `/tempadmin configure` to set the application role, private review channel, duration, title, description, and up to five questions. Then run `/tempadmin panel channel:<text-channel>` to post or refresh the public application panel. The bot needs Manage Roles, View Channel, Send Messages, and Embed Links permissions in the review channel, and its highest role must be above the temporary role. Applicants can privately review decisions with `/tempadmin history`.
 
-For Town Jobs, management configures the panel with `/townjobs configure`, adds arbitrary role buttons with `/townjobs add`, and publishes or refreshes it with `/townjobs panel`. Configure the bot with Manage Roles and place its highest role above every selectable job role. The current configurable job list is available through the Town Jobs module's `getTownJobOptions` helper for future salary eligibility; jobs are not hardcoded.
+For Town Jobs, management configures the panel with `/townjobs configure`, adds arbitrary role buttons with `/townjobs add`, and publishes or refreshes it with `/townjobs panel`. Configure the bot with Manage Roles and place its highest role above every selectable job role. Jobs are not hardcoded; the salary system can pay any currently configured Town Job role.
 
 For welcome messages, a configured Owner sets `WELCOME_CHANNEL_ID`, `HOW_TO_JOIN_CHANNEL_ID`, and `SERVER_RULES_CHANNEL_ID` with `/staffconfig channel`. The bot needs View Channel, Send Messages, and Embed Links in the welcome channel. New members receive a welcome embed with their own avatar thumbnail and links to the configured channels.
 
-For Economy Stage 1, management runs `/economy configure channel:<text-channel>` to set the panel channel. The same command accepts minimum reward, maximum reward, and Work cooldown values. Then run `/economy panel` to post or refresh the panel. Players use **My Wallet** for private account totals, **Work** for a random reward, and **Delivery Rush** for a route-choice minigame. Delivery Rush reward ranges and cooldown are configurable through `/economy configure`; game cooldowns, wallet rewards, and ledger entries persist in SQLite. Current default reward settings are in `config.js`.
+For the economy, management runs `/economy configure channel:<text-channel>` to set the player panel. Set `drop-channel` to choose where automatic cash drops appear, then use `/economy panel` to publish or refresh the player controls. `/management-dashboard` opens the staff dashboard; its Economy section manages products, rewards, cash drops, salary status, balance changes, and economy audit entries. Shop products can also be created, edited, enabled/disabled, and removed with `/economy item-add`, `item-edit`, `item-toggle`, and `item-remove`.
 
-For Economy Stage 2, add roles to the Town Jobs panel first, then use `/salary add role:<role> amount:<amount>` to make them salary-eligible. `/salary policy mode:highest|combined` controls multiple-role payouts; `/salary pause` and `/salary resume` control automatic payments; `/salary history` shows recent payouts. Salary schedules are checked on startup and by the existing 15-minute worker loop; a new eligible player starts with a 30-minute wait, and late/restarted workers do not receive catch-up payments.
+Players can use the Economy Panel or `/economy` commands to view wallets, deposit/withdraw, transfer credits, claim daily rewards, browse and buy shop products, review inventory/history/transactions, and view the leaderboard. Blackjack pays 3:2 for a natural, 1:1 for a regular win, and returns the wager on a push. Coin Flip wins pay 2x; American Roulette red/black pay 2x and zero pays 36x; Chicken Road increases its displayed cash-out multiplier with each safe step. Bets are taken from the wallet. Game sessions, claims, shop stock, cooldowns, balances, and transaction history are stored in SQLite and survive bot restarts.
+
+Automatic cash drops run every 15 minutes when enabled and a drop channel is configured. Each drop has a configured per-player amount, claimant limit, and expiry; each player can claim a given drop only once. The next due time and pending posts are persisted so a restart or temporary channel failure does not silently lose a drop. Existing wallet balances are not reset by economy schema upgrades. Town Jobs salaries remain configurable with `/salary add`, `set`, `remove`, `toggle`, `policy`, `pause`, `resume`, and `history`; payment schedules are persisted and scanned on startup and by the recurring worker.
 
 After first setup, a configured Owner or Co-Owner can update channels and role groups using `/staffconfig channel` and `/staffconfig role`. These overrides are saved in SQLite. The initial Owner role still needs to be set in `config.js` so someone can run that command.
 
@@ -129,8 +131,10 @@ Run the bot as a single long-lived worker with `npm start` (it does not serve an
 - `/vehicle panel` posts the registration panel. Players use its buttons or `/vehicle mine`; management can search, review, update, revoke, set expiration, and inspect registration history.
 - `/tempadmin panel` posts the application panel; `/tempadmin configure` sets the application questions, review channel, assigned role, and role duration. `/tempadmin history` shows private application history.
 - `/townjobs configure`, `/townjobs add`, `/townjobs edit`, `/townjobs remove`, `/townjobs list`, and `/townjobs panel` manage the customizable Town Jobs role panel.
-- `/economy configure`, `/economy panel`, `/economy wallet`, and `/economy work` configure and use the Stage 1 virtual wallet and Work system.
-- **Delivery Rush** is available from the Economy Panel and pays successful rewards into the same wallet and transaction ledger.
+- `/economy configure`, `/economy panel`, `/economy wallet`, `/economy work`, `/economy daily`, bank transfers, shop, inventory, history, transactions, leaderboard, and staff product/balance commands manage the persistent virtual economy.
+- **Delivery Rush**, Blackjack, Coin Flip, Roulette, and Chicken Road use the shared economy wallet and transaction ledger; buttons and game sessions persist through restarts.
+- Automatic cash drops post every 15 minutes to the configured channel; claims are limited per player and recorded in the ledger.
+- `/management-dashboard` includes economy management controls and audit history. Shop, reward, cash-drop, HEX color, salary, and balance changes are restricted to management.
 - `/salary add`, `/salary set`, `/salary remove`, `/salary toggle`, `/salary list`, `/salary policy`, `/salary pause`, `/salary resume`, and `/salary history` manage Town Jobs salaries.
 
 ## Project Files
@@ -145,7 +149,8 @@ Run the bot as a single long-lived worker with `npm start` (it does not serve an
 - `src/commands/vehicles.js`: Vehicle applications, staff review, and registration management.
 - `src/commands/tempAdmin.js`: Temporary Admin application configuration, review, role assignment, history, and expiration.
 - `src/commands/townJobs.js`: Configurable Town Jobs panel and shared job-role catalog.
-- `src/commands/economy.js`: Persistent Economy Stage 1 accounts, Work rewards, and panel.
+- `src/commands/economy.js`: Persistent economy accounts, banking, shop, cash drops, player/staff interactions, history, and panel.
+- `src/services/economyGames.js`: Persisted Blackjack, Coin Flip, Roulette, and Chicken Road wager/payout state machines.
 - `src/events/memberJoin.js`: Configured welcome embed and join/rules links.
 - `src/commands/salaries.js` and `src/services/economySalaries.js`: Town Jobs salary configuration, persistent due schedules, and automated payments.
 - `src/commands/safety.js`: Player reports and moderation commands.

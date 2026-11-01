@@ -11,6 +11,7 @@ const {
   handleTempAdminButton,
   handleTempAdminCommand,
   handleTempAdminModal,
+  handleTempAdminSelect,
   processTemporaryAdminExpirations,
 } = require('../src/commands/tempAdmin');
 const { setConfigValue } = require('../src/utils/discord');
@@ -122,16 +123,32 @@ function makeApplicationOptions(values = {}) {
 
 async function submitApplication(env, applicantId, answers) {
   const settings = getApplicationSettings(env.db);
+  const completeAnswers = Array.from({ length: settings.questions.length }, (_, index) => answers[index] ?? `Completed response ${index + 1}.`);
   const draftId = createApplicationDraft(env.db, applicantId, settings);
+  const pageCount = Math.ceil(settings.questions.length / 5);
+  let customId = pageCount > 1 ? `gv:tempadmin:apply:${draftId}:0` : `gv:tempadmin:apply:${draftId}`;
   let response;
-  await handleTempAdminModal({
-    customId: `gv:tempadmin:apply:${draftId}`,
-    user: { id: applicantId, username: applicantId },
-    guild: env.guild,
-    client: env.client,
-    fields: { getTextInputValue: (id) => answers[Number(id.slice('answer_'.length))] },
-    reply: async (payload) => { response = payload; return payload; },
-  }, { db: env.db });
+  for (let page = 0; page < pageCount; page += 1) {
+    await handleTempAdminModal({
+      customId,
+      user: { id: applicantId, username: applicantId },
+      guild: env.guild,
+      client: env.client,
+      fields: { getTextInputValue: (id) => completeAnswers[Number(id.slice('answer_'.length))] },
+      reply: async (payload) => { response = payload; return payload; },
+    }, { db: env.db });
+    if (page < pageCount - 1) {
+      let nextModal;
+      const nextId = response.components[0].components.at(-1).data.custom_id;
+      await handleTempAdminButton({
+        customId: nextId,
+        user: { id: applicantId, username: applicantId },
+        showModal: async (modal) => { nextModal = modal; return modal; },
+        reply: async (payload) => payload,
+      }, { db: env.db });
+      customId = nextModal.data.custom_id;
+    }
+  }
   return response;
 }
 
@@ -193,7 +210,7 @@ test('management configures and publishes the application panel; submitted forms
   assert.deepEqual(JSON.parse(application.questions_json), ['Why do you want this role?', 'Describe your experience.']);
   assert.equal(application.duration_hours, 24);
   assert.match(env.reviewPosts[0].embeds[0].data.title, /GV GR Temporary Admin/);
-  assert.equal(env.reviewPosts[0].components[0].components.length, 2);
+  assert.equal(env.reviewPosts[0].components[0].components.length, 4);
 
   let duplicateReply;
   await handleTempAdminButton({
@@ -235,7 +252,23 @@ test('management-only approval and denial update roles, history, and private not
   assert.equal(applicant.roles.cache.has(adminRoleId), true);
   assert.ok(approved.expires_at);
   assert.match(approvedMessage.embeds[0].data.title, /Approved/);
-  assert.equal(env.dms.length, 1);
+  assert.equal(approved.trial_started_at, approved.reviewed_at);
+  assert.equal(approved.assigned_manager_id, managerId);
+  const initialExpires = approved.expires_at;
+  let extensionReply;
+  await handleTempAdminCommand(managerInteraction(env, {
+    commandName: 'tempadmin',
+    options: {
+      getSubcommand: () => 'trial-extend',
+      getInteger: (name) => name === 'hours' ? 24 : approvedApp.id,
+      getString: () => 'Strong attendance',
+    },
+    reply: async (payload) => { extensionReply = payload; return payload; },
+  }), { db: env.db });
+  const extended = env.db.prepare('SELECT * FROM temporary_admin_applications WHERE id = ?').get(approvedApp.id);
+  assert.match(extensionReply.content, /Trial extended/);
+  assert.ok(new Date(extended.expires_at).getTime() > new Date(initialExpires).getTime());
+  assert.equal(extended.trial_extensions, 1);
 
   let denialModal;
   await handleTempAdminButton(managerInteraction(env, {
@@ -253,8 +286,61 @@ test('management-only approval and denial update roles, history, and private not
   assert.equal(denied.status, 'denied');
   assert.equal(denied.decision_reason, 'Insufficient detail.');
   assert.match(denialReply.content, /notified privately/);
-  assert.equal(env.dms.length, 2);
+  assert.equal(env.dms.length, 5);
   assert.equal(env.db.prepare('SELECT COUNT(*) AS count FROM temporary_admin_application_history WHERE action IN (\'approved\', \'denied\')').get().count, 2);
+});
+
+test('management can hold, request information, resume, and record applicant responses', async (t) => {
+  const env = createEnvironment(t);
+  const applicant = addApplicant(env, 'applicant-info');
+  await submitApplication(env, applicant.id, ['Answer one.', 'Answer two.', 'Answer three.']);
+  const application = env.db.prepare('SELECT * FROM temporary_admin_applications WHERE applicant_id = ?').get(applicant.id);
+
+  let holdReply;
+  await handleTempAdminButton(managerInteraction(env, {
+    customId: `gv:tempadmin:hold:${application.id}`,
+    reply: async (payload) => { holdReply = payload; return payload; },
+  }), { db: env.db });
+  assert.match(holdReply.content, /on hold/);
+  assert.equal(env.db.prepare('SELECT review_state FROM temporary_admin_applications WHERE id = ?').get(application.id).review_state, 'on_hold');
+
+  let approveReply;
+  await handleTempAdminButton(managerInteraction(env, {
+    customId: `gv:tempadmin:approve:${application.id}`,
+    reply: async (payload) => { approveReply = payload; return payload; },
+  }), { db: env.db });
+  assert.match(approveReply.content, /on hold/);
+
+  await handleTempAdminButton(managerInteraction(env, {
+    customId: `gv:tempadmin:resume:${application.id}`,
+    reply: async (payload) => payload,
+  }), { db: env.db });
+  let infoModal;
+  await handleTempAdminButton(managerInteraction(env, {
+    customId: `gv:tempadmin:info:${application.id}`,
+    showModal: async (modal) => { infoModal = modal; return modal; },
+  }), { db: env.db });
+  let infoReply;
+  await handleTempAdminModal(managerInteraction(env, {
+    customId: infoModal.data.custom_id,
+    fields: { getTextInputValue: () => 'Please provide your schedule.' },
+    reply: async (payload) => { infoReply = payload; return payload; },
+  }), { db: env.db });
+  assert.match(infoReply.content, /Information requested/);
+  assert.equal(env.db.prepare('SELECT review_state FROM temporary_admin_applications WHERE id = ?').get(application.id).review_state, 'info_requested');
+
+  let response;
+  await handleTempAdminCommand({
+    commandName: 'tempadmin',
+    options: { getSubcommand: () => 'respond', getInteger: () => application.id, getString: () => 'I am available weekends.' },
+    user: { id: applicant.id },
+    guild: env.guild,
+    client: env.client,
+    reply: async (payload) => { response = payload; return payload; },
+  }, { db: env.db });
+  assert.match(response.content, /sent to management/);
+  assert.equal(env.db.prepare('SELECT review_state FROM temporary_admin_applications WHERE id = ?').get(application.id).review_state, 'pending');
+  assert.ok(env.db.prepare("SELECT id FROM temporary_admin_application_history WHERE application_id = ? AND action = 'applicant_information_submitted'").get(application.id));
 });
 
 test('temporary role expiration removes the role once and recovers interrupted approvals', async (t) => {
@@ -284,4 +370,76 @@ test('temporary role expiration removes the role once and recovers interrupted a
   const recovered = env.db.prepare('SELECT status, expires_at FROM temporary_admin_applications WHERE id = ?').get(recovery.id);
   assert.equal(recovered.status, 'approved');
   assert.ok(recovered.expires_at);
+});
+
+test('Temporary Admin forms paginate text and real dropdown/multi-select questions while retaining all submitted answers', async (t) => {
+  const env = createEnvironment(t);
+  setConfigValue(env.db, 'TEMP_ADMIN_APPLICATION_QUESTIONS', [
+    { label: 'Roblox username', type: 'short', required: true },
+    { label: 'Why apply?', type: 'paragraph', required: true },
+    { label: 'Select your shift', type: 'dropdown', required: true, options: ['Morning', 'Evening'] },
+    { label: 'Past experience', type: 'short', required: false },
+    { label: 'Which rules do you know?', type: 'multiple_choice', required: true, options: ['Respect', 'Safety', 'Fair play'] },
+    { label: 'Availability', type: 'paragraph', required: true },
+  ]);
+  const applicantId = 'applicant-multistep';
+  let firstModal;
+  await handleTempAdminButton({
+    customId: 'gv:tempadmin:apply',
+    user: { id: applicantId, username: 'Multi Step Applicant' },
+    showModal: async (modal) => { firstModal = modal; return modal; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
+  assert.equal(firstModal.toJSON().custom_id.split(':').at(-1), '0');
+  assert.equal(firstModal.toJSON().components.length, 3);
+
+  let choicePayload;
+  await handleTempAdminModal({
+    customId: firstModal.data.custom_id,
+    user: { id: applicantId, username: 'Multi Step Applicant' },
+    guild: env.guild,
+    client: env.client,
+    fields: { getTextInputValue: (key) => ({ answer_0: 'RobloxOne', answer_1: 'I want to help.', answer_3: 'Community moderation' }[key] ?? '') },
+    reply: async (payload) => { choicePayload = payload; return payload; },
+  }, { db: env.db });
+  assert.equal(choicePayload.components.length, 3);
+  assert.equal(choicePayload.components[0].components[0].data.type, 3);
+  const dropdownId = choicePayload.components[0].components[0].data.custom_id;
+  await handleTempAdminSelect({
+    customId: dropdownId,
+    values: ['Evening'],
+    user: { id: applicantId },
+    update: async (payload) => { choicePayload = payload; return payload; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
+  const multiChoiceId = choicePayload.components[1].components[0].data.custom_id;
+  await handleTempAdminSelect({
+    customId: multiChoiceId,
+    values: ['Respect', 'Safety'],
+    user: { id: applicantId },
+    update: async (payload) => { choicePayload = payload; return payload; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
+
+  const continueId = choicePayload.components[2].components[0].data.custom_id;
+  let secondModal;
+  await handleTempAdminButton({
+    customId: continueId,
+    user: { id: applicantId },
+    showModal: async (modal) => { secondModal = modal; return modal; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
+  assert.equal(secondModal.data.custom_id.split(':').at(-1), '1');
+  let submitted;
+  await handleTempAdminModal({
+    customId: secondModal.data.custom_id,
+    user: { id: applicantId, username: 'Multi Step Applicant' },
+    guild: env.guild,
+    client: env.client,
+    fields: { getTextInputValue: () => 'Available every weekend.' },
+    reply: async (payload) => { submitted = payload; return payload; },
+  }, { db: env.db });
+  assert.match(submitted.content, /sent to management/);
+  const application = env.db.prepare('SELECT * FROM temporary_admin_applications WHERE applicant_id = ?').get(applicantId);
+  assert.deepEqual(JSON.parse(application.answers_json), ['RobloxOne', 'I want to help.', 'Evening', 'Community moderation', 'Respect, Safety', 'Available every weekend.']);
 });

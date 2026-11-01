@@ -35,6 +35,20 @@ function makeSessionModal(host) {
     );
 }
 
+function makeSessionPanelModal(hostId) {
+  return new ModalBuilder()
+    .setCustomId(`gv:session_panel_start:${hostId}`)
+    .setTitle('GV GR • Start RP Session')
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder()
+        .setCustomId('name').setLabel('Session name').setStyle(TextInputStyle.Short)
+        .setMaxLength(100).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder()
+        .setCustomId('description').setLabel('Session details (optional)').setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1000).setRequired(false)),
+    );
+}
+
 function makeSessionButtons(sessionId) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gv:session_join:${sessionId}`).setLabel('Join Session').setEmoji('🎙️').setStyle(ButtonStyle.Primary),
@@ -64,27 +78,32 @@ async function submitSessionModal(interaction, ctx) {
   if (!host || !getStaffRoleName(host, ctx.db)) {
     return interaction.reply({ content: 'The selected host no longer has a configured staff role.', ephemeral: true });
   }
-  if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) {
-    return interaction.reply({ content: 'An RP session was started while this form was open. Check `/session status`.', ephemeral: true });
-  }
-
-  const now = new Date().toISOString();
   const name = interaction.fields.getTextInputValue('name').trim();
   const description = interaction.fields.getTextInputValue('description').trim();
   if (!name) return interaction.reply({ content: 'Enter a session name before starting.', ephemeral: true });
+  return publishSessionAnnouncement(interaction, ctx, host, name, description);
+}
 
-  const result = ctx.db.prepare(`
-    INSERT INTO sessions (name, description, host_id, host_name, started_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(name, description, host.id, host.user.username, now);
-  const sessionId = Number(result.lastInsertRowid);
-  ctx.db.prepare(`
-    INSERT INTO session_participants (session_id, user_id, username, joined_at) VALUES (?, ?, ?, ?)
-  `).run(sessionId, host.id, host.user.username, now);
+async function publishSessionAnnouncement(interaction, ctx, host, name, description) {
+  const now = new Date().toISOString();
+  const sessionId = ctx.db.transaction(() => {
+    if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) return null;
+    const result = ctx.db.prepare(`
+      INSERT INTO sessions (name, description, host_id, host_name, started_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(name, description, host.id, host.user.username, now);
+    const id = Number(result.lastInsertRowid);
+    ctx.db.prepare('INSERT INTO session_participants (session_id, user_id, username, joined_at) VALUES (?, ?, ?, ?)')
+      .run(id, host.id, host.user.username, now);
+    return id;
+  })();
+  if (!sessionId) return interaction.reply({ content: 'Another RP session is already active. End it before starting a new one.', ephemeral: true });
 
-  const embed = makeEmbed(config.EMBED_COLORS.info, `🎙️ RP Session: ${name}`,
-    `${description ? `${description}\n\n` : ''}**Host:** <@${host.id}>\n**Started:** ${unixTime(now)}\n**Session:** #${sessionId}`)
-    .setFooter({ text: 'GV GR RP Session • Staff can join below' });
+  const embed = makeEmbed(config.EMBED_COLORS.info, `🎙️ GV GR • ${name}`,
+    `${description ? `${description}\n\n` : ''}**SESSION LIVE**\n\n👤 **Host**\n<@${host.id}>\n\n🕒 **Started**\n${unixTime(now)}\n\n🆔 **Session**\n#${sessionId}`)
+    .setFooter({ text: 'GREENVILLE ROLEPLAY • Staff can join this active session below' })
+    .setTimestamp(new Date(now));
+  if (interaction.guild?.iconURL()) embed.setAuthor({ name: 'GV GR • GREENVILLE ROLEPLAY', iconURL: interaction.guild.iconURL() });
   const channelId = getConfigValue(ctx.db, 'SESSION_CHANNEL_ID');
   let message;
   if (channelId) {
@@ -109,6 +128,33 @@ async function submitSessionModal(interaction, ctx) {
   });
 }
 
+async function handleSessionPanelButton(interaction, ctx) {
+  if (interaction.customId === 'gv:session_panel:start') {
+    const host = await fetchGuildMember(interaction.guild, interaction.user.id);
+    if (!host || !getStaffRoleName(host, ctx.db)) {
+      return interaction.reply({ content: 'Starting a GV GR session is available to configured staff members only.', ephemeral: true });
+    }
+    if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) {
+      return interaction.reply({ content: 'An RP session is already active. End it before starting another.', ephemeral: true });
+    }
+    return interaction.showModal(makeSessionPanelModal(interaction.user.id));
+  }
+  if (interaction.customId === 'gv:session_panel:end') return endSession(interaction, ctx);
+  return null;
+}
+
+async function handleSessionPanelModal(interaction, ctx) {
+  const match = interaction.customId.match(/^gv:session_panel_start:(\d{17,20})$/);
+  if (!match) return null;
+  if (match[1] !== interaction.user.id) return interaction.reply({ content: 'Only the staff member who opened this session form can submit it.', ephemeral: true });
+  const host = await fetchGuildMember(interaction.guild, interaction.user.id);
+  if (!host || !getStaffRoleName(host, ctx.db)) return interaction.reply({ content: 'Your configured GV GR staff role is required to start a session.', ephemeral: true });
+  const name = interaction.fields.getTextInputValue('name').trim();
+  const description = interaction.fields.getTextInputValue('description').trim();
+  if (!name) return interaction.reply({ content: 'Enter a session name before publishing.', ephemeral: true });
+  return publishSessionAnnouncement(interaction, ctx, host, name, description);
+}
+
 async function endSession(interaction, ctx) {
   if (!await ensureManagement(interaction, ctx.db)) return;
   const session = ctx.db.prepare("SELECT * FROM sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1").get();
@@ -131,7 +177,9 @@ async function endSession(interaction, ctx) {
   }
 
   const embed = makeEmbed(config.EMBED_COLORS.info, '🎙️ RP Session Ended',
-    `**${session.name}** • Host: <@${session.host_id}>\nStarted: ${unixTime(session.started_at)}\nEnded: ${unixTime(endedAt)}\nDuration: **${formatDuration(durationSeconds)}**`);
+    `**SESSION CONCLUDED**\n\n🎙️ **${session.name}**\n👤 **Host:** <@${session.host_id}>\n🕒 **Started:** ${unixTime(session.started_at)}\n🏁 **Ended:** ${unixTime(endedAt)}\n⏱️ **Duration:** ${formatDuration(durationSeconds)}`)
+    .setFooter({ text: 'GREENVILLE ROLEPLAY • Session announcement' })
+    .setTimestamp(new Date(endedAt));
   await sendToChannel(interaction.client, getConfigValue(ctx.db, 'SESSION_CHANNEL_ID'), { embeds: [embed] });
   await logStaffAction(interaction.client, ctx.db, { embeds: [embed] });
   return interaction.reply({ content: `Session #${session.id} ended. Duration: **${formatDuration(durationSeconds)}**.`, ephemeral: true });
@@ -236,6 +284,8 @@ async function handleSessionJoin(interaction, ctx, sessionId) {
 }
 
 module.exports = {
+  handleSessionPanelButton,
+  handleSessionPanelModal,
   handleOperationsCommand,
   handleSessionJoin,
   makeSessionButtons,

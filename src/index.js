@@ -13,12 +13,14 @@ const { createDatabase } = require('./database');
 const { commands } = require('./commands/definitions');
 const { handleButton } = require('./buttons');
 const { handleClockCommand } = require('./commands/clock');
-const { handleOperationsCommand, submitSessionModal } = require('./commands/operations');
+const { handleOperationsCommand, handleSessionPanelModal, submitSessionModal } = require('./commands/operations');
 const { handleAnnouncementManagerInteraction } = require('./commands/announcementManager');
 const { handleVehicleCommand, handleVehicleModal, processVehicleExpirations } = require('./commands/vehicles');
-const { handleTempAdminCommand, handleTempAdminModal, processTemporaryAdminExpirations } = require('./commands/tempAdmin');
+const { handleTempAdminCommand, handleTempAdminModal, handleTempAdminSelect, processTemporaryAdminExpirations } = require('./commands/tempAdmin');
 const { handleTownJobsCommand } = require('./commands/townJobs');
-const { handleEconomyCommand } = require('./commands/economy');
+const { handleEconomyCommand, handleEconomyManagementButton, handleEconomyManagementSelect, handleEconomyModal, processEconomyCashDrops } = require('./commands/economy');
+const { handleBlacklistButton, handleBlacklistCommand, handleBlacklistModal, handleBlacklistSelect, processBlacklistExpirations } = require('./commands/blacklist');
+const { handlePanelEditorButton, handlePanelEditorCommand, handlePanelEditorModal, handlePanelEditorSelect } = require('./commands/panelEditor');
 const { handleSalaryCommand } = require('./commands/salaries');
 const { processTownJobsSalaries } = require('./services/economySalaries');
 const { handleSafetyCommand, submitReport } = require('./commands/safety');
@@ -76,6 +78,8 @@ if (requireSetup()) {
       processVehicleExpirations(db);
       await processTemporaryAdminExpirations(client, db);
       await processTownJobsSalaries(client, db);
+      await processEconomyCashDrops(client, db);
+      await processBlacklistExpirations(client, db);
     } catch (error) {
       console.error('Staff background task failed:', error);
     }
@@ -137,7 +141,7 @@ if (requireSetup()) {
       }
 
       if (interaction.isChatInputCommand()) {
-        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
+        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleBlacklistCommand, handlePanelEditorCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
         for (const handler of handlers) {
           const result = await handler(interaction, context);
           if (result !== null && result !== undefined) return;
@@ -150,6 +154,8 @@ if (requireSetup()) {
       }
 
       if (interaction.isButton()) {
+        if (interaction.customId.startsWith('gv:panel_editor:')) return handlePanelEditorButton(interaction, context);
+        if (interaction.customId === 'mgmt:economy') return handleEconomyManagementButton(interaction, context);
         if (interaction.customId.startsWith('mgmt:shift_confirm:') || interaction.customId.startsWith('mgmt:shift_cancel:')) {
           return handleManagementShiftConfirm(interaction, context);
         }
@@ -171,6 +177,18 @@ if (requireSetup()) {
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:daily:rating:')) {
         return handleDailyReportSelect(interaction, context);
       }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:blacklist:select:')) {
+        return handleBlacklistSelect(interaction, context);
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:tempadmin:choice:')) {
+        return handleTempAdminSelect(interaction, context);
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId === 'gv:panel_editor:select') {
+        return handlePanelEditorSelect(interaction, context);
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:economy:staff:')) {
+        return handleEconomyManagementSelect(interaction, context);
+      }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('owner:action:')) {
         return handleOwnerActionSelect(interaction, context);
       }
@@ -182,9 +200,13 @@ if (requireSetup()) {
         if (interaction.customId === 'owner:select_staff') return handleOwnerHistorySelect(interaction, context);
       }
       if (interaction.isModalSubmit()) {
+        if (interaction.customId.startsWith('gv:panel_editor:')) return handlePanelEditorModal(interaction, context);
+        if (interaction.customId.startsWith('gv:blacklist:')) return handleBlacklistModal(interaction, context);
+        if (interaction.customId.startsWith('gv:economy:')) return handleEconomyModal(interaction, context);
         if (interaction.customId === 'gv:report_submit') return submitReport(interaction, context);
         if (interaction.customId.startsWith('gv:daily:submit:')) return handleDailyReportModal(interaction, context);
         if (interaction.customId.startsWith('gv:session_start:')) return submitSessionModal(interaction, context);
+        if (interaction.customId.startsWith('gv:session_panel_start:')) return handleSessionPanelModal(interaction, context);
         if (interaction.customId.startsWith('gv:ann:')) return handleAnnouncementManagerInteraction(interaction, context);
         if (interaction.customId.startsWith('gv:vehicle:')) return handleVehicleModal(interaction, context);
         if (interaction.customId.startsWith('gv:tempadmin:')) return handleTempAdminModal(interaction, context);

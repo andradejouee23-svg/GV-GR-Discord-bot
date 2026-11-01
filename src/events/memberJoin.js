@@ -2,10 +2,12 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
   PermissionFlagsBits,
 } = require('discord.js');
 const config = require('../../config');
 const { getConfigValue, makeEmbed, validId } = require('../utils/discord');
+const { applyPanelCustomization, getPanelEditorConfig } = require('../commands/panelEditor');
 
 function buildWelcomeEmbed(member) {
   return makeEmbed(config.EMBED_COLORS.active, 'WELCOME TO GV GR!',
@@ -66,9 +68,14 @@ async function welcomeNewMember(member, db, client) {
     return null;
   }
 
+  const customized = applyPanelCustomization(db, 'welcome', buildWelcomeEmbed(member), buildWelcomeComponents(member.guild.id, howToJoinChannelId, rulesChannelId));
+  const panel = getPanelEditorConfig(db, 'welcome');
+  if (panel.headerImageUrl) {
+    await welcomeChannel.send({ embeds: [new EmbedBuilder().setImage(panel.headerImageUrl)], allowedMentions: { parse: [] } });
+  }
   return welcomeChannel.send({
-    embeds: [buildWelcomeEmbed(member)],
-    components: buildWelcomeComponents(member.guild.id, howToJoinChannelId, rulesChannelId),
+    embeds: [customized.embed],
+    components: customized.components,
     allowedMentions: { users: [member.id] },
   });
 }

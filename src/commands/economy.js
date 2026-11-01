@@ -3,16 +3,31 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
   PermissionFlagsBits,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 const config = require('../../config');
 const { ensureManagement } = require('./staff');
+const {
+  beginBlackjack,
+  cardLabel,
+  handValue,
+  playCoinFlip,
+  playRoulette,
+  resolveBlackjackAction,
+  resolveChickenAction,
+  startChickenRoad,
+} = require('../services/economyGames');
 const {
   getConfigValue,
   makeEmbed,
   setConfigValue,
   validId,
 } = require('../utils/discord');
+const { applyPanelCustomization, ensurePanelHeader } = require('./panelEditor');
 
 function getEconomySettings(db) {
   return {
@@ -22,6 +37,17 @@ function getEconomySettings(db) {
     minimumReward: Number(getConfigValue(db, 'ECONOMY_WORK_MIN_REWARD') ?? config.ECONOMY_WORK_MIN_REWARD),
     maximumReward: Number(getConfigValue(db, 'ECONOMY_WORK_MAX_REWARD') ?? config.ECONOMY_WORK_MAX_REWARD),
     cooldownMinutes: Number(getConfigValue(db, 'ECONOMY_WORK_COOLDOWN_MINUTES') ?? config.ECONOMY_WORK_COOLDOWN_MINUTES),
+    startingBalance: Number(getConfigValue(db, 'ECONOMY_STARTING_BALANCE') ?? config.ECONOMY_STARTING_BALANCE),
+    dailyReward: Number(getConfigValue(db, 'ECONOMY_DAILY_REWARD_AMOUNT') ?? config.ECONOMY_DAILY_REWARD_AMOUNT),
+    dailyRewardCooldownHours: Number(getConfigValue(db, 'ECONOMY_DAILY_REWARD_COOLDOWN_HOURS') ?? config.ECONOMY_DAILY_REWARD_COOLDOWN_HOURS),
+    panelColor: Number(getConfigValue(db, 'ECONOMY_PANEL_COLOR') ?? config.ECONOMY_PANEL_COLOR),
+    shopColor: Number(getConfigValue(db, 'ECONOMY_SHOP_COLOR') ?? config.ECONOMY_SHOP_COLOR),
+    cashDropsEnabled: getConfigValue(db, 'ECONOMY_CASH_DROPS_ENABLED') !== false,
+    cashDropChannelId: getConfigValue(db, 'ECONOMY_CASH_DROP_CHANNEL_ID') ?? getConfigValue(db, 'ECONOMY_PANEL_CHANNEL_ID'),
+    cashDropIntervalMinutes: Number(getConfigValue(db, 'ECONOMY_CASH_DROP_INTERVAL_MINUTES') ?? config.ECONOMY_CASH_DROP_INTERVAL_MINUTES),
+    cashDropAmount: Number(getConfigValue(db, 'ECONOMY_CASH_DROP_AMOUNT') ?? config.ECONOMY_CASH_DROP_AMOUNT),
+    cashDropMaxClaims: Number(getConfigValue(db, 'ECONOMY_CASH_DROP_MAX_CLAIMS') ?? config.ECONOMY_CASH_DROP_MAX_CLAIMS),
+    cashDropLifetimeMinutes: Number(getConfigValue(db, 'ECONOMY_CASH_DROP_LIFETIME_MINUTES') ?? config.ECONOMY_CASH_DROP_LIFETIME_MINUTES),
     deliveryMinimumReward: Number(getConfigValue(db, 'ECONOMY_DELIVERY_MIN_REWARD') ?? config.ECONOMY_DELIVERY_MIN_REWARD),
     deliveryMaximumReward: Number(getConfigValue(db, 'ECONOMY_DELIVERY_MAX_REWARD') ?? config.ECONOMY_DELIVERY_MAX_REWARD),
     deliveryCooldownMinutes: Number(getConfigValue(db, 'ECONOMY_DELIVERY_COOLDOWN_MINUTES') ?? config.ECONOMY_DELIVERY_COOLDOWN_MINUTES),
@@ -60,13 +86,422 @@ function formatCurrency(amount, currencyName) {
 }
 
 function ensureEconomyAccount(db, userId, now = new Date().toISOString()) {
-  db.prepare('INSERT INTO economy_accounts (user_id, created_at) VALUES (?, ?) ON CONFLICT(user_id) DO NOTHING')
-    .run(userId, now);
+  const existing = db.prepare('SELECT * FROM economy_accounts WHERE user_id = ?').get(userId);
+  if (existing) return existing;
+  const settings = getEconomySettings(db);
+  const startingBalance = Number(settings.startingBalance ?? config.ECONOMY_STARTING_BALANCE ?? 0);
+  db.prepare(`
+    INSERT INTO economy_accounts (user_id, wallet_balance, bank_balance, lifetime_earnings, total_spent, total_transferred, created_at)
+    VALUES (?, ?, 0, 0, 0, 0, ?)
+  `).run(userId, startingBalance, now);
   return db.prepare('SELECT * FROM economy_accounts WHERE user_id = ?').get(userId);
 }
 
 function getWallet(db, userId, now = new Date().toISOString()) {
   return ensureEconomyAccount(db, userId, now);
+}
+
+function recordEconomyTransaction(db, {
+  userId,
+  relatedUserId = null,
+  type,
+  amount,
+  walletAfter,
+  bankAfter,
+  description = '',
+  now = new Date().toISOString(),
+}) {
+  if (!Number.isSafeInteger(amount) || amount < 1) throw new Error('Transaction amount must be a positive whole number.');
+  db.prepare(`
+    INSERT INTO economy_transactions (id, user_id, related_user_id, type, amount, wallet_after, bank_after, created_at, metadata_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(randomUUID(), userId, relatedUserId, type, amount, walletAfter, bankAfter, now, JSON.stringify({ description }));
+}
+
+function recordEconomyAudit(db, { actorId, targetId = 'economy', action, reason = '', previousValue = null, newValue = null, details = {}, now = new Date().toISOString() }) {
+  db.prepare(`
+    INSERT INTO staff_audit_logs (action, target_id, actor_id, reason, previous_value, new_value, details_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(`economy_${action}`, targetId, actorId, reason, previousValue, newValue, JSON.stringify(details), now);
+}
+
+function claimDailyReward(db, userId, settings = getEconomySettings(db), now = new Date()) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Daily reward time is invalid.');
+  const nowIso = nowDate.toISOString();
+  return db.transaction(() => {
+    const account = ensureEconomyAccount(db, userId, nowIso);
+    const cooldownHours = Number(settings.dailyRewardCooldownHours ?? 24);
+    const amount = Number(settings.dailyReward ?? 0);
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1_000_000_000
+      || !Number.isSafeInteger(cooldownHours) || cooldownHours < 1 || cooldownHours > 168) {
+      throw new Error('Daily reward settings are invalid.');
+    }
+    const cooldownMs = cooldownHours * 60 * 60 * 1000;
+    if (account.last_daily_reward_at) {
+      const nextAvailableAt = Date.parse(account.last_daily_reward_at) + cooldownMs;
+      if (Number.isFinite(nextAvailableAt) && nowDate.getTime() < nextAvailableAt) {
+        return { claimed: false, amount, nextRewardAt: new Date(nextAvailableAt).toISOString() };
+      }
+    }
+    const newWallet = account.wallet_balance + amount;
+    const newLifetime = account.lifetime_earnings + amount;
+    if (!Number.isSafeInteger(newWallet) || !Number.isSafeInteger(newLifetime)) {
+      throw new Error('Daily reward would exceed the safe account balance limit. Contact management.');
+    }
+    db.prepare(`
+      UPDATE economy_accounts
+      SET wallet_balance = ?, lifetime_earnings = ?, last_daily_reward_at = ?
+      WHERE user_id = ?
+    `).run(newWallet, newLifetime, nowIso, userId);
+    recordEconomyTransaction(db, { userId, type: 'daily_reward', amount, walletAfter: newWallet, bankAfter: account.bank_balance, description: 'Daily reward', now: nowIso });
+    return { claimed: true, amount, nextRewardAt: new Date(nowDate.getTime() + cooldownMs).toISOString(), walletAfter: newWallet };
+  })();
+}
+
+function depositToBank(db, userId, amount, description = 'Bank deposit', now = new Date().toISOString()) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Deposit amount must be a positive whole number.');
+  return db.transaction(() => {
+    const account = ensureEconomyAccount(db, userId, now);
+    if (account.wallet_balance < amount) throw new Error('You do not have enough wallet cash to make that deposit.');
+    const newWallet = account.wallet_balance - amount;
+    const newBank = account.bank_balance + amount;
+    if (!Number.isSafeInteger(newBank)) throw new Error('Bank balance would exceed the safe account limit.');
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ?, bank_balance = ? WHERE user_id = ?').run(newWallet, newBank, userId);
+    recordEconomyTransaction(db, { userId, type: 'bank_deposit', amount, walletAfter: newWallet, bankAfter: newBank, description, now });
+    return { walletAfter: newWallet, bankAfter: newBank, amount };
+  })();
+}
+
+function withdrawFromBank(db, userId, amount, description = 'Bank withdrawal', now = new Date().toISOString()) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Withdrawal amount must be a positive whole number.');
+  return db.transaction(() => {
+    const account = ensureEconomyAccount(db, userId, now);
+    if (account.bank_balance < amount) throw new Error('You do not have enough funds in your bank account.');
+    const newWallet = account.wallet_balance + amount;
+    const newBank = account.bank_balance - amount;
+    if (!Number.isSafeInteger(newWallet)) throw new Error('Wallet balance would exceed the safe account limit.');
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ?, bank_balance = ? WHERE user_id = ?').run(newWallet, newBank, userId);
+    recordEconomyTransaction(db, { userId, type: 'bank_withdrawal', amount, walletAfter: newWallet, bankAfter: newBank, description, now });
+    return { walletAfter: newWallet, bankAfter: newBank, amount };
+  })();
+}
+
+function transferToPlayer(db, fromUserId, toUserId, amount, description = 'Player transfer', now = new Date().toISOString()) {
+  if (fromUserId === toUserId) throw new Error('You cannot transfer money to yourself.');
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Transfer amount must be a positive whole number.');
+  return db.transaction(() => {
+    const sender = ensureEconomyAccount(db, fromUserId, now);
+    const recipient = ensureEconomyAccount(db, toUserId, now);
+    if (sender.wallet_balance < amount) throw new Error('You do not have enough wallet cash to make that transfer.');
+    const senderWallet = sender.wallet_balance - amount;
+    const recipientWallet = recipient.wallet_balance + amount;
+    const transferredTotal = sender.total_transferred + amount;
+    if (!Number.isSafeInteger(recipientWallet) || !Number.isSafeInteger(transferredTotal)) throw new Error('Transfer would exceed a safe account balance limit.');
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ?, total_transferred = ? WHERE user_id = ?').run(senderWallet, transferredTotal, fromUserId);
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ? WHERE user_id = ?').run(recipientWallet, toUserId);
+    recordEconomyTransaction(db, { userId: fromUserId, relatedUserId: toUserId, type: 'player_transfer', amount, walletAfter: senderWallet, bankAfter: sender.bank_balance, description, now });
+    recordEconomyTransaction(db, { userId: toUserId, relatedUserId: fromUserId, type: 'player_transfer_received', amount, walletAfter: recipientWallet, bankAfter: recipient.bank_balance, description: `Incoming transfer from <@${fromUserId}>`, now });
+    return { sender: getWallet(db, fromUserId, now), recipient: getWallet(db, toUserId, now), amount };
+  })();
+}
+
+function createShopItem(db, item, createdBy, now = new Date().toISOString()) {
+  const payload = {
+    id: item.id ?? randomUUID(),
+    name: String(item.name ?? '').trim(),
+    description: String(item.description ?? '').trim(),
+    price: Number(item.price ?? 0),
+    category: String(item.category ?? 'General').trim() || 'General',
+    stock: Number(item.stock ?? 0),
+    imageUrl: item.imageUrl ?? null,
+    enabled: item.enabled === false ? 0 : 1,
+    purchaseLimit: item.purchaseLimit == null ? null : Number(item.purchaseLimit),
+    createdBy,
+    now,
+  };
+  if (!payload.name || !Number.isSafeInteger(payload.price) || payload.price < 1 || !Number.isSafeInteger(payload.stock) || payload.stock < 0
+    || (payload.purchaseLimit !== null && (!Number.isSafeInteger(payload.purchaseLimit) || payload.purchaseLimit < 1))) {
+    throw new Error('Shop item name, price, and stock must be valid.');
+  }
+  if (payload.imageUrl) {
+    let imageUrl;
+    try { imageUrl = new URL(payload.imageUrl); } catch { throw new Error('Shop item image must be a valid HTTPS URL.'); }
+    if (imageUrl.protocol !== 'https:') throw new Error('Shop item image must be a valid HTTPS URL.');
+  }
+  db.prepare(`
+    INSERT INTO economy_shop_items (id, name, description, price, category, stock, image_url, enabled, purchase_limit, created_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(payload.id, payload.name, payload.description, payload.price, payload.category, payload.stock, payload.imageUrl, payload.enabled, payload.purchaseLimit, payload.createdBy, now, now);
+  recordEconomyAudit(db, { actorId: createdBy, targetId: payload.id, action: 'shop_item_created', newValue: JSON.stringify(payload), now });
+  return payload.id;
+}
+
+function editShopItem(db, itemId, changes, actorId, now = new Date().toISOString()) {
+  const existing = db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0').get(itemId);
+  if (!existing) return { updated: false, reason: 'missing' };
+  const allowed = {
+    name: (value) => String(value).trim(),
+    description: (value) => String(value).trim(),
+    price: (value) => Number(value),
+    category: (value) => String(value).trim() || 'General',
+    stock: (value) => Number(value),
+    imageUrl: (value) => value || null,
+    purchaseLimit: (value) => value == null ? null : Number(value),
+    enabled: (value) => value ? 1 : 0,
+  };
+  const next = {};
+  for (const [key, value] of Object.entries(changes)) {
+    if (value !== undefined && allowed[key]) next[key] = allowed[key](value);
+  }
+  if (!Object.keys(next).length) return { updated: false, reason: 'empty' };
+  if ((next.name !== undefined && !next.name)
+    || (next.price !== undefined && (!Number.isSafeInteger(next.price) || next.price < 1))
+    || (next.stock !== undefined && (!Number.isSafeInteger(next.stock) || next.stock < 0))
+    || (next.purchaseLimit !== undefined && next.purchaseLimit !== null && (!Number.isSafeInteger(next.purchaseLimit) || next.purchaseLimit < 1))) {
+    throw new Error('Shop item name, price, stock, or purchase limit is invalid.');
+  }
+  if (next.imageUrl) {
+    let imageUrl;
+    try { imageUrl = new URL(next.imageUrl); } catch { throw new Error('Shop item image must be a valid HTTPS URL.'); }
+    if (imageUrl.protocol !== 'https:') throw new Error('Shop item image must be a valid HTTPS URL.');
+  }
+  const fields = Object.keys(next);
+  const assignments = fields.map((field) => `${({ imageUrl: 'image_url', purchaseLimit: 'purchase_limit' })[field] ?? field} = ?`);
+  const values = fields.map((field) => next[field]);
+  db.prepare(`UPDATE economy_shop_items SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?`).run(...values, now, itemId);
+  const updated = db.prepare('SELECT * FROM economy_shop_items WHERE id = ?').get(itemId);
+  recordEconomyAudit(db, { actorId, targetId: itemId, action: 'shop_item_edited', previousValue: JSON.stringify(existing), newValue: JSON.stringify(updated), now });
+  return { updated: true, item: updated };
+}
+
+function removeShopItem(db, itemId, actorId, now = new Date().toISOString()) {
+  const existing = db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0').get(itemId);
+  if (!existing) return { removed: false, reason: 'missing' };
+  db.prepare('UPDATE economy_shop_items SET deleted = 1, enabled = 0, updated_at = ? WHERE id = ?').run(now, itemId);
+  recordEconomyAudit(db, { actorId, targetId: itemId, action: 'shop_item_removed', previousValue: JSON.stringify(existing), now });
+  return { removed: true, itemId };
+}
+
+function listShopItems(db, includeDisabled = true) {
+  const rows = db.prepare(`
+    SELECT * FROM economy_shop_items WHERE deleted = 0 AND (? = 1 OR enabled = 1) ORDER BY category, name ASC
+  `).all(includeDisabled ? 1 : 0);
+  return rows;
+}
+
+function getPlayerInventory(db, userId) {
+  return db.prepare(`
+    SELECT i.item_id, i.item_name, i.quantity, i.purchased_at, s.description, s.category
+    FROM economy_inventory i
+    JOIN economy_shop_items s ON s.id = i.item_id
+    WHERE i.user_id = ?
+    ORDER BY i.purchased_at DESC
+  `).all(userId);
+}
+
+function getPlayerPurchaseHistory(db, userId, limit = 20) {
+  return db.prepare(`
+    SELECT * FROM economy_purchase_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?
+  `).all(userId, limit);
+}
+
+function purchaseShopItem(db, userId, itemId, quantity = 1, now = new Date().toISOString()) {
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new Error('Purchase quantity must be a positive whole number.');
+  return db.transaction(() => {
+    const item = db.prepare('SELECT * FROM economy_shop_items WHERE id = ?').get(itemId);
+    if (!item || item.deleted) return { purchased: false, reason: 'missing' };
+    if (!item.enabled) return { purchased: false, reason: 'disabled' };
+    if (item.stock < quantity) return { purchased: false, reason: 'stock' };
+    const account = ensureEconomyAccount(db, userId, now);
+    const totalCost = item.price * quantity;
+    if (!Number.isSafeInteger(totalCost)) throw new Error('Purchase total exceeds the safe currency limit.');
+    if (account.wallet_balance + account.bank_balance < totalCost) return { purchased: false, reason: 'funds' };
+    if (item.purchase_limit) {
+      const owned = db.prepare('SELECT COALESCE(SUM(quantity), 0) AS owned FROM economy_purchase_history WHERE user_id = ? AND item_id = ?').get(userId, itemId).owned;
+      if (owned + quantity > item.purchase_limit) return { purchased: false, reason: 'limit' };
+    }
+    const stockUpdate = db.prepare(`
+      UPDATE economy_shop_items SET stock = stock - ?, updated_at = ?
+      WHERE id = ? AND deleted = 0 AND enabled = 1 AND stock >= ?
+    `).run(quantity, now, itemId, quantity);
+    if (!stockUpdate.changes) return { purchased: false, reason: 'stock' };
+    const walletSpent = Math.min(account.wallet_balance, totalCost);
+    const bankSpent = totalCost - walletSpent;
+    const newWallet = account.wallet_balance - walletSpent;
+    const newBank = account.bank_balance - bankSpent;
+    const newSpent = account.total_spent + totalCost;
+    if (!Number.isSafeInteger(newSpent)) throw new Error('Lifetime spending would exceed the safe account limit.');
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ?, bank_balance = ?, total_spent = ? WHERE user_id = ?')
+      .run(newWallet, newBank, newSpent, userId);
+    db.prepare(`
+      INSERT INTO economy_inventory (user_id, item_id, item_name, quantity, purchased_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = economy_inventory.quantity + excluded.quantity, purchased_at = excluded.purchased_at
+    `).run(userId, item.id, item.name, quantity, now);
+    db.prepare(`
+      INSERT INTO economy_purchase_history (id, user_id, item_id, item_name, quantity, price, total_cost, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(randomUUID(), userId, item.id, item.name, quantity, item.price, totalCost, now);
+    recordEconomyTransaction(db, { userId, type: 'shop_purchase', amount: totalCost, walletAfter: newWallet, bankAfter: newBank, description: `${item.name} x${quantity}`, now });
+    return { purchased: true, itemId: item.id, totalCost, walletAfter: newWallet, bankAfter: newBank, remainingStock: item.stock - quantity };
+  })();
+}
+
+function adjustPlayerBalance(db, actorId, userId, amount, reason, now = new Date().toISOString()) {
+  if (!Number.isSafeInteger(amount) || amount === 0) throw new Error('Adjustment amount must be a nonzero whole number.');
+  if (!reason?.trim()) throw new Error('A reason is required for balance adjustments.');
+  return db.transaction(() => {
+    const account = ensureEconomyAccount(db, userId, now);
+    const nextWallet = account.wallet_balance + amount;
+    if (nextWallet < 0) throw new Error('A player balance cannot go below zero.');
+    if (!Number.isSafeInteger(nextWallet)) throw new Error('This adjustment exceeds the safe account balance limit.');
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ? WHERE user_id = ?').run(nextWallet, userId);
+    recordEconomyTransaction(db, {
+      userId,
+      type: amount > 0 ? 'admin_credit' : 'admin_debit',
+      amount: Math.abs(amount),
+      walletAfter: nextWallet,
+      bankAfter: account.bank_balance,
+      description: `${reason} • staff ${actorId}`,
+      now,
+    });
+    recordEconomyAudit(db, { actorId, targetId: userId, action: 'balance_adjusted', reason, previousValue: String(account.wallet_balance), newValue: String(nextWallet), now });
+    return { userId, walletAfter: nextWallet, amount, reason };
+  })();
+}
+
+function getEconomyLeaderboard(db, limit = 10) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Leaderboard limit must be from 1 to 100.');
+  return db.prepare(`
+    SELECT user_id, wallet_balance, bank_balance, lifetime_earnings
+    FROM economy_accounts
+      ORDER BY wallet_balance + bank_balance DESC, lifetime_earnings DESC, user_id ASC
+    LIMIT ?
+  `).all(limit);
+}
+
+function getEconomyTransactions(db, userId = null, limit = 25) {
+  if (userId) {
+    return db.prepare('SELECT * FROM economy_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?').all(userId, limit);
+  }
+  return db.prepare('SELECT * FROM economy_transactions ORDER BY created_at DESC LIMIT ?').all(limit);
+}
+
+function cashDropComponents(dropId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gv:economy:drop:claim:${dropId}`).setLabel('Claim Cash Drop').setEmoji('💵').setStyle(ButtonStyle.Success),
+  )];
+}
+
+function claimEconomyCashDrop(db, dropId, userId, now = new Date()) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Cash drop claim time is invalid.');
+  const nowIso = nowDate.toISOString();
+  return db.transaction(() => {
+    const drop = db.prepare('SELECT * FROM economy_cash_drops WHERE drop_id = ?').get(dropId);
+    if (!drop) return { claimed: false, reason: 'missing' };
+    if (drop.status !== 'open') return { claimed: false, reason: 'closed' };
+    if (drop.expires_at <= nowIso) {
+      db.prepare("UPDATE economy_cash_drops SET status = 'expired' WHERE drop_id = ? AND status = 'open'").run(dropId);
+      return { claimed: false, reason: 'expired' };
+    }
+    if (db.prepare('SELECT 1 FROM economy_cash_drop_claims WHERE drop_id = ? AND user_id = ?').get(dropId, userId)) {
+      return { claimed: false, reason: 'duplicate' };
+    }
+    const account = ensureEconomyAccount(db, userId, nowIso);
+    const walletAfter = account.wallet_balance + drop.amount;
+    const lifetimeAfter = account.lifetime_earnings + drop.amount;
+    if (!Number.isSafeInteger(walletAfter) || !Number.isSafeInteger(lifetimeAfter)) {
+      throw new Error('Cash drop would exceed the safe account balance limit. Contact management.');
+    }
+    const updated = db.prepare(`
+      UPDATE economy_cash_drops
+      SET claim_count = claim_count + 1,
+          status = CASE WHEN claim_count + 1 >= max_claims THEN 'claimed' ELSE status END
+      WHERE drop_id = ? AND status = 'open' AND expires_at > ? AND claim_count < max_claims
+    `).run(dropId, nowIso);
+    if (!updated.changes) return { claimed: false, reason: 'closed' };
+    db.prepare('INSERT INTO economy_cash_drop_claims (drop_id, user_id, amount, claimed_at) VALUES (?, ?, ?, ?)')
+      .run(dropId, userId, drop.amount, nowIso);
+    db.prepare('UPDATE economy_accounts SET wallet_balance = ?, lifetime_earnings = ? WHERE user_id = ?')
+      .run(walletAfter, lifetimeAfter, userId);
+    recordEconomyTransaction(db, {
+      userId,
+      type: 'cash_drop',
+      amount: drop.amount,
+      walletAfter,
+      bankAfter: account.bank_balance,
+      description: `Cash drop ${dropId}`,
+      now: nowIso,
+    });
+    return { claimed: true, amount: drop.amount, walletAfter, claimCount: drop.claim_count + 1, maxClaims: drop.max_claims };
+  })();
+}
+
+async function postPendingCashDrop(client, db, drop, processedAt) {
+  let channel;
+  try {
+    channel = await client.channels.fetch(drop.channel_id);
+    if (!channel?.isTextBased() || !channel.send) return { posted: false, reason: 'channel' };
+    const message = await channel.send({
+      embeds: [makeEmbed(getEconomySettings(db).panelColor, '💵 GV GR Cash Drop',
+        `A cash drop is available! The first **${drop.max_claims}** players to claim receive **${formatCurrency(drop.amount, getEconomySettings(db).currencyName)}** each.\nExpires <t:${Math.floor(new Date(drop.expires_at).getTime() / 1000)}:R>.`)],
+      components: cashDropComponents(drop.drop_id),
+    });
+    db.transaction(() => {
+      db.prepare("UPDATE economy_cash_drops SET message_id = ?, status = 'open' WHERE drop_id = ? AND status = 'pending'")
+        .run(message.id, drop.drop_id);
+      const currentNextAt = Date.parse(getConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT'));
+      const nextAfterPost = processedAt.getTime() + getEconomySettings(db).cashDropIntervalMinutes * 60_000;
+      if (!Number.isFinite(currentNextAt) || currentNextAt < nextAfterPost) {
+        setConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT', new Date(nextAfterPost).toISOString());
+      }
+    })();
+    return { posted: true, dropId: drop.drop_id, messageId: message.id };
+  } catch (error) {
+    console.error('Could not post Economy Cash Drop:', error.message);
+    return { posted: false, reason: 'post', error };
+  }
+}
+
+async function processEconomyCashDrops(client, db, now = new Date()) {
+  const settings = getEconomySettings(db);
+  if (!settings.cashDropsEnabled) return { created: false, reason: 'disabled' };
+  if (!validId(settings.cashDropChannelId)) return { created: false, reason: 'channel' };
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Cash drop scheduler time is invalid.');
+  const nowIso = nowDate.toISOString();
+  db.prepare("UPDATE economy_cash_drops SET status = 'expired' WHERE status = 'open' AND expires_at <= ?").run(nowIso);
+
+  let pending = db.prepare("SELECT * FROM economy_cash_drops WHERE status = 'pending' ORDER BY created_at LIMIT 1").get();
+  if (!pending) {
+    const intervalMinutes = settings.cashDropIntervalMinutes;
+    if (!Number.isSafeInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1440
+      || !Number.isSafeInteger(settings.cashDropAmount) || settings.cashDropAmount < 1
+      || !Number.isSafeInteger(settings.cashDropMaxClaims) || settings.cashDropMaxClaims < 1
+      || !Number.isSafeInteger(settings.cashDropLifetimeMinutes) || settings.cashDropLifetimeMinutes < 1) {
+      return { created: false, reason: 'settings' };
+    }
+    const intervalMs = intervalMinutes * 60_000;
+    let scheduledAt = getConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT');
+    const scheduledTime = scheduledAt ? Date.parse(scheduledAt) : nowDate.getTime();
+    if (!Number.isFinite(scheduledTime)) scheduledAt = nowIso;
+    else if (nowDate.getTime() < scheduledTime) return { created: false, reason: 'not-due', nextAt: scheduledAt };
+    const dueTime = Date.parse(scheduledAt) || nowDate.getTime();
+    const nextTime = nowDate.getTime() + intervalMs;
+    const dropId = randomUUID();
+    const expiresAt = new Date(nowDate.getTime() + settings.cashDropLifetimeMinutes * 60_000).toISOString();
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO economy_cash_drops (drop_id, schedule_key, channel_id, amount, max_claims, status, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(dropId, new Date(dueTime).toISOString(), settings.cashDropChannelId, settings.cashDropAmount, settings.cashDropMaxClaims, nowIso, expiresAt);
+      setConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT', new Date(nextTime).toISOString());
+    })();
+    pending = db.prepare('SELECT * FROM economy_cash_drops WHERE drop_id = ?').get(dropId);
+  }
+  return postPendingCashDrop(client, db, pending, nowDate);
 }
 
 function claimWorkReward(db, userId, settings, now = new Date()) {
@@ -112,19 +547,20 @@ function claimWorkReward(db, userId, settings, now = new Date()) {
 }
 
 function walletEmbed(account, username, settings) {
-  const embed = makeEmbed(config.EMBED_COLORS.info, `💳 ${username}'s GV GR Wallet`,
+  const embed = makeEmbed(settings.panelColor, `💳 ${username}'s GV GR Wallet`,
     `**Wallet:** ${formatCurrency(account.wallet_balance, settings.currencyName)}\n**Bank:** ${formatCurrency(account.bank_balance, settings.currencyName)}\n**Lifetime earnings:** ${formatCurrency(account.lifetime_earnings, settings.currencyName)}\n**Total spent:** ${formatCurrency(account.total_spent, settings.currencyName)}\n**Total transferred:** ${formatCurrency(account.total_transferred, settings.currencyName)}\n**Account created:** <t:${Math.floor(new Date(account.created_at).getTime() / 1000)}:D>`)
     .setFooter({ text: `Account ID • ${account.user_id}` });
   return embed;
 }
 
 function economyPanelEmbed(settings) {
-  return makeEmbed(config.EMBED_COLORS.management, '💰 GV GR | ECONOMY',
+  return makeEmbed(settings.panelColor, '💰 GV GR | ECONOMY',
     'Manage your virtual roleplay money from one place. Your wallet and account history are private to you.\n\n'
     + `**Work:** Earn ${formatCurrency(settings.minimumReward, settings.currencyName)}–${formatCurrency(settings.maximumReward, settings.currencyName)} every ${settings.cooldownMinutes} minutes.\n`
     + `**Delivery Rush:** Deliver for ${formatCurrency(settings.deliveryMinimumReward, settings.currencyName)}–${formatCurrency(settings.deliveryMaximumReward * 2, settings.currencyName)} every ${settings.deliveryCooldownMinutes} minutes.\n`
-    + '**My Wallet:** View your private wallet, bank balance, and account totals.\n\n'
-    + 'Bank, Shop, Leaderboard, Blackjack, Transactions, and Daily Rewards will unlock in upcoming economy stages.')
+    + `**Daily reward:** ${formatCurrency(settings.dailyReward, settings.currencyName)} every ${settings.dailyRewardCooldownHours} hours.\n`
+    + `**Automatic cash drops:** ${settings.cashDropsEnabled ? 'Enabled' : 'Disabled'}; claim from the drop message when available.\n`
+    + '**My Wallet:** View wallet, bank, and account totals. Shop, games, inventory, leaderboards, and private history are available below.')
     .setFooter({ text: 'GV GR • Virtual currency only' });
 }
 
@@ -133,15 +569,21 @@ function economyPanelComponents() {
     new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('gv:economy:wallet').setLabel('My Wallet').setEmoji('💳').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('gv:economy:work').setLabel('Work').setEmoji('🧰').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('gv:economy:bank').setLabel('Bank').setEmoji('🏦').setStyle(ButtonStyle.Secondary).setDisabled(true),
-      new ButtonBuilder().setCustomId('gv:economy:shop').setLabel('Shop').setEmoji('🛍️').setStyle(ButtonStyle.Secondary).setDisabled(true),
-      new ButtonBuilder().setCustomId('gv:economy:leaderboard').setLabel('Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary).setDisabled(true),
+      new ButtonBuilder().setCustomId('gv:economy:bank').setLabel('Bank').setEmoji('🏦').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:shop').setLabel('Shop').setEmoji('🛍️').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:leaderboard').setLabel('Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gv:economy:blackjack').setLabel('Blackjack').setEmoji('🃏').setStyle(ButtonStyle.Secondary).setDisabled(true),
-      new ButtonBuilder().setCustomId('gv:economy:transactions').setLabel('Transactions').setEmoji('📜').setStyle(ButtonStyle.Secondary).setDisabled(true),
-      new ButtonBuilder().setCustomId('gv:economy:daily').setLabel('Daily Rewards').setEmoji('🎁').setStyle(ButtonStyle.Secondary).setDisabled(true),
+      new ButtonBuilder().setCustomId('gv:economy:blackjack').setLabel('Blackjack').setEmoji('🃏').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:coinflip').setLabel('Coin Flip').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:roulette').setLabel('Roulette').setEmoji('🎡').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:chicken').setLabel('Chicken Road').setEmoji('🐔').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:transactions').setLabel('Transactions').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:economy:daily').setLabel('Daily Rewards').setEmoji('🎁').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('gv:economy:delivery:start').setLabel('Delivery Rush').setEmoji('🚗').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('gv:economy:inventory').setLabel('Inventory').setEmoji('🎒').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -313,21 +755,50 @@ async function configureEconomy(interaction, ctx) {
   const deliveryMinimumReward = options.getInteger('delivery-minimum') ?? current.deliveryMinimumReward;
   const deliveryMaximumReward = options.getInteger('delivery-maximum') ?? current.deliveryMaximumReward;
   const deliveryCooldownMinutes = options.getInteger('delivery-cooldown-minutes') ?? current.deliveryCooldownMinutes;
+  const dropChannel = options.getChannel('drop-channel');
+  const dropAmount = options.getInteger('drop-amount') ?? current.cashDropAmount;
+  const dropClaims = options.getInteger('drop-claims') ?? current.cashDropMaxClaims;
+  const dropInterval = options.getInteger('drop-interval-minutes') ?? current.cashDropIntervalMinutes;
+  const dropLifetime = options.getInteger('drop-lifetime-minutes') ?? current.cashDropLifetimeMinutes;
+  const dropsEnabled = options.getBoolean?.('drop-enabled');
+  const panelColorInput = options.getString?.('panel-color');
+  const shopColorInput = options.getString?.('shop-color');
   const settingsError = validateWorkSettings({ minimumReward, maximumReward, cooldownMinutes });
   if (settingsError) return interaction.reply({ content: settingsError, ephemeral: true });
   const deliveryError = validateDeliverySettings({ deliveryMinimumReward, deliveryMaximumReward, deliveryCooldownMinutes });
   if (deliveryError) return interaction.reply({ content: deliveryError, ephemeral: true });
+  if (!Number.isSafeInteger(dropAmount) || dropAmount < 1 || dropAmount > 1_000_000_000
+    || !Number.isSafeInteger(dropClaims) || dropClaims < 1 || dropClaims > 100
+    || !Number.isSafeInteger(dropInterval) || dropInterval < 1 || dropInterval > 1440
+    || !Number.isSafeInteger(dropLifetime) || dropLifetime < 1 || dropLifetime > 1440) {
+    return interaction.reply({ content: 'Cash drop amount, claims, interval, or lifetime is outside the allowed range.', ephemeral: true });
+  }
+  const parseColor = (value) => value == null ? null : (/^#?[0-9a-f]{6}$/i.test(value) ? Number.parseInt(value.replace(/^#/, ''), 16) : NaN);
+  const panelColor = parseColor(panelColorInput);
+  const shopColor = parseColor(shopColorInput);
+  if (Number.isNaN(panelColor) || Number.isNaN(shopColor)) {
+    return interaction.reply({ content: 'Colors must be six-digit HEX values such as #1F7AE0.', ephemeral: true });
+  }
   const changes = [];
   if (channel) changes.push(['ECONOMY_PANEL_CHANNEL_ID', channel.id]);
+  if (dropChannel) changes.push(['ECONOMY_CASH_DROP_CHANNEL_ID', dropChannel.id]);
   if (options.getInteger('minimum-reward') !== null) changes.push(['ECONOMY_WORK_MIN_REWARD', minimumReward]);
   if (options.getInteger('maximum-reward') !== null) changes.push(['ECONOMY_WORK_MAX_REWARD', maximumReward]);
   if (options.getInteger('cooldown-minutes') !== null) changes.push(['ECONOMY_WORK_COOLDOWN_MINUTES', cooldownMinutes]);
   if (options.getInteger('delivery-minimum') !== null) changes.push(['ECONOMY_DELIVERY_MIN_REWARD', deliveryMinimumReward]);
   if (options.getInteger('delivery-maximum') !== null) changes.push(['ECONOMY_DELIVERY_MAX_REWARD', deliveryMaximumReward]);
   if (options.getInteger('delivery-cooldown-minutes') !== null) changes.push(['ECONOMY_DELIVERY_COOLDOWN_MINUTES', deliveryCooldownMinutes]);
+  if (options.getInteger('drop-amount') !== null) changes.push(['ECONOMY_CASH_DROP_AMOUNT', dropAmount]);
+  if (options.getInteger('drop-claims') !== null) changes.push(['ECONOMY_CASH_DROP_MAX_CLAIMS', dropClaims]);
+  if (options.getInteger('drop-interval-minutes') !== null) changes.push(['ECONOMY_CASH_DROP_INTERVAL_MINUTES', dropInterval]);
+  if (options.getInteger('drop-lifetime-minutes') !== null) changes.push(['ECONOMY_CASH_DROP_LIFETIME_MINUTES', dropLifetime]);
+  if (typeof dropsEnabled === 'boolean') changes.push(['ECONOMY_CASH_DROPS_ENABLED', dropsEnabled]);
+  if (panelColor !== null) changes.push(['ECONOMY_PANEL_COLOR', panelColor]);
+  if (shopColor !== null) changes.push(['ECONOMY_SHOP_COLOR', shopColor]);
   if (!changes.length) return interaction.reply({ content: 'Provide a panel channel or at least one Work setting to configure.', ephemeral: true });
   ctx.db.transaction(() => {
     for (const [key, value] of changes) setConfigValue(ctx.db, key, value);
+    recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: 'settings_updated', reason: 'Economy configuration updated', newValue: JSON.stringify(Object.fromEntries(changes)) });
   })();
   return interaction.reply({ content: `Updated Economy settings: ${changes.map(([key]) => `**${key}**`).join(', ')}.`, ephemeral: true });
 }
@@ -355,9 +826,16 @@ async function publishEconomyPanel(interaction, ctx) {
     || !permissions.has(PermissionFlagsBits.EmbedLinks)) {
     return interaction.reply({ content: 'The bot needs View Channel, Send Messages, and Embed Links permissions in the Economy Panel channel.', ephemeral: true });
   }
-  const payload = { embeds: [economyPanelEmbed(settings)], components: economyPanelComponents() };
+  const customized = applyPanelCustomization(ctx.db, 'economy', economyPanelEmbed(settings), economyPanelComponents());
+  const payload = { embeds: [customized.embed], components: customized.components };
   let message;
-  const savedMessageId = settings.messageId;
+  let savedMessageId = settings.messageId;
+  const header = await ensurePanelHeader(interaction.client, ctx.db, 'economy', channel);
+  if (header.created && savedMessageId && settings.messageChannelId === channel.id) {
+    try { const previous = await channel.messages.fetch(savedMessageId); if (previous.author?.id === interaction.client.user?.id) await previous.delete(); } catch {}
+    setConfigValue(ctx.db, 'ECONOMY_PANEL_MESSAGE_ID', null);
+    savedMessageId = null;
+  }
   if (settings.messageChannelId === channel.id && validId(savedMessageId)) {
     try {
       const previous = await channel.messages.fetch(savedMessageId);
@@ -461,6 +939,516 @@ async function chooseDeliveryRoute(interaction, ctx, gameId, route) {
   });
 }
 
+async function handleBankCommand(interaction, ctx) {
+  const action = interaction.options.getSubcommand();
+  const amount = interaction.options.getInteger('amount', true);
+  const description = interaction.options.getString('description') || 'Economy transfer';
+  if (action === 'deposit') {
+    const result = depositToBank(ctx.db, interaction.user.id, amount, description);
+    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🏦 Bank Deposit', `Deposited **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** to your bank account.\n**Wallet:** ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}\n**Bank:** ${formatCurrency(result.bankAfter, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+  }
+  if (action === 'withdraw') {
+    const result = withdrawFromBank(ctx.db, interaction.user.id, amount, description);
+    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🏦 Bank Withdrawal', `Withdrew **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** from your bank account.\n**Wallet:** ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}\n**Bank:** ${formatCurrency(result.bankAfter, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+  }
+  if (action === 'transfer') {
+    const target = interaction.options.getUser('member', true);
+    const result = transferToPlayer(ctx.db, interaction.user.id, target.id, amount, description);
+    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, '💸 Transfer Complete', `Transferred **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** to <@${target.id}>.\n**Sender wallet:** ${formatCurrency(result.sender.wallet_balance, getEconomySettings(ctx.db).currencyName)}\n**Recipient wallet:** ${formatCurrency(result.recipient.wallet_balance, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+  }
+  return interaction.reply({ content: 'Bank action not recognized.', ephemeral: true });
+}
+
+async function handleDailyRewardCommand(interaction, ctx) {
+  const settings = getEconomySettings(ctx.db);
+  const result = claimDailyReward(ctx.db, interaction.user.id, settings, new Date());
+  if (!result.claimed) {
+    return interaction.reply({ content: `Your daily reward is still cooling down. It will be ready <t:${Math.floor(new Date(result.nextRewardAt).getTime() / 1000)}:R>.`, ephemeral: true });
+  }
+  return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🎁 Daily Reward Claimed', `You claimed **${formatCurrency(result.amount, settings.currencyName)}**.\n**Wallet:** ${formatCurrency(result.walletAfter, settings.currencyName)}`)], ephemeral: true });
+}
+
+function shopPagePayload(db, page = 0) {
+  const settings = getEconomySettings(db);
+  const items = listShopItems(db, false).filter((item) => item.stock > 0);
+  const pageSize = 10;
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.min(Math.max(0, page), pageCount - 1);
+  const shown = items.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const description = shown.length
+    ? shown.map((item) => `**${item.name}** • ${formatCurrency(item.price, settings.currencyName)} • Stock: ${item.stock}\n${item.description || 'No description'}\nID: \`${item.id}\``).join('\n\n').slice(0, 3900)
+    : 'The shop is empty right now.';
+  const rows = [];
+  for (let index = 0; index < shown.length; index += 5) {
+    rows.push(new ActionRowBuilder().addComponents(shown.slice(index, index + 5).map((item) =>
+      new ButtonBuilder().setCustomId(`gv:economy:shop:buy:${item.id}`).setLabel(`Buy ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Success))));
+  }
+  if (pageCount > 1) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`gv:economy:shop:page:${safePage - 1}`).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(safePage === 0),
+      new ButtonBuilder().setCustomId(`gv:economy:shop:page:${safePage + 1}`).setLabel(`Page ${safePage + 1}/${pageCount}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+      new ButtonBuilder().setCustomId(`gv:economy:shop:page:${safePage + 1}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safePage >= pageCount - 1),
+    ));
+  }
+  const customized = applyPanelCustomization(db, 'shop', makeEmbed(settings.shopColor, '🛍️ GV GR Shop', description), rows);
+  return {
+    embeds: [customized.embed],
+    components: customized.components,
+    ephemeral: true,
+  };
+}
+
+function amountModal(customId, title, label = 'Amount in GV Credits') {
+  return new ModalBuilder().setCustomId(customId).setTitle(title).addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('amount').setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12),
+    ),
+  );
+}
+
+function economyTransactionsEmbed(db, userId, title = 'Your Transactions') {
+  const rows = getEconomyTransactions(db, userId, 15);
+  const settings = getEconomySettings(db);
+  const description = rows.length
+    ? rows.map((row) => {
+      let note = '';
+      try { note = JSON.parse(row.metadata_json).description || ''; } catch {}
+      const direction = ['bank_deposit', 'player_transfer', 'shop_purchase', 'admin_debit'].includes(row.type) || row.type.endsWith('_bet') ? '-' : '+';
+      return `**${row.type.replaceAll('_', ' ')}** • ${direction}${formatCurrency(row.amount, settings.currencyName)}\n${note ? `${note} • ` : ''}<t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`;
+    }).join('\n\n')
+    : 'No economy transactions have been recorded yet.';
+  return makeEmbed(settings.panelColor, title, description.slice(0, 4000));
+}
+
+function gameBetModal(gameType) {
+  const modal = new ModalBuilder().setCustomId(`gv:economy:modal:game:${gameType}`).setTitle(`${gameType === 'chicken' ? 'Chicken Road' : gameType[0].toUpperCase() + gameType.slice(1)} Wager`);
+  modal.addComponents(new ActionRowBuilder().addComponents(
+    new TextInputBuilder().setCustomId('bet').setLabel('Wager from your wallet').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12),
+  ));
+  if (gameType === 'coinflip' || gameType === 'roulette') {
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('choice').setLabel(gameType === 'coinflip' ? 'heads or tails' : 'red, black, or green').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10),
+    ));
+  }
+  return modal;
+}
+
+function blackjackComponents(gameId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gv:economy:game:blackjack:${gameId}:hit`).setLabel('Hit').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`gv:economy:game:blackjack:${gameId}:stand`).setLabel('Stand').setStyle(ButtonStyle.Success),
+  )];
+}
+
+function chickenComponents(gameId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gv:economy:game:chicken:${gameId}:step`).setLabel('Take another step').setEmoji('🐔').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`gv:economy:game:chicken:${gameId}:cashout`).setLabel('Cash out').setStyle(ButtonStyle.Success),
+  )];
+}
+
+function blackjackEmbed(result, settings) {
+  const state = result.state;
+  const active = result.active === true || (result.started && !result.status);
+  const dealerCards = active ? `${cardLabel(state.dealerCards[0])}, ??` : state.dealerCards.map(cardLabel).join(', ');
+  const dealerTotal = active ? '' : ` (${handValue(state.dealerCards)})`;
+  const playerCards = state.playerCards.map(cardLabel).join(', ');
+  let description = `**Your hand:** ${playerCards} (${handValue(state.playerCards)})\n**Dealer:** ${dealerCards}${dealerTotal}\n**Wager:** ${formatCurrency(result.bet, settings.currencyName)}`;
+  if (!active) {
+    const outcome = result.status === 'won' ? 'You won.' : result.status === 'push' ? 'Push. Your wager was returned.' : result.status === 'expired' ? 'The game expired; the wager was forfeited.' : 'The dealer won.';
+    description += `\n\n${outcome}\n**Payout:** ${formatCurrency(result.payout ?? 0, settings.currencyName)}`;
+  }
+  return makeEmbed(result.status === 'lost' ? config.EMBED_COLORS.error : settings.panelColor, '🃏 Blackjack', description);
+}
+
+function chickenEmbed(result, settings) {
+  const state = result.state;
+  const active = result.active === true || (result.started && !result.status);
+  const description = active
+    ? `Steps: **${state.steps}** • Cash-out multiplier: **${state.multiplier}x**\nWager: ${formatCurrency(result.bet, settings.currencyName)}\nCash out now or risk another step.`
+    : `${result.status === 'won' ? `You cashed out after ${state.steps} steps.` : result.status === 'expired' ? 'The road expired; your wager was forfeited.' : `The road ended at step ${state.crashedAtStep ?? state.steps + 1}.`}\n**Payout:** ${formatCurrency(result.payout ?? 0, settings.currencyName)}`;
+  return makeEmbed(result.status === 'lost' ? config.EMBED_COLORS.error : settings.panelColor, '🐔 Chicken Road', description);
+}
+
+function gameStartFailure(result) {
+  return result.reason === 'funds' ? 'You do not have enough wallet balance for that wager.' : 'Finish your active economy game before starting another.';
+}
+
+async function startBlackjackInteraction(interaction, ctx, bet) {
+  const settings = getEconomySettings(ctx.db);
+  let result;
+  try { result = beginBlackjack(ctx.db, interaction.user.id, bet, new Date()); } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
+  }
+  if (!result.started) return interaction.reply({ content: gameStartFailure(result), ephemeral: true });
+  const active = !result.status;
+  return interaction.reply({ embeds: [blackjackEmbed(result, settings)], components: active ? blackjackComponents(result.gameId) : [], ephemeral: true });
+}
+
+async function startChickenInteraction(interaction, ctx, bet) {
+  const settings = getEconomySettings(ctx.db);
+  let result;
+  try { result = startChickenRoad(ctx.db, interaction.user.id, bet, new Date()); } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
+  }
+  if (!result.started) return interaction.reply({ content: gameStartFailure(result), ephemeral: true });
+  return interaction.reply({ embeds: [chickenEmbed(result, settings)], components: chickenComponents(result.gameId), ephemeral: true });
+}
+
+async function startQuickGame(interaction, ctx, gameType, bet, choice) {
+  const settings = getEconomySettings(ctx.db);
+  let result;
+  try {
+    result = gameType === 'coinflip'
+      ? playCoinFlip(ctx.db, interaction.user.id, bet, choice)
+      : playRoulette(ctx.db, interaction.user.id, bet, choice);
+  } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
+  }
+  if (!result.started) return interaction.reply({ content: gameStartFailure(result), ephemeral: true });
+  const won = result.status === 'won';
+  const detail = gameType === 'coinflip'
+    ? `You chose **${result.state.choice}**. The coin landed on **${result.state.result}**.`
+    : `The wheel landed on **${result.state.pocket} (${result.state.result})**. You chose **${result.state.choice}**.`;
+  return interaction.reply({
+    embeds: [makeEmbed(won ? settings.panelColor : config.EMBED_COLORS.error, gameType === 'coinflip' ? '🪙 Coin Flip' : '🎡 Roulette', `${detail}\n**Wager:** ${formatCurrency(bet, settings.currencyName)}\n**Payout:** ${formatCurrency(result.payout, settings.currencyName)}${result.walletAfter === null ? '' : `\n**Wallet:** ${formatCurrency(result.walletAfter, settings.currencyName)}`}`)],
+    ephemeral: true,
+  });
+}
+
+async function handleGameButton(interaction, ctx) {
+  const blackjack = interaction.customId.match(/^gv:economy:game:blackjack:([a-f0-9-]{36}):(hit|stand)$/);
+  const chicken = interaction.customId.match(/^gv:economy:game:chicken:([a-f0-9-]{36}):(step|cashout)$/);
+  if (!blackjack && !chicken) return null;
+  const settings = getEconomySettings(ctx.db);
+  let result;
+  try {
+    result = blackjack
+      ? resolveBlackjackAction(ctx.db, interaction.user.id, blackjack[1], blackjack[2])
+      : resolveChickenAction(ctx.db, interaction.user.id, chicken[1], chicken[2]);
+  } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
+  }
+  if (result.reason) {
+    const messages = { owner: 'Only the player who started this game can use these controls.', missing: 'This game no longer exists.', resolved: 'This game has already been settled.', expired: 'This game expired and the wager was forfeited.', 'no-steps': 'Take at least one safe step before cashing out.' };
+    return interaction.reply({ content: messages[result.reason] ?? 'That game action is unavailable.', ephemeral: true });
+  }
+  const isBlackjack = Boolean(blackjack);
+  return interaction.update({
+    embeds: [isBlackjack ? blackjackEmbed(result, settings) : chickenEmbed(result, settings)],
+    components: result.active ? (isBlackjack ? blackjackComponents(blackjack[1]) : chickenComponents(chicken[1])) : [],
+  });
+}
+
+async function showBankPanel(interaction, ctx) {
+  const account = getWallet(ctx.db, interaction.user.id);
+  const settings = getEconomySettings(ctx.db);
+  return interaction.reply({
+    embeds: [makeEmbed(settings.panelColor, '🏦 GV GR Bank', `**Wallet:** ${formatCurrency(account.wallet_balance, settings.currencyName)}\n**Bank:** ${formatCurrency(account.bank_balance, settings.currencyName)}\n\nChoose a bank action below.`)],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:economy:bank:deposit').setLabel('Deposit').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('gv:economy:bank:withdraw').setLabel('Withdraw').setStyle(ButtonStyle.Primary),
+    )],
+    ephemeral: true,
+  });
+}
+
+async function handleShopCommand(interaction, ctx) {
+  const action = interaction.options.getSubcommand();
+  if (action === 'shop' || action === 'list') {
+    return interaction.reply(shopPagePayload(ctx.db));
+  }
+  if (action === 'item-add') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const name = interaction.options.getString('name', true);
+    const description = interaction.options.getString('description') || '';
+    const price = interaction.options.getInteger('price', true);
+    const stock = interaction.options.getInteger('stock', true);
+    const category = interaction.options.getString('category') || 'General';
+    const image = interaction.options.getString('image') || null;
+    const enabled = interaction.options.getBoolean('enabled') ?? true;
+    const purchaseLimit = interaction.options.getInteger('purchase-limit');
+    const itemId = createShopItem(ctx.db, { name, description, price, stock, category, imageUrl: image, enabled, purchaseLimit }, interaction.user.id);
+    return interaction.reply({ content: `Added shop item **${name}** (ID: \`${itemId}\`) for ${formatCurrency(price, getEconomySettings(ctx.db).currencyName)}.`, ephemeral: true });
+  }
+  if (action === 'item-edit') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const itemId = interaction.options.getString('item-id', true);
+    const changes = {
+      name: interaction.options.getString('name'),
+      description: interaction.options.getString('description'),
+      price: interaction.options.getInteger('price'),
+      stock: interaction.options.getInteger('stock'),
+      category: interaction.options.getString('category'),
+      imageUrl: interaction.options.getString('image'),
+      purchaseLimit: interaction.options.getInteger('purchase-limit'),
+    };
+    const result = editShopItem(ctx.db, itemId, changes, interaction.user.id);
+    return interaction.reply({ content: result.updated ? `Updated **${result.item.name}** (\`${itemId}\`).` : 'Shop item not found or no editable fields were provided.', ephemeral: true });
+  }
+  if (action === 'item-remove') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const result = removeShopItem(ctx.db, interaction.options.getString('item-id', true), interaction.user.id);
+    return interaction.reply({ content: result.removed ? 'Shop item removed from the active catalog. Existing purchase records are preserved.' : 'Shop item not found.', ephemeral: true });
+  }
+  if (action === 'item-toggle') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const itemId = interaction.options.getString('item-id', true);
+    const enabled = interaction.options.getBoolean('enabled', true);
+    const result = editShopItem(ctx.db, itemId, { enabled }, interaction.user.id);
+    return interaction.reply({ content: result.updated ? `**${result.item.name}** is now ${enabled ? 'enabled' : 'disabled'}.` : 'Shop item not found.', ephemeral: true });
+  }
+  if (action === 'manage') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const settings = getEconomySettings(ctx.db);
+    const items = listShopItems(ctx.db, true);
+    const description = `**Automatic cash drops:** ${settings.cashDropsEnabled ? 'Enabled' : 'Disabled'} • every ${settings.cashDropIntervalMinutes} minutes • ${formatCurrency(settings.cashDropAmount, settings.currencyName)} each • ${settings.cashDropMaxClaims} claims\n**Panel color:** #${settings.panelColor.toString(16).padStart(6, '0').toUpperCase()} • **Shop color:** #${settings.shopColor.toString(16).padStart(6, '0').toUpperCase()}\n**Products:** ${items.length} active or disabled\n\nUse \/salary to manage Town Jobs pay, \/economy configure for rewards/drop settings, and \/economy item-add, item-edit, item-toggle, or item-remove for products.`;
+    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, 'Economy Management', description)], ephemeral: true });
+  }
+  if (action === 'inventory') {
+    const inventory = getPlayerInventory(ctx.db, interaction.user.id);
+    const description = inventory.length
+      ? inventory.map((entry) => `**${entry.item_name}** • Qty: ${entry.quantity}\n${entry.description || 'No description'}`).join('\n\n')
+      : 'You do not own any shop items yet.';
+    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, '🎒 Inventory', description.slice(0, 4000))], ephemeral: true });
+  }
+  if (action === 'history') {
+    const history = getPlayerPurchaseHistory(ctx.db, interaction.user.id, 20);
+    const description = history.length
+      ? history.map((entry) => `**${entry.item_name}** • ${entry.quantity}x • ${formatCurrency(entry.total_cost, getEconomySettings(ctx.db).currencyName)} • <t:${Math.floor(new Date(entry.created_at).getTime() / 1000)}:d>`).join('\n')
+      : 'You have not purchased any items yet.';
+    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, '🧾 Purchase History', description.slice(0, 4000))], ephemeral: true });
+  }
+  if (action === 'purchase') {
+    const itemId = interaction.options.getString('item-id', true);
+    const quantity = interaction.options.getInteger('quantity') ?? 1;
+    const result = purchaseShopItem(ctx.db, interaction.user.id, itemId, quantity, new Date().toISOString());
+    if (!result.purchased) {
+      const reasons = { missing: 'That item does not exist.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough wallet balance.', limit: 'You have reached the purchase limit for that item.' };
+      return interaction.reply({ content: reasons[result.reason] || 'That purchase could not be completed.', ephemeral: true });
+    }
+    return interaction.reply({ content: `Purchased **${itemId}** for ${formatCurrency(result.totalCost, getEconomySettings(ctx.db).currencyName)}.`, ephemeral: true });
+  }
+  return interaction.reply({ content: 'This shop action is not available yet.', ephemeral: true });
+}
+
+function economyStaffComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:economy:staff:settings').setLabel('Rewards & Colors').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:products').setLabel('Products').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:salaries').setLabel('Salaries').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:audit').setLabel('Economy Audit').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:balance').setLabel('Adjust Balance').setStyle(ButtonStyle.Danger),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:economy:staff:toggle-drops').setLabel('Toggle Cash Drops').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('gv:economy:staff:work-rewards').setLabel('Work & Daily Rewards').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('mgmt:overview').setLabel('Back to Management').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+function economyStaffEmbed(db) {
+  const settings = getEconomySettings(db);
+  const nextDrop = getConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT');
+  return makeEmbed(config.EMBED_COLORS.management, 'GV GR Economy Management',
+    `**Work:** ${formatCurrency(settings.minimumReward, settings.currencyName)}–${formatCurrency(settings.maximumReward, settings.currencyName)} every ${settings.cooldownMinutes} minutes\n`
+    + `**Town Jobs salaries:** ${getConfigValue(db, 'TOWN_JOBS_SALARIES_ENABLED') === false ? 'Paused' : 'Running'} • manage with \/salary\n`
+    + `**Cash drops:** ${settings.cashDropsEnabled ? 'Enabled' : 'Disabled'} • every ${settings.cashDropIntervalMinutes}m • ${settings.cashDropMaxClaims} players × ${formatCurrency(settings.cashDropAmount, settings.currencyName)}${nextDrop ? `\n**Next drop:** <t:${Math.floor(new Date(nextDrop).getTime() / 1000)}:R>` : ''}\n`
+    + `**HEX colors:** Panel #${settings.panelColor.toString(16).padStart(6, '0').toUpperCase()} • Shop #${settings.shopColor.toString(16).padStart(6, '0').toUpperCase()}\n\nUse product commands \/economy item-add, item-edit, item-toggle, and item-remove to manage the catalog.`);
+}
+
+function economyStaffSettingsModal() {
+  const modal = new ModalBuilder().setCustomId('gv:economy:modal:staff-settings').setTitle('Cash Drops & HEX Colors');
+  const fields = [
+    ['drop-amount', 'Cash drop amount per player'],
+    ['drop-interval', 'Cash drop interval in minutes'],
+    ['drop-claims', 'Maximum cash drop claims'],
+    ['panel-color', 'Panel HEX color (#RRGGBB)'],
+    ['shop-color', 'Shop HEX color (#RRGGBB)'],
+  ];
+  for (const [id, label] of fields) {
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12),
+    ));
+  }
+  return modal;
+}
+
+function economyWorkRewardsModal() {
+  const modal = new ModalBuilder().setCustomId('gv:economy:modal:staff-work-rewards').setTitle('Work & Daily Rewards');
+  for (const [id, label] of [
+    ['work-min', 'Minimum Work reward'],
+    ['work-max', 'Maximum Work reward'],
+    ['daily-amount', 'Daily reward amount'],
+    ['daily-cooldown', 'Daily cooldown hours'],
+  ]) {
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12),
+    ));
+  }
+  return modal;
+}
+
+function economyProductModal(mode, item = null) {
+  const modal = new ModalBuilder()
+    .setCustomId(mode === 'add' ? 'gv:economy:modal:staff-product:add' : `gv:economy:modal:staff-product:edit:${item.id}`)
+    .setTitle(mode === 'add' ? 'Add Economy Product' : 'Edit Economy Product');
+  const fields = [
+    ['name', 'Product name', item?.name ?? ''],
+    ['price', 'Price in GV Credits', String(item?.price ?? '')],
+    ['stock', 'Available stock', String(item?.stock ?? '')],
+    ['description', 'Product description', item?.description ?? ''],
+    ['category', 'Category', item?.category ?? 'General'],
+  ];
+  for (const [id, label, value] of fields) {
+    const input = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(id === 'description' ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(id !== 'description').setMaxLength(id === 'description' ? 500 : 100);
+    if (value) input.setValue(value);
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      input,
+    ));
+  }
+  return modal;
+}
+
+function economyProductsPayload(db) {
+  const items = listShopItems(db, true);
+  const embedDescription = items.length
+    ? items.slice(0, 25).map((item) => `**${item.name}** • ${formatCurrency(item.price, getEconomySettings(db).currencyName)} • stock ${item.stock} • ${item.enabled ? 'enabled' : 'disabled'}\nID: \`${item.id}\``).join('\n\n')
+    : 'No products exist yet. Use Add Product to create the first item.';
+  const components = [];
+  if (items.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder().setCustomId('gv:economy:staff:product-select').setPlaceholder('Select a product to manage')
+        .addOptions(items.slice(0, 25).map((item) => ({
+          label: item.name.slice(0, 100),
+          value: item.id,
+          description: `${item.enabled ? 'Enabled' : 'Disabled'} • stock ${item.stock}`.slice(0, 100),
+        }))),
+    ));
+  }
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gv:economy:staff:add-product').setLabel('Add Product').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('gv:economy:staff:back').setLabel('Back to Economy').setStyle(ButtonStyle.Secondary),
+  ));
+  return { embeds: [makeEmbed(config.EMBED_COLORS.management, 'Economy Products', embedDescription.slice(0, 3900))], components };
+}
+
+function economyBalanceModal() {
+  const modal = new ModalBuilder().setCustomId('gv:economy:modal:staff-balance').setTitle('Adjust Player Wallet');
+  for (const [id, label, maxLength] of [
+    ['user-id', 'Player Discord ID', 20],
+    ['amount', 'Signed amount (+credit / -debit)', 12],
+    ['reason', 'Required audit reason', 500],
+  ]) {
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(id === 'reason' ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(true).setMaxLength(maxLength),
+    ));
+  }
+  return modal;
+}
+
+async function handleEconomyManagementButton(interaction, ctx) {
+  if (interaction.customId !== 'mgmt:economy' && !interaction.customId.startsWith('gv:economy:staff:')) return null;
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (interaction.customId === 'mgmt:economy') {
+    return interaction.update({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents() });
+  }
+  const productAction = interaction.customId.match(/^gv:economy:staff:product:(edit|toggle|remove):([a-f0-9-]{36})$/);
+  if (productAction) {
+    const [, action, itemId] = productAction;
+    const item = ctx.db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0').get(itemId);
+    if (!item) return interaction.reply({ content: 'That economy product is no longer available.', ephemeral: true });
+    if (action === 'edit') return interaction.showModal(economyProductModal('edit', item));
+    if (action === 'remove') {
+      removeShopItem(ctx.db, itemId, interaction.user.id);
+      return interaction.update(economyProductsPayload(ctx.db));
+    }
+    editShopItem(ctx.db, itemId, { enabled: !item.enabled }, interaction.user.id);
+    return interaction.update(economyProductsPayload(ctx.db));
+  }
+  const action = interaction.customId.split(':').at(-1);
+  if (action === 'settings') return interaction.showModal(economyStaffSettingsModal());
+  if (action === 'work-rewards') return interaction.showModal(economyWorkRewardsModal());
+  if (action === 'balance') return interaction.showModal(economyBalanceModal());
+  if (action === 'add-product') return interaction.showModal(economyProductModal('add'));
+  if (action === 'back') return interaction.update({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents() });
+  if (action === 'toggle-drops') {
+    const enabled = !getEconomySettings(ctx.db).cashDropsEnabled;
+    setConfigValue(ctx.db, 'ECONOMY_CASH_DROPS_ENABLED', enabled);
+    recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: 'cash_drops_toggled', newValue: String(enabled) });
+    return interaction.update({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents() });
+  }
+  if (action === 'products') {
+    return interaction.update(economyProductsPayload(ctx.db));
+  }
+  if (action === 'salaries') {
+    const rows = ctx.db.prepare('SELECT role_id, salary, enabled FROM economy_job_salaries ORDER BY role_id').all();
+    const description = rows.length
+      ? rows.map((row) => `<@&${row.role_id}> • ${formatCurrency(row.salary, getEconomySettings(ctx.db).currencyName)} / 30m • ${row.enabled ? 'enabled' : 'disabled'}`).join('\n')
+      : 'No Town Jobs salaries are configured.';
+    return interaction.update({ embeds: [makeEmbed(config.EMBED_COLORS.info, 'Town Jobs Salaries', `${description}\n\nUse \/salary add, set, remove, toggle, policy, pause, or resume to manage payroll.`.slice(0, 4000))], components: economyStaffComponents() });
+  }
+  if (action === 'audit') {
+    const rows = ctx.db.prepare("SELECT action, target_id, actor_id, reason, previous_value, new_value, created_at FROM staff_audit_logs WHERE substr(action, 1, 8) = 'economy_' ORDER BY id DESC LIMIT 15").all();
+    const description = rows.length
+      ? rows.map((row) => `**${row.action.replace('economy_', '').replaceAll('_', ' ')}** • <@${row.actor_id}> → ${row.target_id === 'economy' ? 'economy settings' : `<@${row.target_id}>`}\n${row.reason || ''}${row.previous_value || row.new_value ? ` • ${row.previous_value ?? '—'} → ${row.new_value ?? '—'}` : ''} • <t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`).join('\n\n')
+      : 'No economy staff actions have been audited yet.';
+    return interaction.update({ embeds: [makeEmbed(config.EMBED_COLORS.info, 'Economy Staff Audit', description.slice(0, 4000))], components: economyStaffComponents() });
+  }
+  return interaction.reply({ content: 'Unknown economy management action.', ephemeral: true });
+}
+
+async function handleEconomyManagementSelect(interaction, ctx) {
+  if (interaction.customId !== 'gv:economy:staff:product-select') return null;
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const itemId = interaction.values[0];
+  const item = ctx.db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0').get(itemId);
+  if (!item) return interaction.reply({ content: 'That economy product is no longer available.', ephemeral: true });
+  const settings = getEconomySettings(ctx.db);
+  return interaction.update({
+    embeds: [makeEmbed(config.EMBED_COLORS.management, item.name,
+      `${item.description || 'No description'}\n\n**Price:** ${formatCurrency(item.price, settings.currencyName)}\n**Stock:** ${item.stock}\n**Category:** ${item.category}\n**Status:** ${item.enabled ? 'Enabled' : 'Disabled'}\n**ID:** \`${item.id}\``)],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gv:economy:staff:product:edit:${item.id}`).setLabel('Edit').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`gv:economy:staff:product:toggle:${item.id}`).setLabel(item.enabled ? 'Disable' : 'Enable').setStyle(item.enabled ? ButtonStyle.Secondary : ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`gv:economy:staff:product:remove:${item.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
+      ),
+      new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('gv:economy:staff:products').setLabel('Back to Products').setStyle(ButtonStyle.Secondary)),
+    ],
+  });
+}
+
+async function handleEconomyLeaderboard(interaction, ctx) {
+  const rows = getEconomyLeaderboard(ctx.db, 10);
+  const currency = getEconomySettings(ctx.db).currencyName;
+  const description = rows.length
+    ? rows.map((row, index) => `${index + 1}. <@${row.user_id}> • Total ${formatCurrency(row.wallet_balance + row.bank_balance, currency)} (wallet ${formatCurrency(row.wallet_balance, currency)} • bank ${formatCurrency(row.bank_balance, currency)})`).join('\n')
+    : 'No economy accounts have been created yet.';
+  return interaction.reply({ embeds: [makeEmbed(getEconomySettings(ctx.db).panelColor, '🏆 Economy Leaderboard', description.slice(0, 4000))], ephemeral: true });
+}
+
+async function handleEconomyAdmin(interaction, ctx) {
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const target = interaction.options.getUser('member', true);
+  const amount = interaction.options.getInteger('amount', true);
+  const reason = interaction.options.getString('reason', true);
+  const result = adjustPlayerBalance(ctx.db, interaction.user.id, target.id, amount, reason);
+  return interaction.reply({ content: `Updated <@${target.id}> balance by ${formatCurrency(Math.abs(result.amount), getEconomySettings(ctx.db).currencyName)}. New wallet: ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}.`, ephemeral: true });
+}
+
+async function handleEconomyTransactions(interaction, ctx) {
+  const requestedUser = interaction.options.getUser('member');
+  let userId = interaction.user.id;
+  if (requestedUser && requestedUser.id !== userId) {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    userId = requestedUser.id;
+  }
+  return interaction.reply({ embeds: [economyTransactionsEmbed(ctx.db, userId, requestedUser ? `${requestedUser.username}'s Transactions` : 'Your Transactions')], ephemeral: true });
+}
+
 async function handleEconomyCommand(interaction, ctx) {
   if (interaction.commandName !== 'economy') return null;
   const action = interaction.options.getSubcommand();
@@ -468,34 +1456,252 @@ async function handleEconomyCommand(interaction, ctx) {
   if (action === 'work') return work(interaction, ctx);
   if (action === 'configure') return configureEconomy(interaction, ctx);
   if (action === 'panel') return publishEconomyPanel(interaction, ctx);
+  if (action === 'daily') return handleDailyRewardCommand(interaction, ctx);
+  if (action === 'deposit' || action === 'withdraw' || action === 'transfer') return handleBankCommand(interaction, ctx);
+  if (action === 'shop' || action === 'inventory' || action === 'history' || action === 'purchase'
+    || action.startsWith('item-') || action === 'manage') return handleShopCommand(interaction, ctx);
+  if (action === 'leaderboard') return handleEconomyLeaderboard(interaction, ctx);
+  if (action === 'transactions') return handleEconomyTransactions(interaction, ctx);
+  if (action === 'admin') return handleEconomyAdmin(interaction, ctx);
+  if (action === 'blackjack') return startBlackjackInteraction(interaction, ctx, interaction.options.getInteger('bet', true));
+  if (action === 'coinflip' || action === 'roulette') {
+    return startQuickGame(interaction, ctx, action, interaction.options.getInteger('bet', true), interaction.options.getString('choice', true));
+  }
+  if (action === 'chicken') return startChickenInteraction(interaction, ctx, interaction.options.getInteger('bet', true));
   return interaction.reply({ content: 'That economy command is not available yet.', ephemeral: true });
 }
 
+async function handleEconomyModal(interaction, ctx) {
+  if (interaction.customId === 'gv:economy:modal:staff-work-rewards') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const current = getEconomySettings(ctx.db);
+    const values = [
+      ['work-min', 'ECONOMY_WORK_MIN_REWARD', current.minimumReward],
+      ['work-max', 'ECONOMY_WORK_MAX_REWARD', current.maximumReward],
+      ['daily-amount', 'ECONOMY_DAILY_REWARD_AMOUNT', current.dailyReward],
+      ['daily-cooldown', 'ECONOMY_DAILY_REWARD_COOLDOWN_HOURS', current.dailyRewardCooldownHours],
+    ];
+    const changes = [];
+    const next = { minimumReward: current.minimumReward, maximumReward: current.maximumReward, cooldownMinutes: current.cooldownMinutes, dailyReward: current.dailyReward, dailyRewardCooldownHours: current.dailyRewardCooldownHours };
+    for (const [field, key, fallback] of values) {
+      const raw = interaction.fields.getTextInputValue(field).trim();
+      if (!raw) continue;
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value)) return interaction.reply({ content: `${field} must be a whole number.`, ephemeral: true });
+      changes.push([key, value]);
+      if (field === 'work-min') next.minimumReward = value;
+      if (field === 'work-max') next.maximumReward = value;
+      if (field === 'daily-amount') next.dailyReward = value;
+      if (field === 'daily-cooldown') next.dailyRewardCooldownHours = value;
+      if (fallback === value) changes.pop();
+    }
+    const workError = validateWorkSettings(next);
+    if (workError) return interaction.reply({ content: workError, ephemeral: true });
+    if (!Number.isSafeInteger(next.dailyReward) || next.dailyReward < 1 || next.dailyReward > 1_000_000_000
+      || !Number.isSafeInteger(next.dailyRewardCooldownHours) || next.dailyRewardCooldownHours < 1 || next.dailyRewardCooldownHours > 168) {
+      return interaction.reply({ content: 'Daily reward amount must be 1–1,000,000,000 and cooldown must be 1–168 hours.', ephemeral: true });
+    }
+    if (!changes.length) return interaction.reply({ content: 'No reward settings were changed.', ephemeral: true });
+    ctx.db.transaction(() => {
+      for (const [key, value] of changes) setConfigValue(ctx.db, key, value);
+      recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: 'rewards_updated', newValue: JSON.stringify(Object.fromEntries(changes)) });
+    })();
+    return interaction.reply({ content: 'Work and daily reward settings were saved.', ephemeral: true });
+  }
+  const productModal = interaction.customId.match(/^gv:economy:modal:staff-product:(add|edit)(?::([a-f0-9-]{36}))?$/);
+  if (productModal) {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const name = interaction.fields.getTextInputValue('name').trim();
+    const price = Number(interaction.fields.getTextInputValue('price').trim());
+    const stock = Number(interaction.fields.getTextInputValue('stock').trim());
+    const description = interaction.fields.getTextInputValue('description').trim();
+    const category = interaction.fields.getTextInputValue('category').trim() || 'General';
+    if (!name || !Number.isSafeInteger(price) || price < 1 || price > 1_000_000_000
+      || !Number.isSafeInteger(stock) || stock < 0 || stock > 1_000_000) {
+      return interaction.reply({ content: 'Provide a product name, price from 1 to 1,000,000,000, and stock from 0 to 1,000,000.', ephemeral: true });
+    }
+    if (productModal[1] === 'add') {
+      const itemId = createShopItem(ctx.db, { name, price, stock, description, category }, interaction.user.id);
+      return interaction.reply({ content: `Created **${name}** (\`${itemId}\`).`, ephemeral: true });
+    }
+    const result = editShopItem(ctx.db, productModal[2], { name, price, stock, description, category }, interaction.user.id);
+    return interaction.reply({ content: result.updated ? `Updated **${name}**.` : 'That product no longer exists.', ephemeral: true });
+  }
+  if (interaction.customId === 'gv:economy:modal:staff-settings') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const settings = getEconomySettings(ctx.db);
+    const fields = {
+      'drop-amount': ['ECONOMY_CASH_DROP_AMOUNT', settings.cashDropAmount, 1, 1_000_000_000],
+      'drop-interval': ['ECONOMY_CASH_DROP_INTERVAL_MINUTES', settings.cashDropIntervalMinutes, 1, 1440],
+      'drop-claims': ['ECONOMY_CASH_DROP_MAX_CLAIMS', settings.cashDropMaxClaims, 1, 100],
+    };
+    const changes = [];
+    for (const [field, [key, , minimum, maximum]] of Object.entries(fields)) {
+      const value = interaction.fields.getTextInputValue(field).trim();
+      if (!value) continue;
+      const number = Number(value);
+      if (!Number.isSafeInteger(number) || number < minimum || number > maximum) {
+        return interaction.reply({ content: `${field} must be a whole number between ${minimum} and ${maximum}.`, ephemeral: true });
+      }
+      changes.push([key, number]);
+    }
+    for (const [field, key] of [['panel-color', 'ECONOMY_PANEL_COLOR'], ['shop-color', 'ECONOMY_SHOP_COLOR']]) {
+      const value = interaction.fields.getTextInputValue(field).trim();
+      if (!value) continue;
+      if (!/^#?[0-9a-f]{6}$/i.test(value)) return interaction.reply({ content: 'Colors must be six-digit HEX values such as #1F7AE0.', ephemeral: true });
+      changes.push([key, Number.parseInt(value.replace(/^#/, ''), 16)]);
+    }
+    if (!changes.length) return interaction.reply({ content: 'No economy settings were changed.', ephemeral: true });
+    ctx.db.transaction(() => {
+      for (const [key, value] of changes) setConfigValue(ctx.db, key, value);
+      recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: 'settings_updated', reason: 'Economy management panel settings', newValue: JSON.stringify(Object.fromEntries(changes)) });
+    })();
+    return interaction.reply({ content: 'Economy drop and HEX color settings were saved.', ephemeral: true });
+  }
+  if (interaction.customId === 'gv:economy:modal:staff-balance') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const userId = interaction.fields.getTextInputValue('user-id').trim();
+    const amount = Number(interaction.fields.getTextInputValue('amount').trim());
+    const reason = interaction.fields.getTextInputValue('reason').trim();
+    if (!validId(userId) || !Number.isSafeInteger(amount) || amount === 0 || Math.abs(amount) > 1_000_000_000 || !reason) {
+      return interaction.reply({ content: 'Provide a valid Discord user ID, nonzero signed whole amount (up to 1,000,000,000), and audit reason.', ephemeral: true });
+    }
+    try {
+      const result = adjustPlayerBalance(ctx.db, interaction.user.id, userId, amount, reason);
+      return interaction.reply({ content: `Adjusted <@${userId}> by ${formatCurrency(Math.abs(amount), getEconomySettings(ctx.db).currencyName)}. New wallet: ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}.`, ephemeral: true });
+    } catch (error) {
+      return interaction.reply({ content: error.message, ephemeral: true });
+    }
+  }
+  const gameMatch = interaction.customId.match(/^gv:economy:modal:game:(blackjack|coinflip|roulette|chicken)$/);
+  if (gameMatch) {
+    const bet = Number(interaction.fields.getTextInputValue('bet'));
+    if (!Number.isSafeInteger(bet) || bet < 1 || bet > 1_000_000_000) {
+      return interaction.reply({ content: 'Enter a whole-number wager from 1 to 1,000,000,000.', ephemeral: true });
+    }
+    if (gameMatch[1] === 'blackjack') return startBlackjackInteraction(interaction, ctx, bet);
+    if (gameMatch[1] === 'chicken') return startChickenInteraction(interaction, ctx, bet);
+    const choice = interaction.fields.getTextInputValue('choice').trim().toLowerCase();
+    return startQuickGame(interaction, ctx, gameMatch[1], bet, choice);
+  }
+  const match = interaction.customId.match(/^gv:economy:modal:bank:(deposit|withdraw)$/);
+  if (!match) return null;
+  const amount = Number(interaction.fields.getTextInputValue('amount'));
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    return interaction.reply({ content: 'Enter a positive whole-number amount.', ephemeral: true });
+  }
+  try {
+    const result = match[1] === 'deposit'
+      ? depositToBank(ctx.db, interaction.user.id, amount)
+      : withdrawFromBank(ctx.db, interaction.user.id, amount);
+    const currency = getEconomySettings(ctx.db).currencyName;
+    return interaction.reply({ content: `${match[1] === 'deposit' ? 'Deposited' : 'Withdrew'} ${formatCurrency(amount, currency)}. Wallet: ${formatCurrency(result.walletAfter, currency)} • Bank: ${formatCurrency(result.bankAfter, currency)}.`, ephemeral: true });
+  } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
+  }
+}
+
 async function handleEconomyButton(interaction, ctx) {
+  const managementResult = await handleEconomyManagementButton(interaction, ctx);
+  if (managementResult) return managementResult;
+  const gameAction = await handleGameButton(interaction, ctx);
+  if (gameAction) return gameAction;
   if (interaction.customId === 'gv:economy:wallet') return showWallet(interaction, ctx);
   if (interaction.customId === 'gv:economy:work') return work(interaction, ctx);
+  if (interaction.customId === 'gv:economy:bank') return showBankPanel(interaction, ctx);
+  if (interaction.customId === 'gv:economy:bank:deposit' || interaction.customId === 'gv:economy:bank:withdraw') {
+    const action = interaction.customId.endsWith('deposit') ? 'deposit' : 'withdraw';
+    return interaction.showModal(amountModal(`gv:economy:modal:bank:${action}`, `Bank ${action}`));
+  }
+  if (interaction.customId === 'gv:economy:shop') return interaction.reply(shopPagePayload(ctx.db));
+  if (interaction.customId === 'gv:economy:leaderboard') return handleEconomyLeaderboard(interaction, ctx);
+  if (interaction.customId === 'gv:economy:daily') return handleDailyRewardCommand(interaction, ctx);
+  if (interaction.customId === 'gv:economy:inventory') {
+    const inventory = getPlayerInventory(ctx.db, interaction.user.id);
+    const description = inventory.length
+      ? inventory.map((entry) => `**${entry.item_name}** • Qty: ${entry.quantity}\n${entry.description || 'No description'}`).join('\n\n')
+      : 'You do not own any shop items yet.';
+    return interaction.reply({ embeds: [makeEmbed(getEconomySettings(ctx.db).panelColor, '🎒 Inventory', description.slice(0, 4000))], ephemeral: true });
+  }
+  if (interaction.customId === 'gv:economy:transactions') {
+    return interaction.reply({ embeds: [economyTransactionsEmbed(ctx.db, interaction.user.id)], ephemeral: true });
+  }
+  if (['blackjack', 'coinflip', 'roulette', 'chicken'].some((game) => interaction.customId === `gv:economy:${game}`)) {
+    const game = interaction.customId.split(':').at(-1);
+    return interaction.showModal(gameBetModal(game));
+  }
+  const shopPage = interaction.customId.match(/^gv:economy:shop:page:(\d+)$/);
+  if (shopPage) {
+    const payload = shopPagePayload(ctx.db, Number(shopPage[1]));
+    delete payload.ephemeral;
+    return interaction.update(payload);
+  }
+  const shopBuy = interaction.customId.match(/^gv:economy:shop:buy:([a-f0-9-]{36})$/);
+  if (shopBuy) {
+    const result = purchaseShopItem(ctx.db, interaction.user.id, shopBuy[1]);
+    if (!result.purchased) {
+      const reasons = { missing: 'That item is no longer available.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough combined wallet and bank funds.', limit: 'You have reached the purchase limit for that item.' };
+      return interaction.reply({ content: reasons[result.reason] ?? 'Purchase could not be completed.', ephemeral: true });
+    }
+    return interaction.reply({ content: `Purchase complete. **${formatCurrency(result.totalCost, getEconomySettings(ctx.db).currencyName)}** was charged.`, ephemeral: true });
+  }
   if (interaction.customId === 'gv:economy:delivery:start') return startDeliveryRush(interaction, ctx);
+  const cashDropMatch = interaction.customId.match(/^gv:economy:drop:claim:([a-f0-9-]{36})$/);
+  if (cashDropMatch) {
+    const result = claimEconomyCashDrop(ctx.db, cashDropMatch[1], interaction.user.id);
+    const messages = {
+      missing: 'That cash drop could not be found.',
+      closed: 'That cash drop has already been fully claimed.',
+      expired: 'That cash drop has expired.',
+      duplicate: 'You have already claimed this cash drop.',
+    };
+    if (!result.claimed) return interaction.reply({ content: messages[result.reason] ?? 'That cash drop is unavailable.', ephemeral: true });
+    if (result.claimCount >= result.maxClaims) {
+      await interaction.message?.edit({ components: [] }).catch(() => {});
+    }
+    return interaction.reply({ content: `Cash drop claimed: **${formatCurrency(result.amount, getEconomySettings(ctx.db).currencyName)}** added to your wallet.`, ephemeral: true });
+  }
   const match = interaction.customId.match(/^gv:economy:delivery:choose:([a-f0-9-]{36}):(fast|safe|shortcut)$/);
   if (match) return chooseDeliveryRoute(interaction, ctx, match[1], match[2]);
   return interaction.reply({ content: 'This Economy Panel action is not available yet.', ephemeral: true });
 }
 
 module.exports = {
+  adjustPlayerBalance,
+  claimDailyReward,
+  claimEconomyCashDrop,
   claimWorkReward,
+  createShopItem,
+  depositToBank,
   deliveryRoutes,
+  editShopItem,
   economyPanelComponents,
   economyPanelEmbed,
   ensureEconomyAccount,
+  getEconomyLeaderboard,
   getEconomySettings,
+  getEconomyTransactions,
+  getPlayerInventory,
+  getPlayerPurchaseHistory,
   getWallet,
   handleEconomyButton,
   handleEconomyCommand,
+  handleEconomyModal,
+  handleEconomyManagementButton,
+  handleEconomyManagementSelect,
+  listShopItems,
   makeDeliveryGameComponents,
+  processEconomyCashDrops,
+  recordEconomyAudit,
+  purchaseShopItem,
+  removeShopItem,
   resolveDeliveryGame,
   resolveDeliveryOutcome,
   rewardForDeliveryOutcome,
   startDeliveryGame,
+  transferToPlayer,
   validateDeliverySettings,
   validateWorkSettings,
   walletEmbed,
+  withdrawFromBank,
 };

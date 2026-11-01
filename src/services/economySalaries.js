@@ -26,9 +26,13 @@ function getEligibleSalaryRoles(db) {
 function calculateSalary(roles, policy) {
   if (!roles.length) return null;
   if (policy === 'highest') {
-    return roles.reduce((highest, role) => role.salary > highest.salary
-      ? role
-      : role.salary === highest.salary && role.role_id < highest.role_id ? role : highest);
+    return roles.reduce((highest, role) => {
+      const currentRoleId = BigInt(role.role_id);
+      const highestRoleId = BigInt(highest.role_id);
+      if (role.salary > highest.salary) return role;
+      if (role.salary === highest.salary && currentRoleId < highestRoleId) return role;
+      return highest;
+    });
   }
   const amount = roles.reduce((total, role) => total + role.salary, 0);
   if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Combined Town Job salary is outside the safe integer range.');

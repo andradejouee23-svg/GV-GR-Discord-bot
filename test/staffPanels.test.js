@@ -8,6 +8,7 @@ const { createDatabase } = require('../src/database');
 const { canRefreshStaffPanel } = require('../src/commands/clock');
 const { isManagement, isOwner, isStaff } = require('../src/commands/staffCenter');
 const { handleManagementButton, handleOwnerButton } = require('../src/commands/staffManagement');
+const { handleStaffCenterCommand } = require('../src/commands/staffCenter');
 const { handleButton } = require('../src/buttons');
 const { logMessageDeletion } = require('../src/events/messageDelete');
 const {
@@ -176,6 +177,14 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
     const result = await handleManagementButton(createInteraction(customId, manager), { db });
     assert.ok(result.embeds[0], `Management button ${customId} should update the dashboard.`);
   }
+  const managementPanel = await handleStaffCenterCommand({
+    commandName: 'management-dashboard',
+    guild: server,
+    member: manager,
+    user: { id: manager.id },
+    reply: async (payload) => payload,
+  }, { db });
+  assert.ok(managementPanel.components.flatMap((row) => row.components).some((button) => button.data.custom_id === 'mgmt:economy'));
   for (const customId of ['owner:overview', 'owner:reports', 'owner:audit', 'owner:activity']) {
     const result = await handleOwnerButton(createInteraction(customId, owner), { db });
     assert.ok(result.embeds[0], `Owner button ${customId} should update the dashboard.`);

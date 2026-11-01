@@ -72,6 +72,7 @@ function managementComponents() {
       new ButtonBuilder().setCustomId('mgmt:reports').setLabel('Daily Reports').setEmoji('📝').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('mgmt:activity').setLabel('Recent Activity').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('mgmt:leaderboard').setLabel('Weekly Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('mgmt:economy').setLabel('Economy').setEmoji('💰').setStyle(ButtonStyle.Success),
     ),
     new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId('mgmt:staff_history').setPlaceholder('View a staff member’s history'),
