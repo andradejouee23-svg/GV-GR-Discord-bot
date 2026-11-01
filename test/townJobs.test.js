@@ -143,6 +143,10 @@ test('management configures roles and updates one persistent panel message', asy
   assert.equal(env.posts.length, 1);
   assert.equal(env.edits.length, 1);
   assert.equal(env.posts[0].embeds[0].data.title, 'Town Jobs');
+  const publicPanelText = JSON.stringify(env.posts[0].embeds[0].data);
+  assert.doesNotMatch(publicPanelText, /<@&/);
+  for (const roleId of jobRoleIds) assert.equal(publicPanelText.includes(roleId), false);
+  assert.match(publicPanelText, /Serve the community/);
   assert.equal(env.posts[0].components[0].components[0].data.custom_id, `gv:townjobs:role:${getTownJobOptions(env.db)[0].id}`);
   assert.equal(env.posts[0].components[0].components[0].data.emoji.name, '🚓');
   assert.deepEqual(getTownJobOptions(env.db).map((job) => job.roleId), [jobRoleIds[0]]);

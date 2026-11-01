@@ -13,7 +13,6 @@ const {
   getCurrentStreak,
   getStaffStats,
   getWeekStart,
-  submitDailyReport,
 } = require('../src/services/staffRewards');
 
 function openDatabase(t) {
@@ -26,7 +25,7 @@ function openDatabase(t) {
   return db;
 }
 
-test('check-in, completed-hour points, and one daily report bonus persist safely', (t) => {
+test('check-in and completed-hour points persist safely without changing shift records', (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-rewards-reopen-'));
   const databasePath = path.join(directory, 'test.sqlite');
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -44,23 +43,8 @@ test('check-in, completed-hour points, and one daily report bonus persist safely
   assert.equal(checkOutStaff(db, member.id, '2026-10-04T11:00:00.000Z'), null);
   assert.equal(getStaffStats(db, member.id, new Date('2026-10-04T11:00:00.000Z')).totalPoints, 2);
 
-  const report = submitDailyReport(db, {
-    userId: member.id,
-    shiftId: completed.id,
-    rating: 'great',
-    explanation: 'Good RP session.',
-    now: '2026-10-04T11:01:00.000Z',
-  });
-  assert.equal(report.saved, true);
-  assert.equal(report.bonusPoints, 1);
-  assert.equal(report.totalPoints, 3);
-  assert.equal(submitDailyReport(db, {
-    userId: member.id,
-    shiftId: completed.id,
-    rating: 'good',
-    now: '2026-10-04T11:02:00.000Z',
-  }).reason, 'already_reported');
-  assert.equal(getStaffStats(db, member.id, new Date('2026-10-04T11:03:00.000Z')).totalPoints, 3);
+  assert.equal(getStaffStats(db, member.id, new Date('2026-10-04T11:03:00.000Z')).totalPoints, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM shifts WHERE user_id = ?').get(member.id).count, 1);
   db.close();
 });
 

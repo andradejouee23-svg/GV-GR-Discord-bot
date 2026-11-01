@@ -5,7 +5,18 @@ const path = require('node:path');
 const test = require('node:test');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
-const { handleVehicleButton, handleVehicleCommand, handleVehicleModal, processVehicleExpirations, registrationCode, savePendingApplication } = require('../src/commands/vehicles');
+const {
+  handleVehicleButton,
+  handleVehicleCommand,
+  handleVehicleManagementButton,
+  handleVehicleManagementModal,
+  handleVehicleManagementSelect,
+  handleVehicleModal,
+  processVehicleExpirations,
+  registrationCode,
+  savePendingApplication,
+} = require('../src/commands/vehicles');
+const { handleManagementButton, handleManagementSelect } = require('../src/commands/staffManagement');
 const { setConfigValue } = require('../src/utils/discord');
 
 const managerId = 'vehicle-manager';
@@ -113,6 +124,11 @@ test('panel posts and refreshes; applicants submit a validated application with 
   assert.deepEqual(env.panelPosts[0].components[0].components.map((button) => button.data.label), [
     'Register Vehicle', 'My Registered Vehicles',
   ]);
+  const publicPanelText = JSON.stringify(env.panelPosts[0].embeds[0].data);
+  assert.match(publicPanelText, /CIVILIAN VEHICLES ONLY/);
+  assert.match(publicPanelText, /Police, Fire Rescue/);
+  assert.match(publicPanelText, /must NOT be registered/i);
+  assert.match(publicPanelText, /My Registered Vehicles/);
 
   let firstModal;
   await handleVehicleButton({
@@ -278,6 +294,7 @@ test('management can search, update, revoke, expire, and inspect registrations',
 
   const playerVehicles = await handleVehicleCommand(command('mine', {}, applicantId), { db });
   assert.match(playerVehicles.embeds[0].data.description, /UPDATED 1/);
+  assert.match(playerVehicles.embeds[0].data.description, /APPROVED/);
   const search = await handleVehicleCommand(command('search', { getString: () => 'updated1' }), { db });
   assert.match(search.embeds[0].data.description, /UPDATED 1/);
 
@@ -297,4 +314,126 @@ test('management can search, update, revoke, expire, and inspect registrations',
   assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(firstId).status, 'revoked');
   const history = await handleVehicleCommand(command('history', { getUser: () => ({ id: applicantId, username: 'Driver' }) }), { db });
   assert.match(history.embeds[0].data.description, /UPDATED|REVOKED|EXPIRATION_CHANGED/i);
+});
+
+test('Staff Panel vehicle management selects members and safely manages their registrations', async (t) => {
+  const env = createEnvironment(t);
+  const { db } = env;
+  const approvedId = savePendingApplication(db, applicantId, makeApplicationData({ plate: 'GV 2000' }), reviewChannelId);
+  db.prepare("UPDATE vehicle_applications SET status = 'approved', reviewed_at = ?, reviewer_id = ?, registration_code = ? WHERE id = ?")
+    .run('2026-10-30T12:00:00.000Z', managerId, registrationCode(approvedId), approvedId);
+  const pendingId = savePendingApplication(db, applicantId, makeApplicationData(), reviewChannelId);
+
+  let picker;
+  const dashboard = await handleManagementButton(managerInteraction(env, {
+    customId: 'mgmt:vehicles',
+    update: async (payload) => { picker = payload; return payload; },
+  }), { db });
+  assert.equal(picker.components[0].components[0].data.custom_id, 'mgmt:vehicle:member');
+  assert.equal(dashboard.components[0].components[0].data.type, 5);
+
+  let listed;
+  await handleManagementSelect(managerInteraction(env, {
+    customId: 'mgmt:vehicle:member',
+    values: [applicantId],
+    update: async (payload) => { listed = payload; return payload; },
+  }), { db });
+  assert.match(listed.embeds[0].data.fields.map((field) => field.name).join(' '), /PENDING.*APPROVED/);
+  assert.equal(listed.components[0].components[0].data.custom_id, `mgmt:vehicle:application:${applicantId}:0`);
+
+  let emptyList;
+  await handleManagementSelect(managerInteraction(env, {
+    customId: 'mgmt:vehicle:member',
+    values: ['member-without-vehicles'],
+    update: async (payload) => { emptyList = payload; return payload; },
+  }), { db });
+  assert.match(emptyList.embeds[0].data.description, /no registered vehicle records/i);
+
+  let detail;
+  await handleVehicleManagementSelect(managerInteraction(env, {
+    customId: `mgmt:vehicle:application:${applicantId}:0`,
+    values: [String(pendingId)],
+    update: async (payload) => { detail = payload; return payload; },
+  }), { db });
+  assert.match(detail.embeds[0].data.title, /PENDING/);
+  const actionIds = detail.components[0].components.map((button) => button.data.custom_id);
+  assert.ok(actionIds.includes(`mgmt:vehicle:approve:${applicantId}:${pendingId}`));
+  assert.ok(actionIds.includes(`mgmt:vehicle:deny:${applicantId}:${pendingId}`));
+
+  let wrongOwnerReply;
+  await handleVehicleManagementSelect(managerInteraction(env, {
+    customId: 'mgmt:vehicle:application:someone-else:0',
+    values: [String(pendingId)],
+    reply: async (payload) => { wrongOwnerReply = payload; return payload; },
+  }), { db });
+  assert.match(wrongOwnerReply.content, /does not belong to the selected member/i);
+
+  let unauthorizedReply;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:remove:${applicantId}:${approvedId}`,
+    user: { id: 'unauthorized-player', username: 'Player' },
+    reply: async (payload) => { unauthorizedReply = payload; return payload; },
+  }), { db });
+  assert.match(unauthorizedReply.content, /management roles only/i);
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(approvedId).status, 'approved');
+
+  let approvedMessage;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:approve:${applicantId}:${pendingId}`,
+    update: async (payload) => { approvedMessage = payload; return payload; },
+  }), { db });
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(pendingId).status, 'approved');
+  assert.match(approvedMessage.embeds[0].data.title, /Approved/);
+
+  const deniedId = savePendingApplication(db, 'second-applicant', makeApplicationData({ plate: 'GV 3000' }), reviewChannelId);
+  let denialModal;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:deny:second-applicant:${deniedId}`,
+    showModal: async (modal) => { denialModal = modal; return modal; },
+  }), { db });
+  let denialReply;
+  await handleVehicleModal(managerInteraction(env, {
+    customId: denialModal.data.custom_id,
+    fields: { getTextInputValue: () => 'Registration details need correction.' },
+    reply: async (payload) => { denialReply = payload; return payload; },
+  }), { db });
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(deniedId).status, 'denied');
+  assert.match(denialReply.content, /applicant was notified/i);
+
+  let editModal;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:edit:${applicantId}:${approvedId}`,
+    showModal: async (modal) => { editModal = modal; return modal; },
+  }), { db });
+  let editDetailsModal;
+  await handleVehicleManagementModal(managerInteraction(env, {
+    customId: editModal.data.custom_id,
+    fields: { getTextInputValue: (key) => ({
+      roblox: 'UpdatedDriver', vehicle: '2024 Falcon Cruiser', plate: 'GV 2001', state: 'Wisconsin', color: 'Black',
+    })[key] },
+    showModal: async (modal) => { editDetailsModal = modal; return modal; },
+  }), { db });
+  await handleVehicleManagementModal(managerInteraction(env, {
+    customId: editDetailsModal.data.custom_id,
+    fields: { getTextInputValue: (key) => ({ year: '2024', image: '' })[key] },
+    reply: async (payload) => payload,
+  }), { db });
+  const edited = db.prepare('SELECT * FROM vehicle_applications WHERE id = ?').get(approvedId);
+  assert.equal(edited.plate, 'GV 2001');
+  assert.equal(edited.vehicle_year, 2024);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM vehicle_registration_history WHERE application_id = ? AND action = 'updated'").get(approvedId).count, 1);
+
+  let removalModal;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:remove:${applicantId}:${approvedId}`,
+    showModal: async (modal) => { removalModal = modal; return modal; },
+  }), { db });
+  await handleVehicleManagementModal(managerInteraction(env, {
+    customId: removalModal.data.custom_id,
+    fields: { getTextInputValue: () => 'No longer eligible for civilian vehicle registration.' },
+    reply: async (payload) => payload,
+  }), { db });
+  assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(approvedId).status, 'revoked');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM vehicle_applications WHERE id = ?').get(approvedId).count, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM vehicle_registration_history WHERE application_id = ? AND action = 'removed'").get(approvedId).count, 1);
 });

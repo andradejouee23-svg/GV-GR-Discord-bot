@@ -818,6 +818,58 @@ test('Work rewards are bounded, cooldown-safe, atomic, and survive restarts', (t
   assert.equal(persisted.last_work_at, '2026-10-31T12:30:00.000Z');
 });
 
+test('Work checks current Town Jobs roles, explains the current job, and changes immediately with the role', async (t) => {
+  const store = makeTempDatabase(t);
+  const env = createPanelEnvironment(store.db);
+  const playerId = 'economy-player';
+  const firstRole = '1666064708795306151';
+  const secondRole = '1666064708795306152';
+  const player = { id: playerId, roles: { cache: new Map() } };
+  env.guild.members.fetch = async (request) => {
+    assert.deepEqual(request, { user: playerId, force: true });
+    return player;
+  };
+  setConfigValue(store.db, 'TOWN_JOBS_PANEL_CHANNEL_ID', channelId);
+  setConfigValue(store.db, 'TOWN_JOBS_ROLE_OPTIONS', [
+    { id: 'a1b2c3d4', roleId: firstRole, label: 'City Mechanic', description: 'Repair civilian vehicles around town.', emoji: '🛠️', action: 'give', style: 'primary' },
+    { id: 'd4c3b2a1', roleId: secondRole, label: 'Roadside Assistance', description: 'Help stranded drivers return safely.', emoji: '🚗', action: 'give', style: 'success' },
+  ]);
+  const clickWork = async () => {
+    let response;
+    await handleButton({
+      customId: 'gv:economy:work',
+      guild: env.guild,
+      user: { id: playerId, username: 'Player' },
+      reply: async (payload) => { response = payload; return payload; },
+    }, { db: store.db });
+    return response;
+  };
+
+  const noJob = await clickWork();
+  assert.match(noJob.content, /active Town Job role/i);
+  assert.match(noJob.content, new RegExp(channelId));
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'work'").get().count, 0);
+
+  player.roles.cache.set(firstRole, { name: 'City Mechanic' });
+  const firstWork = await clickWork();
+  assert.match(firstWork.embeds[0].data.title, /City Mechanic/);
+  assert.match(firstWork.embeds[0].data.description, /Repair civilian vehicles/);
+  assert.match(firstWork.embeds[0].data.description, /Available reward/);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'work'").get().count, 1);
+
+  player.roles.cache.clear();
+  const removedJob = await clickWork();
+  assert.match(removedJob.content, /active Town Job role/i);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'work'").get().count, 1);
+
+  player.roles.cache.set(secondRole, { name: 'Roadside Assistance' });
+  store.db.prepare('UPDATE economy_accounts SET last_work_at = ? WHERE user_id = ?').run('2026-10-01T00:00:00.000Z', playerId);
+  const changedJob = await clickWork();
+  assert.match(changedJob.embeds[0].data.title, /Roadside Assistance/);
+  assert.match(changedJob.embeds[0].data.description, /Help stranded drivers/);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'work'").get().count, 2);
+});
+
 test('management configures and updates one panel; Wallet and Work stay private', async (t) => {
   const store = makeTempDatabase(t);
   const env = createPanelEnvironment(store.db);
@@ -847,7 +899,7 @@ test('management configures and updates one panel; Wallet and Work stay private'
   assert.equal(env.edits.length, 1);
   const panelButtons = env.posts[0].components.flatMap((row) => row.components);
   assert.deepEqual(panelButtons.map((button) => button.data.label), [
-    'My Wallet', 'Work', 'Bank', 'Shop', 'Leaderboard', 'Blackjack', 'Coin Flip', 'Roulette', 'Chicken Road', 'Transactions', 'Daily Rewards', 'Delivery Rush', 'Inventory',
+    'My Wallet', 'Work', 'Bank', 'Shop', 'Leaderboard', 'Blackjack', 'Coin Flip', 'Roulette', 'Chicken Road', 'History', 'Daily Rewards', 'Delivery Rush', 'Inventory',
   ]);
   assert.ok(panelButtons.every((button) => !button.data.disabled));
 
@@ -860,7 +912,9 @@ test('management configures and updates one panel; Wallet and Work stay private'
     reply: async (payload) => { walletReply = payload; return payload; },
   }, { db: store.db });
   assert.equal(walletReply.ephemeral, true);
-  assert.match(walletReply.embeds[0].data.description, /\$300/);
+  assert.match(walletReply.embeds[0].data.fields.find((field) => field.name.includes('Wallet')).value, /\$300/);
+  assert.match(walletReply.embeds[0].data.fields.find((field) => field.name.includes('Bank')).value, /\$0/);
+  assert.equal(JSON.stringify(walletReply).includes(account.user_id), false);
 
   let unauthorizedReply;
   const unauthorized = env.interaction('configure', {
@@ -960,4 +1014,57 @@ test('Delivery Rush panel button starts a private game and only its owner can ch
   }, { db: store.db });
   assert.match(duplicateReply.content, /already completed/);
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE user_id = ? AND type = 'delivery_rush'").get(playerId).count, rewardTransactions);
+});
+
+test('transaction history paginates all rows newest-first and keeps each viewer bound to their own account', async (t) => {
+  const store = makeTempDatabase(t);
+  const env = createPanelEnvironment(store.db);
+  const userId = 'history-owner';
+  const otherUserId = 'history-other';
+  getWallet(store.db, userId);
+  getWallet(store.db, otherUserId);
+  const insert = store.db.prepare(`
+    INSERT INTO economy_transactions (id, user_id, type, amount, wallet_after, bank_after, created_at, metadata_json)
+    VALUES (?, ?, 'work', ?, ?, 0, ?, ?)
+  `);
+  for (let index = 1; index <= 17; index += 1) {
+    insert.run(`history-${index}`, userId, index, index,
+      new Date(Date.parse('2026-11-01T10:00:00.000Z') + index * 60_000).toISOString(),
+      JSON.stringify({ description: `Reason ${index}` }));
+  }
+  insert.run('other-history-1', otherUserId, 999, 999, '2026-11-01T12:00:00.000Z', JSON.stringify({ description: 'Private other account' }));
+
+  let firstPage;
+  await handleButton({
+    customId: 'gv:economy:transactions',
+    user: { id: userId },
+    reply: async (payload) => { firstPage = payload; return payload; },
+  }, { db: store.db });
+  assert.match(firstPage.embeds[0].data.footer.text, /Page 1 of 2 • 17 transactions/);
+  assert.ok(firstPage.embeds[0].data.description.indexOf('Reason 17') < firstPage.embeds[0].data.description.indexOf('Reason 8'));
+  assert.doesNotMatch(firstPage.embeds[0].data.description, /Reason 7/);
+  const nextId = firstPage.components[0].components[1].data.custom_id;
+
+  let secondPage;
+  await handleButton({
+    customId: nextId,
+    user: { id: userId },
+    update: async (payload) => { secondPage = payload; return payload; },
+  }, { db: store.db });
+  assert.match(secondPage.embeds[0].data.footer.text, /Page 2 of 2 • 17 transactions/);
+  assert.match(secondPage.embeds[0].data.description, /Reason 7/);
+  assert.match(secondPage.embeds[0].data.description, /Reason 1/);
+  assert.equal(secondPage.components[0].components[0].data.disabled, false);
+  assert.equal(secondPage.components[0].components[1].data.disabled, true);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_transactions WHERE user_id = ?').get(userId).count, 17);
+
+  let denied;
+  await handleButton({
+    customId: `gv:economy:transactions:page:${userId}:${otherUserId}:0`,
+    guild: env.guild,
+    user: { id: userId },
+    reply: async (payload) => { denied = payload; return payload; },
+  }, { db: store.db });
+  assert.match(denied.content, /configured Economy Management role/i);
+  assert.doesNotMatch(JSON.stringify(denied), /Private other account/);
 });

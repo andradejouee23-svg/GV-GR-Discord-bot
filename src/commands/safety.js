@@ -24,16 +24,16 @@ function reportModal() {
   return new ModalBuilder().setCustomId('gv:report_submit').setTitle('Submit a Player Report').addComponents(
     new ActionRowBuilder().addComponents(new TextInputBuilder()
       .setCustomId('player').setLabel('Player being reported').setStyle(TextInputStyle.Short)
-      .setMaxLength(100).setRequired(true)),
+      .setMaxLength(100).setRequired(true).setPlaceholder('Exact Discord or Roblox username.')),
     new ActionRowBuilder().addComponents(new TextInputBuilder()
       .setCustomId('reason').setLabel('Reason for the report').setStyle(TextInputStyle.Short)
-      .setMaxLength(200).setRequired(true)),
+      .setMaxLength(200).setRequired(true).setPlaceholder('Example: harassment or exploiting.')),
     new ActionRowBuilder().addComponents(new TextInputBuilder()
       .setCustomId('description').setLabel('What happened?').setStyle(TextInputStyle.Paragraph)
-      .setMaxLength(1500).setRequired(true)),
+      .setMaxLength(1500).setRequired(true).setPlaceholder('Describe what happened and when.')),
     new ActionRowBuilder().addComponents(new TextInputBuilder()
       .setCustomId('evidence').setLabel('Evidence link (optional)').setStyle(TextInputStyle.Short)
-      .setMaxLength(500).setRequired(false)),
+      .setMaxLength(500).setRequired(false).setPlaceholder('Link a screenshot, clip, or other evidence.')),
   );
 }
 
@@ -173,6 +173,7 @@ async function handleSafetyCommand(interaction, ctx) {
 module.exports = {
   handleReportCommand,
   handleSafetyCommand,
+  reportModal,
   reportButtons,
   submitReport,
   updateReport,

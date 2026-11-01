@@ -11,6 +11,7 @@ const {
 } = require('discord.js');
 const config = require('../../config');
 const { ensureManagement: ensureStaffManagement } = require('./staff');
+const { getTownJobOptions } = require('./townJobs');
 const {
   beginBlackjack,
   cardLabel,
@@ -514,11 +515,13 @@ function getEconomyLeaderboard(db, limit = 10, ranking = 'wealth') {
   `).all(limit);
 }
 
-function getEconomyTransactions(db, userId = null, limit = 25) {
+function getEconomyTransactions(db, userId = null, limit = 25, offset = 0) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
+    || !Number.isSafeInteger(offset) || offset < 0) throw new Error('Transaction page bounds are invalid.');
   if (userId) {
-    return db.prepare('SELECT * FROM economy_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?').all(userId, limit);
+    return db.prepare('SELECT * FROM economy_transactions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?').all(userId, limit, offset);
   }
-  return db.prepare('SELECT * FROM economy_transactions ORDER BY created_at DESC LIMIT ?').all(limit);
+  return db.prepare('SELECT * FROM economy_transactions ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?').all(limit, offset);
 }
 
 function cashDropComponents(dropId, claimedBy = null) {
@@ -747,20 +750,31 @@ function claimWorkReward(db, userId, settings, now = new Date()) {
 }
 
 function walletEmbed(account, username, settings) {
-  const embed = makeEmbed(settings.panelColor, `💳 ${username}'s GV GR Wallet`,
-    `**Wallet:** ${formatCurrency(account.wallet_balance, settings.currencyName)}\n**Bank:** ${formatCurrency(account.bank_balance, settings.currencyName)}\n**Lifetime earnings:** ${formatCurrency(account.lifetime_earnings, settings.currencyName)}\n**Total spent:** ${formatCurrency(account.total_spent, settings.currencyName)}\n**Total transferred:** ${formatCurrency(account.total_transferred, settings.currencyName)}\n**Account created:** <t:${Math.floor(new Date(account.created_at).getTime() / 1000)}:D>`)
-    .setFooter({ text: `Account ID • ${account.user_id}` });
-  return embed;
+  return makeEmbed(settings.panelColor, `💳 ${username}'s GV GR Wallet`,
+    `Account opened <t:${Math.floor(new Date(account.created_at).getTime() / 1000)}:D> • balances are private to you.`)
+    .addFields(
+      { name: '👛 Wallet', value: formatCurrency(account.wallet_balance, settings.currencyName), inline: true },
+      { name: '🏦 Bank', value: formatCurrency(account.bank_balance, settings.currencyName), inline: true },
+      { name: '📈 Lifetime Earnings', value: formatCurrency(account.lifetime_earnings, settings.currencyName), inline: true },
+      { name: '🛍️ Total Spent', value: formatCurrency(account.total_spent, settings.currencyName), inline: true },
+      { name: '💸 Total Transferred', value: formatCurrency(account.total_transferred, settings.currencyName), inline: true },
+    )
+    .setFooter({ text: 'GV GR • Virtual economy' });
 }
 
 function economyPanelEmbed(settings) {
-  return makeEmbed(settings.panelColor, '💰 GV GR | ECONOMY',
-    'Manage your virtual roleplay money from one place. Your wallet and account history are private to you.\n\n'
-    + `**Work:** Earn ${formatCurrency(settings.minimumReward, settings.currencyName)}–${formatCurrency(settings.maximumReward, settings.currencyName)} every ${settings.cooldownMinutes} minutes.\n`
-    + `**Delivery Rush:** Deliver for ${formatCurrency(settings.deliveryMinimumReward, settings.currencyName)}–${formatCurrency(settings.deliveryMaximumReward * 2, settings.currencyName)} every ${settings.deliveryCooldownMinutes} minutes.\n`
-    + `**Daily reward:** ${formatCurrency(settings.dailyReward, settings.currencyName)} every ${settings.dailyRewardCooldownHours} hours.\n`
-    + `**Automatic cash drops:** ${settings.cashDropsEnabled ? 'Enabled' : 'Disabled'}; claim from the drop message when available.\n`
-    + '**My Wallet:** View wallet, bank, and account totals. Shop, games, inventory, leaderboards, and private history are available below.')
+  const dropInfo = settings.cashDropsEnabled
+    ? `Every ${settings.cashDropIntervalMinutes} min • ${formatCurrency(settings.cashDropAmount, settings.currencyName)} • up to ${settings.cashDropMaxClaims} claim${settings.cashDropMaxClaims === 1 ? '' : 's'}`
+    : 'Cash drops are currently paused.';
+  return makeEmbed(settings.panelColor, '💰 GV GR • COMMUNITY ECONOMY',
+    'Earn, save, shop, and play. Wallet balances and transaction history are private.')
+    .addFields(
+      { name: '💼 Earn', value: `Select a Town Job to unlock Work: ${formatCurrency(settings.minimumReward, settings.currencyName)}–${formatCurrency(settings.maximumReward, settings.currencyName)} every ${settings.cooldownMinutes} min.\nDelivery Rush: ${formatCurrency(settings.deliveryMinimumReward, settings.currencyName)}–${formatCurrency(settings.deliveryMaximumReward * 2, settings.currencyName)}.`, inline: true },
+      { name: '💳 Spend & save', value: 'Check your wallet and bank, browse the shop, or view your inventory.', inline: true },
+      { name: '🎮 Games', value: 'Blackjack • Coin Flip • Roulette • Chicken Road', inline: true },
+      { name: '🎁 Bonuses', value: `Daily reward: ${formatCurrency(settings.dailyReward, settings.currencyName)} every ${settings.dailyRewardCooldownHours} hours.\nCash drops: ${dropInfo}`, inline: true },
+      { name: '🏆 Track progress', value: 'Open the leaderboard or browse your complete transaction history.', inline: true },
+    )
     .setFooter({ text: 'GV GR • Virtual currency only' });
 }
 
@@ -768,7 +782,7 @@ function economyPanelComponents() {
   return [
     new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('gv:economy:wallet').setLabel('My Wallet').setEmoji('💳').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('gv:economy:work').setLabel('Work').setEmoji('🧰').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('gv:economy:work').setLabel('Work').setEmoji('💼').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:economy:bank').setLabel('Bank').setEmoji('🏦').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('gv:economy:shop').setLabel('Shop').setEmoji('🛍️').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('gv:economy:leaderboard').setLabel('Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
@@ -778,7 +792,7 @@ function economyPanelComponents() {
       new ButtonBuilder().setCustomId('gv:economy:coinflip').setLabel('Coin Flip').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('gv:economy:roulette').setLabel('Roulette').setEmoji('🎡').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('gv:economy:chicken').setLabel('Chicken Road').setEmoji('🐔').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('gv:economy:transactions').setLabel('Transactions').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:transactions').setLabel('History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gv:economy:daily').setLabel('Daily Rewards').setEmoji('🎁').setStyle(ButtonStyle.Secondary),
@@ -1080,6 +1094,16 @@ async function showWallet(interaction, ctx) {
 
 async function work(interaction, ctx) {
   const settings = getEconomySettings(ctx.db);
+  const member = await interaction.guild.members.fetch({ user: interaction.user.id, force: true }).catch(() => null);
+  const currentRoles = new Set(member ? memberRoleIds(member) : []);
+  const job = getTownJobOptions(ctx.db).find((option) => option
+    && typeof option.roleId === 'string'
+    && currentRoles.has(option.roleId));
+  if (!job) {
+    const channelId = getConfigValue(ctx.db, 'TOWN_JOBS_PANEL_CHANNEL_ID');
+    const jobPanel = validId(channelId) ? ` Choose an eligible job in <#${channelId}>.` : ' Ask staff where to choose an eligible Town Job.';
+    return interaction.reply({ content: `You need an active Town Job role to use Work.${jobPanel}`, ephemeral: true });
+  }
   let result;
   try {
     result = claimWorkReward(ctx.db, interaction.user.id, settings);
@@ -1087,11 +1111,12 @@ async function work(interaction, ctx) {
     return interaction.reply({ content: error.message, ephemeral: true });
   }
   if (!result.claimed) {
-    return interaction.reply({ content: `You have already worked recently. You can work again <t:${Math.floor(new Date(result.nextClaimAt).getTime() / 1000)}:R>.`, ephemeral: true });
+    return interaction.reply({ embeds: [makeEmbed(settings.panelColor, `💼 ${job.emoji || '🧰'} ${job.label}`,
+      `${job.description || 'Complete a short roleplay work activity for this job.'}\n\n**Available reward:** ${formatCurrency(settings.minimumReward, settings.currencyName)}–${formatCurrency(settings.maximumReward, settings.currencyName)}\n**Next Work:** <t:${Math.floor(new Date(result.nextClaimAt).getTime() / 1000)}:R>\n\nChoose your Town Job from the reaction-role panel before working; your current role is checked each time.`)], ephemeral: true });
   }
   return interaction.reply({
-    embeds: [makeEmbed(config.EMBED_COLORS.active, '🧰 Work Complete',
-      `You earned **${formatCurrency(result.reward, settings.currencyName)}**.\n**Wallet balance:** ${formatCurrency(result.account.wallet_balance, settings.currencyName)}\n**Next Work:** <t:${Math.floor(new Date(result.nextClaimAt).getTime() / 1000)}:R>`)],
+    embeds: [makeEmbed(config.EMBED_COLORS.active, `💼 ${job.emoji || '🧰'} ${job.label} • Work Complete`,
+      `${job.description || 'Complete a short roleplay work activity for this job.'}\n\nYou earned **${formatCurrency(result.reward, settings.currencyName)}**.\n**Available reward:** ${formatCurrency(settings.minimumReward, settings.currencyName)}–${formatCurrency(settings.maximumReward, settings.currencyName)}\n**Wallet balance:** ${formatCurrency(result.account.wallet_balance, settings.currencyName)}\n**Next Work:** <t:${Math.floor(new Date(result.nextClaimAt).getTime() / 1000)}:R>\n\nRole checked from your current Town Jobs selection.`)],
     ephemeral: true,
   });
 }
@@ -1229,33 +1254,52 @@ function shopPurchaseConfirmationPayload(prepared) {
 function amountModal(customId, title, label = 'Amount in dollars') {
   return new ModalBuilder().setCustomId(customId).setTitle(title).addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('amount').setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12),
+      new TextInputBuilder().setCustomId('amount').setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12)
+        .setPlaceholder('Enter a positive whole-dollar amount, e.g. 250.'),
     ),
   );
 }
 
-function economyTransactionsEmbed(db, userId, title = 'Your Transactions') {
-  const rows = getEconomyTransactions(db, userId, 15);
+function economyTransactionsEmbed(db, userId, title = 'Your Transactions', page = 0, viewerId = userId) {
+  const pageSize = 10;
+  const total = db.prepare(userId
+    ? 'SELECT COUNT(*) AS count FROM economy_transactions WHERE user_id = ?'
+    : 'SELECT COUNT(*) AS count FROM economy_transactions').get(...(userId ? [userId] : [])).count;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.max(0, Math.min(Number.isSafeInteger(page) ? page : 0, pageCount - 1));
+  const rows = getEconomyTransactions(db, userId, pageSize, safePage * pageSize);
   const settings = getEconomySettings(db);
   const description = rows.length
     ? rows.map((row) => {
       let note = '';
       try { note = JSON.parse(row.metadata_json).description || ''; } catch {}
-      const direction = ['bank_deposit', 'player_transfer', 'shop_purchase', 'admin_debit'].includes(row.type) || row.type.endsWith('_bet') ? '-' : '+';
-      return `**${row.type.replaceAll('_', ' ')}** • ${direction}${formatCurrency(row.amount, settings.currencyName)}\n${note ? `${note} • ` : ''}<t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`;
-    }).join('\n\n')
+      const direction = ['bank_deposit', 'player_transfer', 'shop_purchase', 'admin_debit', 'bank_fee'].includes(row.type) || row.type.endsWith('_bet') ? '-' : '+';
+      const reason = String(note).replace(/\s+/g, ' ').trim().slice(0, 72);
+      const timestamp = Math.floor(new Date(row.created_at).getTime() / 1000);
+      return `**${row.type.replaceAll('_', ' ')}** • ${direction}${formatCurrency(row.amount, settings.currencyName)} • <t:${timestamp}:f>${reason ? `\n${reason}` : ''}`;
+    }).join('\n')
     : 'No economy transactions have been recorded yet.';
-  return makeEmbed(settings.panelColor, title, description.slice(0, 4000));
+  const embed = makeEmbed(settings.panelColor, title, description.slice(0, 4000))
+    .setFooter({ text: `Page ${safePage + 1} of ${pageCount} • ${total} transaction${total === 1 ? '' : 's'}` });
+  const components = pageCount > 1 ? [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gv:economy:transactions:page:${viewerId}:${userId}:${safePage - 1}`)
+      .setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(safePage === 0),
+    new ButtonBuilder().setCustomId(`gv:economy:transactions:page:${viewerId}:${userId}:${safePage + 1}`)
+      .setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(safePage >= pageCount - 1),
+  )] : [];
+  return { embed, components, page: safePage, pageCount, total };
 }
 
 function gameBetModal(gameType) {
   const modal = new ModalBuilder().setCustomId(`gv:economy:modal:game:${gameType}`).setTitle(`${gameType === 'chicken' ? 'Chicken Road' : gameType[0].toUpperCase() + gameType.slice(1)} Wager`);
   modal.addComponents(new ActionRowBuilder().addComponents(
-    new TextInputBuilder().setCustomId('bet').setLabel('Wager from your wallet').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12),
+    new TextInputBuilder().setCustomId('bet').setLabel('Wager from your wallet').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12)
+      .setPlaceholder('Whole dollars available in your wallet, e.g. 50.'),
   ));
   if (gameType === 'coinflip' || gameType === 'roulette') {
     modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('choice').setLabel(gameType === 'coinflip' ? 'heads or tails' : 'red, black, or green').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10),
+      new TextInputBuilder().setCustomId('choice').setLabel(gameType === 'coinflip' ? 'heads or tails' : 'red, black, or green').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)
+        .setPlaceholder(gameType === 'coinflip' ? 'Enter heads or tails.' : 'Enter red, black, or green.'),
     ));
   }
   return modal;
@@ -1513,7 +1557,8 @@ function economyStaffSettingsModal() {
   ];
   for (const [id, label] of fields) {
     modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12),
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12)
+        .setPlaceholder(id.endsWith('color') ? 'Example: #21A67A.' : 'Leave blank to keep the current setting.'),
     ));
   }
   return modal;
@@ -1528,7 +1573,8 @@ function economyWorkRewardsModal() {
     ['daily-cooldown', 'Daily cooldown hours'],
   ]) {
     modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12),
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12)
+        .setPlaceholder('Leave blank to keep the current setting.'),
     ));
   }
   return modal;
@@ -1544,7 +1590,8 @@ function economyDeliverySettingsModal(db) {
     ['delivery-cooldown', 'Cooldown in minutes', settings.deliveryCooldownMinutes],
   ]) {
     modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12).setValue(String(value)),
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12).setValue(String(value))
+        .setPlaceholder('Enter a positive whole-dollar amount or minutes.'),
     ));
   }
   return modal;
@@ -1554,8 +1601,8 @@ function economyManualDropModal(db) {
   const settings = getEconomySettings(db);
   return new ModalBuilder().setCustomId('gv:economy:modal:staff-drop').setTitle('Create Manual Cash Drop')
     .addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Cash per player').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12).setValue(String(settings.cashDropAmount))),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('claims').setLabel('Maximum number of claimants').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3).setValue(String(settings.cashDropMaxClaims))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Cash per player').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12).setValue(String(settings.cashDropAmount)).setPlaceholder('Example: 100.')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('claims').setLabel('Maximum number of claimants').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3).setValue(String(settings.cashDropMaxClaims)).setPlaceholder('Example: 5 players.')),
     );
 }
 
@@ -1571,7 +1618,15 @@ function economyProductModal(mode, item = null) {
     ['category', 'Category', item?.category ?? 'General'],
   ];
   for (const [id, label, value] of fields) {
-    const input = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(id === 'description' ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(id !== 'description').setMaxLength(id === 'description' ? 500 : 100);
+    const placeholders = {
+      name: 'Example: GV GR Hoodie.',
+      price: 'Enter the whole-dollar price.',
+      stock: 'Enter the available quantity.',
+      description: 'Describe what the player receives.',
+      category: 'Example: Apparel or Vehicles.',
+    };
+    const input = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(id === 'description' ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(id !== 'description').setMaxLength(id === 'description' ? 500 : 100)
+      .setPlaceholder(placeholders[id]);
     if (value) input.setValue(value);
     modal.addComponents(new ActionRowBuilder().addComponents(
       input,
@@ -1583,7 +1638,7 @@ function economyProductModal(mode, item = null) {
 function economyProductImageModal(item) {
   return new ModalBuilder().setCustomId(`gv:economy:modal:staff-product-image:${item.id}`).setTitle('Set Product Image')
     .addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('image').setLabel('HTTPS image URL (blank removes image)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(500).setValue(item.image_url ?? ''),
+      new TextInputBuilder().setCustomId('image').setLabel('HTTPS image URL (blank removes image)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(500).setValue(item.image_url ?? '').setPlaceholder('https://example.com/product.png'),
     ));
 }
 
@@ -1618,7 +1673,8 @@ function economyBalanceModal() {
     ['reason', 'Required audit reason', 500],
   ]) {
     modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(id === 'reason' ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(true).setMaxLength(maxLength),
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(id === 'reason' ? TextInputStyle.Paragraph : TextInputStyle.Short).setRequired(true).setMaxLength(maxLength)
+        .setPlaceholder(id === 'user-id' ? 'Enter the target member Discord ID.' : id === 'amount' ? 'Example: +500 or -250.' : 'Add context for the permanent audit log.'),
     ));
   }
   return modal;
@@ -1752,7 +1808,8 @@ async function handleEconomyTransactions(interaction, ctx) {
     if (!await ensureManagement(interaction, ctx.db)) return;
     userId = requestedUser.id;
   }
-  return interaction.reply({ embeds: [economyTransactionsEmbed(ctx.db, userId, requestedUser ? `${requestedUser.username}'s Transactions` : 'Your Transactions')], ephemeral: true });
+  const result = economyTransactionsEmbed(ctx.db, userId, requestedUser ? `${requestedUser.username}'s Transactions` : 'Your Transactions', 0, interaction.user.id);
+  return interaction.reply({ embeds: [result.embed], components: result.components, ephemeral: true });
 }
 
 async function handleEconomyCommand(interaction, ctx) {
@@ -2001,7 +2058,18 @@ async function handleEconomyButton(interaction, ctx) {
     return interaction.reply({ embeds: [makeEmbed(getEconomySettings(ctx.db).panelColor, '🎒 Inventory', description.slice(0, 4000))], ephemeral: true });
   }
   if (interaction.customId === 'gv:economy:transactions') {
-    return interaction.reply({ embeds: [economyTransactionsEmbed(ctx.db, interaction.user.id)], ephemeral: true });
+    const result = economyTransactionsEmbed(ctx.db, interaction.user.id, 'Your Transactions', 0, interaction.user.id);
+    return interaction.reply({ embeds: [result.embed], components: result.components, ephemeral: true });
+  }
+  const transactionPage = interaction.customId.match(/^gv:economy:transactions:page:([^:]+):([^:]+):(-?\d+)$/);
+  if (transactionPage) {
+    const [, viewerId, targetId, rawPage] = transactionPage;
+    if (viewerId !== interaction.user.id) {
+      return interaction.reply({ content: 'This transaction history belongs to another viewer.', ephemeral: true });
+    }
+    if (targetId !== viewerId && !await ensureManagement(interaction, ctx.db)) return;
+    const result = economyTransactionsEmbed(ctx.db, targetId, targetId === viewerId ? 'Your Transactions' : 'Member Transactions', Number(rawPage), viewerId);
+    return interaction.update({ embeds: [result.embed], components: result.components });
   }
   if (['blackjack', 'coinflip', 'roulette', 'chicken'].some((game) => interaction.customId === `gv:economy:${game}`)) {
     const game = interaction.customId.split(':').at(-1);

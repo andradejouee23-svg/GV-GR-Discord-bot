@@ -64,12 +64,9 @@ function validJobOption(job) {
 }
 
 function jobField(job) {
-  const action = job.action === 'toggle'
-    ? 'Click again to remove'
-    : job.action === 'remove' ? 'Removes this role' : 'Adds this role';
   return {
     name: `${job.emoji ? `${job.emoji} ` : ''}${job.label}`,
-    value: `${job.description || 'Select the button below to choose this role.'}\n<@&${job.roleId}> • ${action}`,
+    value: job.description || 'Select the button below to choose this job.',
     inline: true,
   };
 }
@@ -364,6 +361,7 @@ async function handleTownJobButton(interaction, ctx) {
 
 module.exports = {
   getTownJobOptions,
+  getTownJobsSettings,
   handleTownJobButton,
   handleTownJobsCommand,
   makeJobComponents,

@@ -6,6 +6,7 @@ const test = require('node:test');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
 const {
+  applyPanelCustomization,
   getPanelEditorConfig,
   handlePanelEditorButton,
   handlePanelEditorCommand,
@@ -22,7 +23,8 @@ const botId = '1666064708795306160';
 
 function setup(t) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-panel-editor-'));
-  const db = createDatabase(path.join(directory, 'panel.sqlite'));
+  const filename = path.join(directory, 'panel.sqlite');
+  let db = createDatabase(filename);
   t.after(() => { db.close(); rmSync(directory, { recursive: true, force: true }); });
   setConfigValue(db, 'role_management', [managerRoleId]);
   setConfigValue(db, 'ECONOMY_PANEL_MESSAGE_CHANNEL_ID', channelId);
@@ -45,7 +47,11 @@ function setup(t) {
     guilds: { cache: new Map([[config.SERVER_ID, guild]]) },
     channels: { fetch: async () => channel },
   };
-  return { db, guild, client, sends, edits, deleted };
+  return {
+    get db() { return db; },
+    reopen() { db.close(); db = createDatabase(filename); return db; },
+    guild, client, sends, edits, deleted,
+  };
 }
 
 function managerInteraction(env, properties = {}) {
@@ -206,4 +212,76 @@ test('panel editor refreshes the existing Vehicle Registration panel without cha
     'gv:vehicle:register',
     'gv:vehicle:mine',
   ]);
+});
+
+test('Town Jobs editor customizes all visible text, sections, button labels and emojis, color, and footer across restarts', async (t) => {
+  const env = setup(t);
+  const roleId = '1666064708795306151';
+  setConfigValue(env.db, 'TOWN_JOBS_PANEL_CHANNEL_ID', channelId);
+  setConfigValue(env.db, 'TOWN_JOBS_PANEL_MESSAGE_ID', oldMessageId);
+  setConfigValue(env.db, 'TOWN_JOBS_ROLE_OPTIONS', [{
+    id: 'a1b2c3d4', roleId, label: 'Mechanic', description: 'Repair civilian vehicles.',
+    emoji: '🛠️', action: 'give', style: 'primary',
+  }]);
+
+  let preview = await handlePanelEditorSelect(managerInteraction(env, {
+    customId: 'gv:panel_editor:select', values: ['townjobs'], update: async (payload) => payload,
+  }), { db: env.db });
+  const textModal = await handlePanelEditorButton(managerInteraction(env, {
+    customId: preview.components[0].components[0].data.custom_id, showModal: async (modal) => modal,
+  }), { db: env.db });
+  preview = await handlePanelEditorModal(managerInteraction(env, {
+    customId: textModal.data.custom_id,
+    fields: { getTextInputValue: (key) => ({
+      title: 'Greenville Careers',
+      description: 'Select a civilian career and read its task before joining.',
+      footer: 'Questions? Contact Town Services.',
+      author: 'Greenville Town Services',
+      buttons: 'Join Mechanic|🔧',
+    }[key]) },
+  }), { db: env.db });
+
+  const sectionsModal = await handlePanelEditorButton(managerInteraction(env, {
+    customId: preview.components[0].components[4].data.custom_id, showModal: async (modal) => modal,
+  }), { db: env.db });
+  preview = await handlePanelEditorModal(managerInteraction(env, {
+    customId: sectionsModal.data.custom_id,
+    fields: { getTextInputValue: () => '1|Vehicle Service|Repair eligible civilian vehicles around Greenville.' },
+  }), { db: env.db });
+
+  const colorModal = await handlePanelEditorButton(managerInteraction(env, {
+    customId: preview.components[0].components[1].data.custom_id, showModal: async (modal) => modal,
+  }), { db: env.db });
+  preview = await handlePanelEditorModal(managerInteraction(env, {
+    customId: colorModal.data.custom_id,
+    fields: { getTextInputValue: () => '#21A67A' },
+  }), { db: env.db });
+
+  const saved = await handlePanelEditorButton(managerInteraction(env, {
+    customId: preview.components[1].components[0].data.custom_id, update: async (payload) => payload,
+  }), { db: env.db });
+  assert.match(saved.content, /customization saved/);
+  assert.equal(env.edits.length, 1);
+  const rendered = env.edits[0];
+  assert.equal(rendered.embeds[0].data.title, 'Greenville Careers');
+  assert.equal(rendered.embeds[0].data.description, 'Select a civilian career and read its task before joining.');
+  assert.equal(rendered.embeds[0].data.color, 0x21a67a);
+  assert.equal(rendered.embeds[0].data.author.name, 'Greenville Town Services');
+  assert.equal(rendered.embeds[0].data.footer.text, 'Questions? Contact Town Services.');
+  assert.equal(rendered.embeds[0].data.fields[0].name, 'Vehicle Service');
+  assert.match(rendered.embeds[0].data.fields[0].value, /Repair eligible civilian vehicles around Greenville/);
+  assert.equal(rendered.components[0].components[0].data.label, 'Join Mechanic');
+  assert.equal(rendered.components[0].components[0].data.emoji.name, '🔧');
+  assert.equal(JSON.stringify(rendered.embeds[0].data).includes(roleId), false);
+
+  env.reopen();
+  const { getTownJobsSettings, makeJobComponents, makeJobEmbed } = require('../src/commands/townJobs');
+  const persistedSettings = getPanelEditorConfig(env.db, 'townjobs');
+  assert.equal(persistedSettings.title, 'Greenville Careers');
+  assert.equal(persistedSettings.colorHex, '#21A67A');
+  const restored = applyPanelCustomization(env.db, 'townjobs', makeJobEmbed(getTownJobsSettings(env.db)), makeJobComponents(getTownJobsSettings(env.db).options));
+  assert.equal(restored.embed.data.title, 'Greenville Careers');
+  assert.equal(restored.embed.data.footer.text, 'Questions? Contact Town Services.');
+  assert.equal(restored.components[0].components[0].data.emoji.name, '🔧');
+  assert.equal(JSON.stringify(restored.embed.data).includes(roleId), false);
 });

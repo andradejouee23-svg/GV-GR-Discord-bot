@@ -8,7 +8,7 @@ const { handleTownJobButton } = require('../commands/townJobs');
 const { handleEconomyButton } = require('../commands/economy');
 const { handleBlacklistButton } = require('../commands/blacklist');
 const { updateReport } = require('../commands/safety');
-const { handleDailyReportReminder, handleStaffCenterButton, handleShiftReminder } = require('../commands/staffCenter');
+const { handleStaffCenterButton, handleShiftReminder } = require('../commands/staffCenter');
 
 async function handleButton(interaction, ctx) {
   if (interaction.customId.startsWith('gv:blacklist:')) {
@@ -36,10 +36,6 @@ async function handleButton(interaction, ctx) {
 
   if (interaction.customId.startsWith('gv:ann:')) {
     return handleAnnouncementManagerInteraction(interaction, ctx);
-  }
-
-  if (interaction.customId.startsWith('gv:daily:remind:')) {
-    return handleDailyReportReminder(interaction, ctx);
   }
 
   if (interaction.customId.startsWith('gv:center:')) {

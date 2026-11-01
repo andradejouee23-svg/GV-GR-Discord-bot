@@ -28,10 +28,10 @@ function makeSessionModal(host) {
     .addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder()
         .setCustomId('name').setLabel('Session name').setStyle(TextInputStyle.Short)
-        .setMaxLength(100).setRequired(true)),
+        .setMaxLength(100).setRequired(true).setPlaceholder('Example: Community Patrol.')),
       new ActionRowBuilder().addComponents(new TextInputBuilder()
         .setCustomId('description').setLabel('Optional description').setStyle(TextInputStyle.Paragraph)
-        .setMaxLength(1000).setRequired(false)),
+        .setMaxLength(1000).setRequired(false).setPlaceholder('Add the activity, meeting point, or schedule.')),
     );
 }
 
@@ -42,10 +42,10 @@ function makeSessionPanelModal(hostId) {
     .addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder()
         .setCustomId('name').setLabel('Session name').setStyle(TextInputStyle.Short)
-        .setMaxLength(100).setRequired(true)),
+        .setMaxLength(100).setRequired(true).setPlaceholder('Example: Community Patrol.')),
       new ActionRowBuilder().addComponents(new TextInputBuilder()
         .setCustomId('description').setLabel('Session details (optional)').setStyle(TextInputStyle.Paragraph)
-        .setMaxLength(1000).setRequired(false)),
+        .setMaxLength(1000).setRequired(false).setPlaceholder('Optional: activity, meeting point, or schedule.')),
     );
 }
 
@@ -303,6 +303,8 @@ module.exports = {
   handleSessionPanelModal,
   handleOperationsCommand,
   handleSessionJoin,
+  makeSessionModal,
   makeSessionButtons,
+  makeSessionPanelModal,
   submitSessionModal,
 };

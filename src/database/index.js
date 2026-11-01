@@ -572,23 +572,8 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     CREATE UNIQUE INDEX IF NOT EXISTS one_hour_reward_per_shift
       ON staff_points_ledger(user_id, source_id) WHERE source_type = 'shift_hours';
 
-    CREATE UNIQUE INDEX IF NOT EXISTS one_report_bonus_per_report
-      ON staff_points_ledger(user_id, source_id) WHERE source_type = 'daily_report';
-
     CREATE INDEX IF NOT EXISTS points_user_created
       ON staff_points_ledger(user_id, created_at);
-
-    CREATE TABLE IF NOT EXISTS daily_rp_reports (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL REFERENCES staff(user_id),
-      shift_id INTEGER NOT NULL UNIQUE REFERENCES shifts(id),
-      report_date TEXT NOT NULL,
-      shift_seconds INTEGER NOT NULL CHECK(shift_seconds >= 0),
-      rating TEXT NOT NULL CHECK(rating IN ('great', 'good', 'okay', 'bad')),
-      explanation TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      UNIQUE(user_id, report_date)
-    );
 
     CREATE TABLE IF NOT EXISTS staff_weekly_awards (
       week_start TEXT PRIMARY KEY,
@@ -605,14 +590,6 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       last_attempt_at TEXT NOT NULL,
       message_id TEXT,
       delivery_status TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS staff_report_reminders (
-      shift_id INTEGER PRIMARY KEY REFERENCES shifts(id),
-      last_attempt_at TEXT NOT NULL,
-      channel_id TEXT,
-      message_id TEXT,
-      delivery_status TEXT NOT NULL CHECK(delivery_status IN ('sent', 'failed', 'completed'))
     );
 
     CREATE TABLE IF NOT EXISTS staff_weekly_goal_reminders (

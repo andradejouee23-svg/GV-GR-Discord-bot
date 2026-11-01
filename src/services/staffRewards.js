@@ -84,43 +84,6 @@ function checkOutStaff(db, userId, now = new Date().toISOString()) {
   })();
 }
 
-function submitDailyReport(db, { userId, shiftId, rating, explanation = '', now = new Date().toISOString() }) {
-  if (!['great', 'good', 'okay', 'bad'].includes(rating)) throw new Error('Choose a valid RP rating.');
-  if (explanation.length > 1000) throw new Error('Report explanation must be 1000 characters or fewer.');
-
-  return db.transaction(() => {
-    const shift = db.prepare("SELECT * FROM shifts WHERE id = ? AND user_id = ? AND status = 'completed'").get(shiftId, userId);
-    if (!shift) return { saved: false, reason: 'shift_not_found' };
-    const reportDate = shift.ended_at.slice(0, 10);
-    const previous = db.prepare('SELECT id FROM daily_rp_reports WHERE user_id = ? AND report_date = ?').get(userId, reportDate);
-    if (previous) return { saved: false, reason: 'already_reported', reportId: previous.id };
-
-    const result = db.prepare(`
-      INSERT INTO daily_rp_reports (user_id, shift_id, report_date, shift_seconds, rating, explanation, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(userId, shiftId, reportDate, shift.duration_seconds, rating, explanation.trim(), now);
-    const reportId = Number(result.lastInsertRowid);
-    db.prepare(`
-      INSERT INTO staff_points_ledger (user_id, amount, source_type, source_id, reason, created_at)
-      VALUES (?, 1, 'daily_report', ?, 'Daily checkout RP report bonus', ?)
-      ON CONFLICT DO NOTHING
-    `).run(userId, String(reportId), now);
-    const reminders = db.prepare(`
-      SELECT r.channel_id, r.message_id FROM staff_report_reminders r
-      JOIN shifts sh ON sh.id = r.shift_id
-      WHERE sh.user_id = ? AND substr(sh.ended_at, 1, 10) = ? AND r.delivery_status = 'sent'
-    `).all(userId, reportDate);
-    db.prepare(`
-      UPDATE staff_report_reminders SET delivery_status = 'completed'
-      WHERE shift_id IN (
-        SELECT id FROM shifts WHERE user_id = ? AND substr(ended_at, 1, 10) = ?
-      ) AND delivery_status = 'sent'
-    `).run(userId, reportDate);
-    const totalPoints = db.prepare('SELECT COALESCE(SUM(amount), 0) AS total FROM staff_points_ledger WHERE user_id = ?').get(userId).total;
-    return { saved: true, reportId, reportDate, bonusPoints: 1, totalPoints, reminders };
-  })();
-}
-
 function secondsInRange(db, userId, start, end) {
   return db.prepare(`
     SELECT COALESCE(SUM(
@@ -173,7 +136,6 @@ function getStaffStats(db, userId, now = new Date()) {
   const shiftCounts = db.prepare(`
     SELECT COUNT(*) AS count FROM shifts WHERE user_id = ? AND status = 'completed'
   `).get(userId).count;
-  const reports = db.prepare('SELECT COUNT(*) AS count FROM daily_rp_reports WHERE user_id = ?').get(userId).count;
   const allStart = '1970-01-01T00:00:00.000Z';
   const weekEnd = new Date(Math.min(now.getTime(), Date.parse(`${nextWeekStart}T00:00:00.000Z`))).toISOString();
   const weekSeconds = secondsInRange(db, userId, `${weekStart}T00:00:00.000Z`, weekEnd);
@@ -188,7 +150,6 @@ function getStaffStats(db, userId, now = new Date()) {
     completedShifts: shiftCounts,
     activeShift: currentShift ? { ...currentShift, durationSeconds: activeShiftSeconds } : null,
     currentStreak: getCurrentStreak(db, userId, now),
-    reportCount: reports,
   };
 }
 
@@ -234,26 +195,11 @@ function getManagementRoster(db, now = new Date()) {
       (SELECT started_at FROM shifts sh WHERE sh.user_id = s.user_id AND sh.status = 'active') AS active_started_at,
       COALESCE((SELECT SUM(duration_seconds) FROM shifts sh WHERE sh.user_id = s.user_id AND sh.status = 'completed'), 0) AS completed_seconds,
       COALESCE((SELECT SUM(amount) FROM staff_points_ledger l WHERE l.user_id = s.user_id), 0) AS total_points,
-      (SELECT COUNT(*) FROM daily_rp_reports r WHERE r.user_id = s.user_id) AS reports,
       (SELECT MAX(ended_at) FROM shifts sh WHERE sh.user_id = s.user_id AND sh.status = 'completed') AS last_active_at
     FROM staff s LEFT JOIN staff_profiles p ON p.user_id = s.user_id
     ORDER BY active_started_at IS NULL, active_started_at ASC, s.username ASC
   `).all();
   return rows.map((row) => ({ ...row, current_streak: getCurrentStreak(db, row.user_id, now) }));
-}
-
-function getStaffReports(db, userId, limit = 20) {
-  return db.prepare(`
-    SELECT r.*, s.username FROM daily_rp_reports r JOIN staff s ON s.user_id = r.user_id
-    WHERE r.user_id = ? ORDER BY r.created_at DESC LIMIT ?
-  `).all(userId, limit);
-}
-
-function getRecentReports(db, limit = 20) {
-  return db.prepare(`
-    SELECT r.*, s.username FROM daily_rp_reports r JOIN staff s ON s.user_id = r.user_id
-    ORDER BY r.created_at DESC LIMIT ?
-  `).all(limit);
 }
 
 function getAuditLogs(db, limit = 25) {
@@ -289,20 +235,19 @@ function awardStaffOfWeek(db, now = new Date()) {
     const winner = db.prepare(`
       SELECT s.user_id,
         COALESCE((SELECT SUM(sh.duration_seconds) FROM shifts sh WHERE sh.user_id = s.user_id AND sh.status = 'completed' AND sh.ended_at >= ? AND sh.ended_at < ?), 0) AS hours_seconds,
-        COALESCE((SELECT SUM(l.amount) FROM staff_points_ledger l WHERE l.user_id = s.user_id AND l.created_at >= ? AND l.created_at < ?), 0) AS points,
-        (SELECT COUNT(*) FROM daily_rp_reports r WHERE r.user_id = s.user_id AND r.created_at >= ? AND r.created_at < ?) AS reports
+        COALESCE((SELECT SUM(l.amount) FROM staff_points_ledger l WHERE l.user_id = s.user_id AND l.created_at >= ? AND l.created_at < ?), 0) AS points
       FROM staff s
-      ORDER BY hours_seconds DESC, reports DESC, points DESC, s.username ASC LIMIT 1
-    `).get(from, until, from, until, from, until);
-    if (!winner || (winner.hours_seconds === 0 && winner.reports === 0 && winner.points === 0)) {
+      ORDER BY hours_seconds DESC, points DESC, s.username ASC LIMIT 1
+    `).get(from, until, from, until);
+    if (!winner || (winner.hours_seconds === 0 && winner.points === 0)) {
       db.prepare('INSERT INTO staff_weekly_awards (week_start, created_at) VALUES (?, ?)').run(previousStart, now.toISOString());
       return { weekStart: previousStart, winner: null };
     }
 
     db.prepare(`
-      INSERT INTO staff_weekly_awards (week_start, user_id, hours_seconds, points, reports, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(previousStart, winner.user_id, winner.hours_seconds, winner.points, winner.reports, now.toISOString());
+      INSERT INTO staff_weekly_awards (week_start, user_id, hours_seconds, points, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(previousStart, winner.user_id, winner.hours_seconds, winner.points, now.toISOString());
     db.prepare(`
       INSERT INTO staff_points_ledger (user_id, amount, source_type, source_id, reason, created_at)
       VALUES (?, ?, 'staff_of_week', ?, 'Staff of the Week award', ?)
@@ -507,36 +452,6 @@ function getOverdueShifts(db, now = new Date()) {
   `).all(cutoff, retryBefore);
 }
 
-function getPendingDailyReportReminders(db, now = new Date()) {
-  const cutoff = new Date(now.getTime() - config.DAILY_REPORT_REMINDER_MINUTES * 60_000).toISOString();
-  const retryBefore = new Date(now.getTime() - config.DAILY_REPORT_REMINDER_RETRY_HOURS * 3600_000).toISOString();
-  return db.prepare(`
-    SELECT sh.* FROM shifts sh
-    LEFT JOIN staff_report_reminders r ON r.shift_id = sh.id
-    WHERE sh.status = 'completed' AND sh.ended_at <= ?
-      AND NOT EXISTS (
-        SELECT 1 FROM daily_rp_reports rp
-        WHERE rp.user_id = sh.user_id AND rp.report_date = substr(sh.ended_at, 1, 10)
-      )
-      AND sh.id = (
-        SELECT MAX(latest.id) FROM shifts latest
-        WHERE latest.user_id = sh.user_id AND latest.status = 'completed'
-          AND substr(latest.ended_at, 1, 10) = substr(sh.ended_at, 1, 10)
-      )
-      AND (r.shift_id IS NULL OR (r.delivery_status = 'failed' AND r.last_attempt_at <= ?))
-    ORDER BY sh.ended_at ASC
-  `).all(cutoff, retryBefore);
-}
-
-function recordDailyReportReminder(db, shiftId, { status, channelId = null, messageId = null, now = new Date().toISOString() }) {
-  db.prepare(`
-    INSERT INTO staff_report_reminders (shift_id, last_attempt_at, channel_id, message_id, delivery_status)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(shift_id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
-      channel_id = excluded.channel_id, message_id = excluded.message_id, delivery_status = excluded.delivery_status
-  `).run(shiftId, now, channelId, messageId, status);
-}
-
 function shouldSendWeeklyGoalReminders(now = new Date()) {
   return config.WEEKLY_GOAL_REMINDER_ENABLED
     && now.getUTCDay() === config.WEEKLY_GOAL_REMINDER_DAY_UTC
@@ -585,11 +500,8 @@ module.exports = {
   getNextWeekStart,
   getOverdueShifts,
   getPointsLeaderboard,
-  getPendingDailyReportReminders,
   getPunishments,
-  getRecentReports,
   getRecentShiftActivity,
-  getStaffReports,
   getStaffStats,
   getWeekStart,
   getNextWeekStart,
@@ -597,10 +509,8 @@ module.exports = {
   getWeeklySummary,
   logAudit,
   recordReminderAttempt,
-  recordDailyReportReminder,
   getWeeklyGoalReminderCandidates,
   recordWeeklyGoalReminder,
   resetStaffStreak,
-  submitDailyReport,
   shouldSendWeeklyGoalReminders,
 };

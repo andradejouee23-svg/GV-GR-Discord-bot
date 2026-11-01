@@ -21,7 +21,6 @@ const {
   getManagementRoster,
   getPointsLeaderboard,
   getPunishments,
-  getRecentReports,
   getRecentShiftActivity,
   getStaffStats,
   getWeekStart,
@@ -69,10 +68,10 @@ function managementComponents() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('mgmt:overview').setLabel('Overview').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('mgmt:reports').setLabel('Daily Reports').setEmoji('📝').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('mgmt:activity').setLabel('Recent Activity').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('mgmt:leaderboard').setLabel('Weekly Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('mgmt:economy').setLabel('Economy').setEmoji('💰').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mgmt:vehicles').setLabel('Member Vehicle Management').setEmoji('🚘').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId('mgmt:staff_history').setPlaceholder('View a staff member’s history'),
@@ -85,7 +84,6 @@ function ownerComponents(db) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('owner:overview').setLabel('Overview').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('owner:reports').setLabel('All Daily Reports').setEmoji('📝').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('owner:audit').setLabel('Audit Log').setEmoji('📚').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('owner:activity').setLabel('Recent Activity').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('owner:toggle_message_delete_logging')
@@ -128,14 +126,6 @@ function activityEmbed(db) {
   return makeEmbed(config.EMBED_COLORS.info, '📈 Recent Staff Activity', text || 'No shifts have been recorded.');
 }
 
-function reportEmbed(db) {
-  const rows = getRecentReports(db, 12);
-  const description = rows.map((row) =>
-    `**${row.username} • ${row.report_date} • ${row.rating.toUpperCase()}**\nShift: ${formatDuration(row.shift_seconds)}${row.explanation ? `\n${row.explanation}` : ''}`)
-    .join('\n\n');
-  return makeEmbed(config.EMBED_COLORS.info, '📝 Recent Daily RP Reports', description || 'No daily RP reports have been submitted.');
-}
-
 function weeklyLeaderboardEmbed(db) {
   const weekStart = getWeekStart();
   const weekEndDate = new Date(`${weekStart}T00:00:00.000Z`);
@@ -150,16 +140,13 @@ function staffHistoryEmbed(db, userId) {
   const staff = db.prepare('SELECT * FROM staff WHERE user_id = ?').get(userId);
   if (!staff) return makeEmbed(config.EMBED_COLORS.warning, 'Staff History', 'This member does not have a staff record.');
   const stats = getStaffStats(db, userId);
-  const reports = getRecentReports(db, 100).filter((row) => row.user_id === userId).slice(0, 5);
   const actions = getPunishments(db, userId, 5);
   const notes = db.prepare('SELECT author_id, note, created_at FROM staff_notes WHERE user_id = ? ORDER BY id DESC LIMIT 5').all(userId);
-  const recentReports = reports.map((row) => `${row.report_date} • ${row.rating.toUpperCase()} • ${formatDuration(row.shift_seconds)}`).join('\n') || 'None';
   const recentActions = actions.map((row) => `${row.action} • ${unixTime(row.created_at, 'd')} • ${row.reason || 'No reason recorded'}`).join('\n') || 'None';
   const recentNotes = notes.map((row) => `${unixTime(row.created_at, 'd')} by <@${row.author_id}>: ${row.note}`).join('\n') || 'None';
   return makeEmbed(config.EMBED_COLORS.management, `Staff History • ${staff.username}`,
     `**Role:** ${staff.role_name}\n**Points:** ${stats.totalPoints}\n**Total hours:** ${formatDuration(stats.totalSeconds)}\n**Weekly hours:** ${formatDuration(stats.weeklySeconds)}\n**Streak:** ${stats.currentStreak} days\n**Status:** ${require('../services/staffRewards').currentStatus(db, userId).status}`)
     .addFields(
-      { name: 'Recent Daily Reports', value: recentReports.slice(0, 1024) },
       { name: 'Warnings and Actions', value: recentActions.slice(0, 1024) },
       { name: 'Management Notes', value: recentNotes.slice(0, 1024) },
     );
@@ -211,17 +198,24 @@ async function handleManagementButton(interaction, ctx) {
   if (!await requireManagerInteraction(interaction, ctx)) return;
   switch (interaction.customId) {
     case 'mgmt:overview': return interaction.update({ embeds: [rosterEmbed(ctx.db)], components: managementComponents() });
-    case 'mgmt:reports': return interaction.update({ embeds: [reportEmbed(ctx.db)], components: managementComponents() });
     case 'mgmt:activity': return interaction.update({ embeds: [activityEmbed(ctx.db)], components: managementComponents() });
     case 'mgmt:leaderboard': return interaction.update({ embeds: [weeklyLeaderboardEmbed(ctx.db)], components: managementComponents() });
-    default: return interaction.reply({ content: 'Unknown management control.', ephemeral: true });
+    case 'mgmt:vehicles': return interaction.update({ ...require('../commands/vehicles').vehicleMemberPickerPayload() });
+    default:
+      if (interaction.customId.startsWith('mgmt:vehicle:')) {
+        return require('./vehicles').handleVehicleManagementButton(interaction, ctx);
+      }
+      return interaction.reply({ content: 'Unknown management control.', ephemeral: true });
   }
 }
 
 async function handleManagementSelect(interaction, ctx) {
-  if (interaction.customId !== 'mgmt:staff_history') return null;
+  if (!['mgmt:staff_history', 'mgmt:vehicle:member'].includes(interaction.customId)) return null;
   if (!await requireManagerInteraction(interaction, ctx)) return;
   const userId = interaction.values[0];
+  if (interaction.customId === 'mgmt:vehicle:member') {
+    return require('./vehicles').showMemberVehicles(interaction, ctx, userId);
+  }
   return interaction.update({
     embeds: [staffHistoryEmbed(ctx.db, userId)],
     components: [...managementComponents(), ...managementShiftActions(ctx.db, userId)],
@@ -248,14 +242,14 @@ async function handleManagementShiftActionSelect(interaction, ctx) {
     .setTitle(action === 'close_shift' ? 'Close Active Staff Shift' : 'Correct Staff Shift');
   if (action === 'correct_shift') {
     modal.addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('started_at').setLabel('Correct start time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ended_at').setLabel('Correct end time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for correction').setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('started_at').setLabel('Correct start time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true).setPlaceholder('Example: 2026-11-01T10:00:00Z.')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ended_at').setLabel('Correct end time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true).setPlaceholder('Example: 2026-11-01T12:00:00Z.')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for correction').setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true).setPlaceholder('Explain why the recorded time needs correction.')),
     );
   } else {
     modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder()
       .setCustomId('reason').setLabel('Reason for closing').setStyle(TextInputStyle.Paragraph)
-      .setMaxLength(1000).setRequired(true)));
+      .setMaxLength(1000).setRequired(true).setPlaceholder('Explain why management is closing this shift.')));
   }
   return interaction.showModal(modal);
 }
@@ -379,16 +373,16 @@ function createActionModal(userId, action) {
     .setTitle(actionLabels[action].slice(0, 45));
   if (action === 'correct_shift') {
     return modal.addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('started_at').setLabel('Correct start time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ended_at').setLabel('Correct end time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for correction').setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('started_at').setLabel('Correct start time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true).setPlaceholder('Example: 2026-11-01T10:00:00Z.')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ended_at').setLabel('Correct end time (ISO 8601)').setStyle(TextInputStyle.Short).setMaxLength(40).setRequired(true).setPlaceholder('Example: 2026-11-01T12:00:00Z.')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason for correction').setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true).setPlaceholder('Explain why the recorded time needs correction.')),
     );
   }
   const rows = [];
   if (['add_points', 'remove_points'].includes(action)) {
-    rows.push(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Whole number of points').setStyle(TextInputStyle.Short).setMaxLength(6).setRequired(true)));
+    rows.push(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Whole number of points').setStyle(TextInputStyle.Short).setMaxLength(6).setRequired(true).setPlaceholder('Example: 5.')));
   }
-  rows.push(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (required)').setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true)));
+  rows.push(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (required)').setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true).setPlaceholder('Add the context for this management action.')));
   return modal.addComponents(...rows);
 }
 
@@ -543,7 +537,6 @@ async function handleOwnerButton(interaction, ctx) {
   }
   switch (interaction.customId) {
     case 'owner:overview': return interaction.update({ embeds: [rosterEmbed(ctx.db, true)], components: ownerComponents(ctx.db) });
-    case 'owner:reports': return interaction.update({ embeds: [reportEmbed(ctx.db)], components: ownerComponents(ctx.db) });
     case 'owner:audit': return interaction.update({ embeds: [auditEmbed(ctx.db)], components: ownerComponents(ctx.db) });
     case 'owner:activity': return interaction.update({ embeds: [activityEmbed(ctx.db)], components: ownerComponents(ctx.db) });
     default: return null;

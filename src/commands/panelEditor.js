@@ -65,7 +65,7 @@ function applyPanelCustomization(db, panelKey, embed, components = []) {
   if (row.title) embed.setTitle(row.title);
   if (row.description != null) embed.setDescription(row.description || ' ');
   if (color !== null) embed.setColor(color);
-  if (row.footer_text) embed.setFooter({ text: row.footer_text });
+  embed.setFooter(row.footer_text ? { text: row.footer_text } : null);
   if (row.author_text) embed.setAuthor({ name: row.author_text });
   if (row.header_image_url && row.header_image_position === 'bottom') embed.setImage(row.header_image_url);
   const fieldOverrides = JSON.parse(row.fields_json ?? '[]');
@@ -158,28 +158,28 @@ function textModal(draft) {
   const data = draft.data;
   return new ModalBuilder().setCustomId(`gv:panel_editor:modal:text:${draft.draft_id}`).setTitle(`Edit ${panelDefinitions[draft.panel_key].label}`)
     .addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title').setLabel('Panel title').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(256).setValue(data.title)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Panel description').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000).setValue(data.description)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title').setLabel('Panel title').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(256).setValue(data.title).setPlaceholder('Write the title players should see.')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Panel description').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000).setValue(data.description).setPlaceholder('Add player-facing instructions and details.')),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('footer').setLabel('Footer text (blank removes it)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2048).setValue(data.footerText)),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('author').setLabel('Author text (blank removes it)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(256).setValue(data.authorText)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('buttons').setLabel('Button label|emoji per line, in order').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000).setValue(data.buttonLabels.map((item) => `${item.label ?? ''}|${item.emoji ?? ''}`).join('\n'))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('buttons').setLabel('Button label|emoji per line, in order').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000).setValue(data.buttonLabels.map((item) => `${item.label ?? ''}|${item.emoji ?? ''}`).join('\n')).setPlaceholder('Example: Register|📝. Leave blank for defaults.')),
     );
 }
 
 function colorModal(draft) {
   return new ModalBuilder().setCustomId(`gv:panel_editor:modal:color:${draft.draft_id}`).setTitle('Preview Panel HEX Color')
-    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('color').setLabel('Six-digit HEX color (#RRGGBB)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7).setValue(draft.data.colorHex)));
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('color').setLabel('Six-digit HEX color (#RRGGBB)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7).setValue(draft.data.colorHex).setPlaceholder('Example: #21A67A.')));
 }
 
 function imageModal(draft) {
   return new ModalBuilder().setCustomId(`gv:panel_editor:modal:image:${draft.draft_id}`).setTitle('Panel Header Image')
-    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('image').setLabel('HTTPS image URL (blank removes image)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(512).setValue(draft.data.headerImageUrl)));
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('image').setLabel('HTTPS image URL (blank removes image)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(512).setValue(draft.data.headerImageUrl).setPlaceholder('https://example.com/header.png')));
 }
 
 function sectionsModal(draft) {
   const value = (draft.data.fields ?? []).map((field, index) => `${field.index ?? index + 1}|${field.name}|${field.value}${field.inline ? '|inline' : ''}`).join('\n');
   return new ModalBuilder().setCustomId(`gv:panel_editor:modal:sections:${draft.draft_id}`).setTitle('Edit Panel Sections')
-    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('fields').setLabel('Field number|heading|description|inline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(value)));
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('fields').setLabel('Field number|heading|description|inline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(value).setPlaceholder('Example: 1|Job name|Player-facing job details|inline')));
 }
 
 function panelTarget(db, key) {

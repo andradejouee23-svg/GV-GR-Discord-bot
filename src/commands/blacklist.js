@@ -62,6 +62,27 @@ function updateDraft(db, draftId, actorId, { stage, data }) {
 function textInput(id, label, { required = false, style = TextInputStyle.Short, value, maxLength = 1000 } = {}) {
   const input = new TextInputBuilder().setCustomId(id).setLabel(label.slice(0, 45)).setStyle(style).setRequired(required).setMaxLength(maxLength);
   if (value) input.setValue(String(value).slice(0, maxLength));
+  const placeholders = {
+    roblox_name: 'Enter the exact Roblox username.',
+    roblox_id: 'Enter the numeric Roblox user ID.',
+    discord_name: 'Enter the Discord username or display name.',
+    discord_id: 'Enter the Discord user ID, not a mention.',
+    reason: 'Explain the conduct and relevant rule.',
+    evidence: 'Link screenshots/video or summarize supporting evidence.',
+    duration: 'Example: 7d, 30d, or permanent.',
+    staff_notes: 'Internal staff context only.',
+    reconsideration: 'Explain why the original decision should be reconsidered.',
+    record_id: 'Enter the ID of an existing blacklist record.',
+    incident: 'Describe the incident and your role in it.',
+    return_reason: 'Explain what has changed and how you will follow the rules.',
+    message: 'Explain the decision or information the applicant should provide.',
+    resolution: 'Enter remove, permanent, or a duration such as 7d.',
+    management_note: 'Internal context for management only.',
+    query: 'Enter a player name, user ID, record ID, or status.',
+    expiration: 'ISO date/time with timezone, or permanent.',
+    status: 'Choose active, expired, or removed.',
+  };
+  if (placeholders[id]) input.setPlaceholder(placeholders[id]);
   return new ActionRowBuilder().addComponents(input);
 }
 
@@ -875,6 +896,8 @@ async function handleBlacklistModal(interaction, ctx) {
 }
 
 module.exports = {
+  blacklistCreateModal,
+  blacklistDetailsModal,
   handleBlacklistButton,
   handleBlacklistCommand,
   handleBlacklistModal,

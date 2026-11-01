@@ -97,7 +97,14 @@ function createApplicationModal(draftId, settings, page = 0, answers = []) {
       .setLabel(question.label.slice(0, 45))
       .setStyle(question.type === 'short' ? TextInputStyle.Short : TextInputStyle.Paragraph)
       .setMaxLength(1000)
-      .setRequired(question.required);
+      .setRequired(question.required)
+      .setPlaceholder(/Roblox username/i.test(question.label)
+        ? 'Enter your exact Roblox username.'
+        : /Discord username/i.test(question.label)
+          ? 'Enter your Discord username or display name.'
+          : /how old|age/i.test(question.label)
+            ? 'Enter your age in years.'
+            : question.type === 'short' ? 'Provide a clear, direct answer.' : 'Include relevant details; do not share passwords.');
     if (answers[globalIndex]) input.setValue(String(answers[globalIndex]).slice(0, 1000));
     modal.addComponents(new ActionRowBuilder().addComponents(input));
   });
@@ -602,7 +609,8 @@ function denialModal(applicationId) {
     .setLabel('Optional reason for denial')
     .setStyle(TextInputStyle.Paragraph)
     .setMaxLength(1000)
-    .setRequired(false);
+    .setRequired(false)
+    .setPlaceholder('Optional: explain what should be reconsidered.');
   return new ModalBuilder()
     .setCustomId(`gv:tempadmin:deny_submit:${applicationId}`)
     .setTitle('Deny Temporary Admin Application')
@@ -613,7 +621,8 @@ function moreInformationModal(applicationId) {
   return new ModalBuilder().setCustomId(`gv:tempadmin:info_submit:${applicationId}`).setTitle('Request More Information')
     .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder()
       .setCustomId('request').setLabel('What information should they provide?')
-      .setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true)));
+      .setStyle(TextInputStyle.Paragraph).setMaxLength(1000).setRequired(true)
+      .setPlaceholder('List the specific details or evidence needed.')));
 }
 
 async function setReviewState(interaction, ctx, applicationId, reviewState) {

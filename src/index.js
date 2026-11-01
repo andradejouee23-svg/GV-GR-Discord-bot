@@ -28,10 +28,7 @@ const { handleSafetyCommand, submitReport } = require('./commands/safety');
 const { handleStaffCommand } = require('./commands/staff');
 const {
   handleStaffCenterCommand,
-  handleDailyReportSelect,
-  handleDailyReportModal,
   handleShiftReminder,
-  processDailyReportReminders,
   processShiftReminders,
   processStaffOfWeek,
   processWeeklyGoalReminders,
@@ -73,7 +70,6 @@ if (requireSetup()) {
   const runStaffTasks = async () => {
     try {
       await processShiftReminders(client, db);
-      await processDailyReportReminders(client, db);
       await processWeeklyGoalReminders(client, db);
       await processStaffOfWeek(client, db);
       processVehicleExpirations(db);
@@ -176,9 +172,6 @@ if (requireSetup()) {
       )) {
         return handleAnnouncementManagerInteraction(interaction, context);
       }
-      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:daily:rating:')) {
-        return handleDailyReportSelect(interaction, context);
-      }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:blacklist:select:')) {
         return handleBlacklistSelect(interaction, context);
       }
@@ -191,6 +184,9 @@ if (requireSetup()) {
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:economy:staff:')) {
         return handleEconomyManagementSelect(interaction, context);
       }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('mgmt:vehicle:')) {
+        return require('./commands/vehicles').handleVehicleManagementSelect(interaction, context);
+      }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('owner:action:')) {
         return handleOwnerActionSelect(interaction, context);
       }
@@ -199,6 +195,7 @@ if (requireSetup()) {
       }
       if (interaction.isUserSelectMenu()) {
         if (interaction.customId === 'mgmt:staff_history') return handleManagementSelect(interaction, context);
+        if (interaction.customId === 'mgmt:vehicle:member') return handleManagementSelect(interaction, context);
         if (interaction.customId === 'owner:select_staff') return handleOwnerHistorySelect(interaction, context);
       }
       if (interaction.isModalSubmit()) {
@@ -206,13 +203,13 @@ if (requireSetup()) {
         if (interaction.customId.startsWith('gv:blacklist:')) return handleBlacklistModal(interaction, context);
         if (interaction.customId.startsWith('gv:economy:')) return handleEconomyModal(interaction, context);
         if (interaction.customId === 'gv:report_submit') return submitReport(interaction, context);
-        if (interaction.customId.startsWith('gv:daily:submit:')) return handleDailyReportModal(interaction, context);
         if (interaction.customId.startsWith('gv:session_start:')) return submitSessionModal(interaction, context);
         if (interaction.customId.startsWith('gv:session_panel_start:')) return handleSessionPanelModal(interaction, context);
         if (interaction.customId.startsWith('gv:ann:')) return handleAnnouncementManagerInteraction(interaction, context);
         if (interaction.customId.startsWith('gv:vehicle:')) return handleVehicleModal(interaction, context);
         if (interaction.customId.startsWith('gv:tempadmin:')) return handleTempAdminModal(interaction, context);
         if (interaction.customId.startsWith('owner:modal:')) return handleOwnerActionModal(interaction, context);
+        if (interaction.customId.startsWith('mgmt:vehicle:')) return require('./commands/vehicles').handleVehicleManagementModal(interaction, context);
         if (interaction.customId.startsWith('mgmt:shift_modal:')) return handleManagementShiftModal(interaction, context);
       }
     } catch (error) {

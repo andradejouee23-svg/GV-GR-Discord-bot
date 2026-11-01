@@ -340,6 +340,13 @@ function editorModal(draft, type, buttonIndex = null) {
     return modal.addComponents(...fields.map(([id, label, style, maxLength, value]) => {
       const input = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style)
         .setMaxLength(maxLength).setRequired(false);
+      const placeholders = {
+        title: 'Example: Community Update.',
+        description: 'Include the key announcement details.',
+        image: 'https://example.com/announcement.png',
+        color: 'Example: #4388D1.',
+      };
+      input.setPlaceholder(placeholders[id]);
       if (value) input.setValue(value.slice(0, maxLength));
       return new ActionRowBuilder().addComponents(input);
     }));
@@ -347,7 +354,8 @@ function editorModal(draft, type, buttonIndex = null) {
   if (type === 'sections') {
     const value = data.sections.map((section) => `${section.name} | ${section.value}`).join('\n');
     const input = new TextInputBuilder().setCustomId('sections').setLabel('One section per line: Heading | Text')
-      .setStyle(TextInputStyle.Paragraph).setMaxLength(4000).setRequired(false);
+      .setStyle(TextInputStyle.Paragraph).setMaxLength(4000).setRequired(false)
+      .setPlaceholder('Example: Rules | Follow the server rules.');
     if (value) input.setValue(value.slice(0, 4000));
     return new ModalBuilder().setCustomId(`gv:ann:sections:${draft.id}`).setTitle('Edit Additional Sections')
       .addComponents(new ActionRowBuilder().addComponents(input));
@@ -355,15 +363,15 @@ function editorModal(draft, type, buttonIndex = null) {
   const current = buttonIndex === null ? null : data.buttons[buttonIndex];
   const buttonType = current?.type ?? type;
   const buttonLabel = new TextInputBuilder().setCustomId('label').setLabel('Button label')
-    .setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
+    .setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true).setPlaceholder('Example: Read the rules.');
   const emoji = new TextInputBuilder().setCustomId('emoji').setLabel('Emoji (optional)')
-    .setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
+    .setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false).setPlaceholder('Example: 📋.');
   if (current?.label) buttonLabel.setValue(current.label);
   if (current?.emoji) emoji.setValue(current.emoji);
   const rows = [new ActionRowBuilder().addComponents(buttonLabel), new ActionRowBuilder().addComponents(emoji)];
   if (buttonType === 'link') {
     const url = new TextInputBuilder().setCustomId('url').setLabel('HTTPS URL (blank skips this button)')
-      .setStyle(TextInputStyle.Short).setMaxLength(512).setRequired(false);
+      .setStyle(TextInputStyle.Short).setMaxLength(512).setRequired(false).setPlaceholder('https://example.com/page');
     if (current?.target) url.setValue(current.target);
     rows.push(new ActionRowBuilder().addComponents(url));
   }
@@ -409,9 +417,9 @@ async function requireDraft(interaction, ctx, draftId) {
 
 function buttonSelectionPrompt(draft, targetType) {
   const label = new TextInputBuilder().setCustomId('label').setLabel('Button label')
-    .setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true);
+    .setStyle(TextInputStyle.Short).setMaxLength(80).setRequired(true).setPlaceholder('Example: Read the rules.');
   const emoji = new TextInputBuilder().setCustomId('emoji').setLabel('Emoji (optional)')
-    .setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false);
+    .setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(false).setPlaceholder('Example: 📋.');
   return new ModalBuilder().setCustomId(`gv:ann:button:${draft.id}:add_${targetType}`).setTitle('Add Announcement Button')
     .addComponents(new ActionRowBuilder().addComponents(label), new ActionRowBuilder().addComponents(emoji));
 }

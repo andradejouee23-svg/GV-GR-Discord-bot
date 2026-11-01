@@ -12,11 +12,9 @@ const { handleStaffCenterCommand } = require('../src/commands/staffCenter');
 const { handleButton } = require('../src/buttons');
 const { logMessageDeletion } = require('../src/events/messageDelete');
 const {
-  createDailyReportComponents,
   createPermanentLeaderboardEmbed,
   createStaffCenterComponents,
 } = require('../src/utils/staffCenter');
-const { createDailyReportReminderComponents } = require('../src/commands/staffCenter');
 
 function member(id, roleIds = []) {
   return { id, roles: { cache: new Map(roleIds.map((roleId) => [roleId, {}])) } };
@@ -99,7 +97,7 @@ test('permanent leaderboard uses all-time points and refreshes from the ledger',
   assert.match(description, /<@staff-b>.*\*\*9 ⭐\*\*/);
 });
 
-test('Staff Center buttons and report reminder open the expected private flows', async (t) => {
+test('Staff Center keeps shift, stats, weekly goal, and streak controls without reports', async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-staff-buttons-'));
   const db = createDatabase(path.join(directory, 'test.sqlite'));
   t.after(() => {
@@ -116,38 +114,18 @@ test('Staff Center buttons and report reminder open the expected private flows',
     'gv:center:leaderboard',
     'gv:center:weekly',
     'gv:center:streak',
-    'gv:center:reports:0',
   ]);
   assert.ok(buttonIds.every((customId) => customId.startsWith('gv:center:')));
+  assert.ok(buttonIds.every((customId) => !customId.includes('report')));
 
-  const reportRatingValues = createDailyReportComponents(42)[0].components[0].toJSON().options.map((option) => option.value);
-  assert.deepEqual(reportRatingValues, ['great', 'good', 'okay', 'bad']);
-  assert.equal(createDailyReportReminderComponents({ id: 42 })[0].components[0].data.custom_id, 'gv:daily:remind:42');
-
-  db.prepare('INSERT INTO staff (user_id, username, role_name, first_seen_at) VALUES (?, ?, ?, ?)')
-    .run('report-owner', 'ReportOwner', 'Moderator', '2026-10-04T00:00:00.000Z');
-  db.prepare(`
-    INSERT INTO shifts (user_id, username, role_name, started_at, ended_at, duration_seconds, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'completed')
-  `).run('report-owner', 'ReportOwner', 'Moderator', '2026-10-04T08:00:00.000Z', '2026-10-04T09:00:00.000Z', 3600);
   let replyPayload;
   await handleButton({
     customId: 'gv:daily:remind:1',
-    user: { id: 'report-owner' },
+    user: { id: 'former-report-user' },
     reply: async (payload) => { replyPayload = payload; },
   }, { db });
   assert.equal(replyPayload.ephemeral, true);
-  assert.match(replyPayload.content, /checkout and shift points are already saved/i);
-  assert.equal(replyPayload.components[0].components[0].data.custom_id, 'gv:daily:rating:1');
-
-  let deniedPayload;
-  await handleButton({
-    customId: 'gv:daily:remind:1',
-    user: { id: 'another-user' },
-    reply: async (payload) => { deniedPayload = payload; },
-  }, { db });
-  assert.equal(deniedPayload.ephemeral, true);
-  assert.match(deniedPayload.content, /not linked to one of your completed shifts/i);
+  assert.match(replyPayload.content, /not recognized/);
 });
 
 test('management and Owner dashboard buttons work; Owner toggles user-only delete logs', async (t) => {
@@ -173,7 +151,7 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
     };
   }
 
-  for (const customId of ['mgmt:overview', 'mgmt:reports', 'mgmt:activity', 'mgmt:leaderboard']) {
+  for (const customId of ['mgmt:overview', 'mgmt:activity', 'mgmt:leaderboard']) {
     const result = await handleManagementButton(createInteraction(customId, manager), { db });
     assert.ok(result.embeds[0], `Management button ${customId} should update the dashboard.`);
   }
@@ -185,7 +163,7 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
     reply: async (payload) => payload,
   }, { db });
   assert.ok(managementPanel.components.flatMap((row) => row.components).some((button) => button.data.custom_id === 'mgmt:economy'));
-  for (const customId of ['owner:overview', 'owner:reports', 'owner:audit', 'owner:activity']) {
+  for (const customId of ['owner:overview', 'owner:audit', 'owner:activity']) {
     const result = await handleOwnerButton(createInteraction(customId, owner), { db });
     assert.ok(result.embeds[0], `Owner button ${customId} should update the dashboard.`);
   }
