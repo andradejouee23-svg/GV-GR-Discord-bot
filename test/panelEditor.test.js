@@ -116,7 +116,8 @@ test('panel editor previews and saves separate HEX/image/text settings while ref
     customId: imageModal.data.custom_id,
     fields: { getTextInputValue: () => 'https://example.com/gv-header.png' },
   }), { db: env.db });
-  assert.ok(imagePreview.embeds[0]);
+  assert.equal(imagePreview.embeds[0].data.image.url, 'https://example.com/gv-header.png');
+  assert.match(imagePreview.embeds[1].data.title, /GV GR • Community Economy/);
 
   const save = await handlePanelEditorButton(managerInteraction(env, {
     customId: imagePreview.components[1].components[0].data.custom_id,
@@ -153,4 +154,42 @@ test('panel editor previews and saves separate HEX/image/text settings while ref
   assert.equal(getPanelEditorConfig(env.db, 'economy').headerImageUrl, '');
   assert.equal(getPanelEditorConfig(env.db, 'economy').headerMessageId, null);
   assert.equal(env.deleted.length, 2);
+});
+
+test('panel editor refreshes the existing Vehicle Registration panel without changing its button IDs', async (t) => {
+  const env = setup(t);
+  setConfigValue(env.db, 'VEHICLE_REGISTRATION_CHANNEL_ID', channelId);
+  setConfigValue(env.db, 'vehicle_panel_message_id', oldMessageId);
+  const preview = await handlePanelEditorSelect(managerInteraction(env, {
+    customId: 'gv:panel_editor:select',
+    values: ['vehicle'],
+    update: async (payload) => payload,
+  }), { db: env.db });
+  assert.match(preview.embeds[0].data.title, /Preview/);
+
+  const textModal = await handlePanelEditorButton(managerInteraction(env, {
+    customId: preview.components[0].components[0].data.custom_id,
+    showModal: async (modal) => modal,
+  }), { db: env.db });
+  const textPreview = await handlePanelEditorModal(managerInteraction(env, {
+    customId: textModal.data.custom_id,
+    fields: { getTextInputValue: (key) => ({
+      title: 'GV GR Vehicle Services',
+      description: 'Register roleplay vehicles here.',
+      footer: '',
+      author: '',
+      buttons: 'Submit registration|📝\nMy vehicles|🚘',
+    }[key]) },
+  }), { db: env.db });
+  await handlePanelEditorButton(managerInteraction(env, {
+    customId: textPreview.components[1].components[0].data.custom_id,
+    update: async (payload) => payload,
+  }), { db: env.db });
+
+  assert.equal(env.edits.length, 1);
+  assert.equal(env.edits[0].embeds[0].data.title, 'GV GR Vehicle Services');
+  assert.deepEqual(env.edits[0].components.flatMap((row) => row.components).map((button) => button.data.custom_id), [
+    'gv:vehicle:register',
+    'gv:vehicle:mine',
+  ]);
 });

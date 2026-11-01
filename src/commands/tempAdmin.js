@@ -21,7 +21,7 @@ const {
 } = require('../utils/discord');
 
 const applicationDraftLifetimeMs = 15 * 60 * 1000;
-const applicationQuestionsPerPage = 5;
+const applicationQuestionsPerPage = 4;
 const activeApplicationStatuses = ['pending', 'approving', 'approved', 'expiring'];
 
 function normalizeQuestion(question, index = 0) {
@@ -120,6 +120,7 @@ function choicePagePayload(draftId, draft, page) {
   if (page > 0) navigation.push(new ButtonBuilder().setCustomId(`gv:tempadmin:continue:${draftId}:${page - 1}`).setLabel('Back').setStyle(ButtonStyle.Secondary));
   if (page < pageCount - 1) navigation.push(new ButtonBuilder().setCustomId(`gv:tempadmin:continue:${draftId}:${page + 1}`).setLabel('Continue').setStyle(ButtonStyle.Primary));
   else navigation.push(new ButtonBuilder().setCustomId(`gv:tempadmin:submit:${draftId}:${page}`).setLabel('Submit Application').setStyle(ButtonStyle.Success));
+  navigation.push(new ButtonBuilder().setCustomId(`gv:tempadmin:cancel:${draftId}`).setLabel('Cancel').setStyle(ButtonStyle.Danger));
   if (navigation.length) rows.push(new ActionRowBuilder().addComponents(navigation));
   return {
     content: `**${draft.settings.title}** • Select your answers for page ${page + 1} of ${pageCount}. Your choices save as you go.`,
@@ -353,7 +354,9 @@ async function startApplication(interaction, ctx) {
 function applicationPageControls(draftId, page, pageCount) {
   const buttons = [];
   if (page > 0) buttons.push(new ButtonBuilder().setCustomId(`gv:tempadmin:continue:${draftId}:${page - 1}`).setLabel('Back').setStyle(ButtonStyle.Secondary));
-  if (page < pageCount - 1) buttons.push(new ButtonBuilder().setCustomId(`gv:tempadmin:continue:${draftId}:${page + 1}`).setLabel('Continue Application').setStyle(ButtonStyle.Primary));
+  if (page < pageCount - 1) buttons.push(new ButtonBuilder().setCustomId(`gv:tempadmin:continue:${draftId}:${page + 1}`).setLabel('Continue').setStyle(ButtonStyle.Primary));
+  else buttons.push(new ButtonBuilder().setCustomId(`gv:tempadmin:submit:${draftId}:${page}`).setLabel('Submit Application').setStyle(ButtonStyle.Success));
+  buttons.push(new ButtonBuilder().setCustomId(`gv:tempadmin:cancel:${draftId}`).setLabel('Cancel').setStyle(ButtonStyle.Danger));
   return [new ActionRowBuilder().addComponents(buttons)];
 }
 
@@ -377,8 +380,10 @@ async function submitApplication(interaction, ctx, draftId, page = 0) {
   if (pageQuestions.some((question) => ['multiple_choice', 'dropdown', 'yes_no'].includes(question.type))) {
     return interaction.reply(choicePagePayload(draftId, updatedDraft, page));
   }
-  if (page < pageCount - 1) return interaction.reply({ content: `Saved page ${page + 1} of ${pageCount}. Continue when you’re ready.`, components: applicationPageControls(draftId, page, pageCount), ephemeral: true });
-  return finishApplicationSubmission(interaction, ctx, draftId, updatedDraft, answers);
+  const content = page < pageCount - 1
+    ? `Saved page ${page + 1} of ${pageCount}. Continue, go back, or cancel.`
+    : 'All answers are saved. Review or change an earlier page, submit the application, or cancel.';
+  return interaction.reply({ content, components: applicationPageControls(draftId, page, pageCount), ephemeral: true });
 }
 
 async function handleTempAdminSelect(interaction, ctx) {
@@ -403,6 +408,8 @@ async function handleTempAdminSelect(interaction, ctx) {
 async function continueApplicationPage(interaction, ctx, draftId, page) {
   const draft = getApplicationDraft(ctx.db, draftId, interaction.user.id);
   if (!draft) return interaction.reply({ content: 'This application form expired. Reopen the panel to start again.', ephemeral: true });
+  const pageCount = Math.ceil(draft.settings.questions.length / applicationQuestionsPerPage);
+  if (!Number.isSafeInteger(page) || page < 0 || page >= pageCount) return interaction.reply({ content: 'This application page is invalid.', ephemeral: true });
   if (hasTextQuestions(draft.settings, page)) return interaction.showModal(createApplicationModal(draftId, draft.settings, page, draft.answers));
   return interaction.reply(choicePagePayload(draftId, draft, page));
 }
@@ -411,12 +418,20 @@ async function submitChoiceApplication(interaction, ctx, draftId, page) {
   const draft = getApplicationDraft(ctx.db, draftId, interaction.user.id);
   if (!draft) return interaction.reply({ content: 'This application form expired. Reopen the panel to start again.', ephemeral: true });
   const questions = draft.settings.questions.map((question, index) => normalizeQuestion(question, index));
+  const pageCount = Math.ceil(questions.length / applicationQuestionsPerPage);
+  if (!Number.isSafeInteger(page) || page < 0 || page >= pageCount) return interaction.reply({ content: 'This application page is invalid.', ephemeral: true });
   const pageQuestions = questions.slice(page * applicationQuestionsPerPage, (page + 1) * applicationQuestionsPerPage);
   const missing = pageQuestions.find((question) => validateQuestionAnswer(question, draft.answers[question.position] ?? '') !== null);
   if (missing) return interaction.reply({ content: `Select an answer for “${missing.label}” before continuing.`, ephemeral: true });
-  const pageCount = Math.ceil(questions.length / applicationQuestionsPerPage);
   if (page < pageCount - 1) return continueApplicationPage(interaction, ctx, draftId, page + 1);
   return finishApplicationSubmission(interaction, ctx, draftId, draft, draft.answers);
+}
+
+async function cancelApplicationDraft(interaction, ctx, draftId) {
+  const result = ctx.db.prepare('DELETE FROM temporary_admin_application_drafts WHERE id = ? AND applicant_id = ?')
+    .run(draftId, interaction.user.id);
+  if (!result.changes) return interaction.reply({ content: 'This application draft is no longer available.', ephemeral: true });
+  return interaction.update({ content: 'Temporary Admin application cancelled. Saved draft answers were removed.', embeds: [], components: [] });
 }
 
 async function getReviewChannel(interaction, reviewChannelId) {
@@ -903,6 +918,8 @@ async function handleTempAdminCommand(interaction, ctx) {
 
 async function handleTempAdminButton(interaction, ctx) {
   if (interaction.customId === 'gv:tempadmin:apply') return startApplication(interaction, ctx);
+  const cancelMatch = interaction.customId.match(/^gv:tempadmin:cancel:([a-f0-9]{32})$/);
+  if (cancelMatch) return cancelApplicationDraft(interaction, ctx, cancelMatch[1]);
   const continueMatch = interaction.customId.match(/^gv:tempadmin:continue:([a-f0-9]{32}):(\d+)$/);
   if (continueMatch) {
     const draft = getApplicationDraft(ctx.db, continueMatch[1], interaction.user.id);

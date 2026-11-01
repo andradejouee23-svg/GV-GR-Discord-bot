@@ -14,6 +14,7 @@ const config = require('../../config');
 const {
   ensureManagement,
 } = require('./staff');
+const { applyPanelCustomization, ensurePanelHeader } = require('./panelEditor');
 const {
   getConfigValue,
   makeEmbed,
@@ -200,9 +201,16 @@ async function openVehiclePanel(interaction, ctx) {
     return interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in the registration channel.', ephemeral: true });
   }
 
-  const payload = { embeds: [vehiclePanelEmbed()], components: vehiclePanelComponents() };
+  const customized = applyPanelCustomization(ctx.db, 'vehicle', vehiclePanelEmbed(), vehiclePanelComponents());
+  const payload = { embeds: [customized.embed], components: customized.components };
   let message;
-  const savedMessageId = getConfigValue(ctx.db, 'vehicle_panel_message_id');
+  let savedMessageId = getConfigValue(ctx.db, 'vehicle_panel_message_id');
+  const header = await ensurePanelHeader(interaction.client, ctx.db, 'vehicle', channel);
+  if (header.created && validId(savedMessageId)) {
+    try { const previous = await channel.messages.fetch(savedMessageId); if (previous.author?.id === interaction.client.user?.id) await previous.delete(); } catch {}
+    setConfigValue(ctx.db, 'vehicle_panel_message_id', null);
+    savedMessageId = null;
+  }
   if (validId(savedMessageId)) {
     try {
       const previous = await channel.messages.fetch(savedMessageId);
@@ -707,6 +715,7 @@ module.exports = {
   applicationDetailsModal,
   createApplicationDraft,
   decisionEmbed,
+  vehiclePanelEmbed,
   handleVehicleButton,
   handleVehicleCommand,
   handleVehicleModal,

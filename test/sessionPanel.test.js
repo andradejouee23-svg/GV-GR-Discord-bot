@@ -50,6 +50,7 @@ test('staff panel starts and ends a branded RP session announcement through butt
   };
   const client = { channels: { fetch: async () => channel } };
   const panelButtons = createPanelComponents().flatMap((row) => row.components);
+  assert.ok(panelButtons.some((button) => button.data.custom_id === 'gv:session_panel:quick-start' && button.data.label === 'Quick Start Session'));
   assert.ok(panelButtons.some((button) => button.data.custom_id === 'gv:session_panel:start' && button.data.label === 'Start RP Session'));
   assert.ok(panelButtons.some((button) => button.data.custom_id === 'gv:session_panel:end' && button.data.label === 'End Session'));
 
@@ -101,4 +102,31 @@ test('staff panel starts and ends a branded RP session announcement through butt
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id = 1").get().status, 'completed');
   assert.equal(edits[0].components[0].components[0].data.disabled, true);
   assert.ok(sent.some((payload) => payload.embeds?.[0]?.data.title === '🎙️ RP Session Ended'));
+
+  let quickReply;
+  await handleButton({
+    customId: 'gv:session_panel:quick-start',
+    user: { id: staffId, username: 'SessionHost' },
+    guild,
+    client,
+    reply: async (payload) => { quickReply = payload; return payload; },
+  }, { db, client });
+  assert.match(quickReply.content, /Session #2 started/);
+  const quickSession = db.prepare('SELECT * FROM sessions WHERE id = 2').get();
+  assert.equal(quickSession.name, 'Greenville RP Session');
+  assert.equal(quickSession.status, 'active');
+  assert.equal(quickSession.channel_id, sessionChannelId);
+  assert.ok(quickSession.message_id);
+  const quickAnnouncement = sent.find((payload) => payload.embeds?.[0]?.data.title === '🎙️ GV GR • Greenville RP Session');
+  assert.match(quickAnnouncement.embeds[0].data.description, /SESSION LIVE/);
+  assert.equal(quickAnnouncement.components[0].components[0].data.custom_id, 'gv:session_join:2');
+
+  await handleButton({
+    customId: 'gv:session_panel:end',
+    user: { id: managerId, username: 'Manager' },
+    guild,
+    client,
+    reply: async (payload) => payload,
+  }, { db, client });
+  assert.equal(db.prepare('SELECT status FROM sessions WHERE id = 2').get().status, 'completed');
 });

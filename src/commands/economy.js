@@ -51,6 +51,7 @@ function getEconomySettings(db) {
     deliveryMinimumReward: Number(getConfigValue(db, 'ECONOMY_DELIVERY_MIN_REWARD') ?? config.ECONOMY_DELIVERY_MIN_REWARD),
     deliveryMaximumReward: Number(getConfigValue(db, 'ECONOMY_DELIVERY_MAX_REWARD') ?? config.ECONOMY_DELIVERY_MAX_REWARD),
     deliveryCooldownMinutes: Number(getConfigValue(db, 'ECONOMY_DELIVERY_COOLDOWN_MINUTES') ?? config.ECONOMY_DELIVERY_COOLDOWN_MINUTES),
+    maximumBet: Number(getConfigValue(db, 'ECONOMY_GAME_MAX_BET') ?? config.ECONOMY_GAME_MAX_BET),
     currencyName: getConfigValue(db, 'ECONOMY_CURRENCY_NAME') ?? config.ECONOMY_CURRENCY_NAME,
   };
 }
@@ -86,13 +87,12 @@ function formatCurrency(amount, currencyName) {
 }
 
 function ensureEconomyAccount(db, userId, now = new Date().toISOString()) {
-  const existing = db.prepare('SELECT * FROM economy_accounts WHERE user_id = ?').get(userId);
-  if (existing) return existing;
   const settings = getEconomySettings(db);
   const startingBalance = Number(settings.startingBalance ?? config.ECONOMY_STARTING_BALANCE ?? 0);
   db.prepare(`
     INSERT INTO economy_accounts (user_id, wallet_balance, bank_balance, lifetime_earnings, total_spent, total_transferred, created_at)
     VALUES (?, ?, 0, 0, 0, 0, ?)
+    ON CONFLICT(user_id) DO NOTHING
   `).run(userId, startingBalance, now);
   return db.prepare('SELECT * FROM economy_accounts WHERE user_id = ?').get(userId);
 }
@@ -109,13 +109,15 @@ function recordEconomyTransaction(db, {
   walletAfter,
   bankAfter,
   description = '',
+  metadata = {},
+  idempotencyKey = null,
   now = new Date().toISOString(),
 }) {
   if (!Number.isSafeInteger(amount) || amount < 1) throw new Error('Transaction amount must be a positive whole number.');
   db.prepare(`
-    INSERT INTO economy_transactions (id, user_id, related_user_id, type, amount, wallet_after, bank_after, created_at, metadata_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(randomUUID(), userId, relatedUserId, type, amount, walletAfter, bankAfter, now, JSON.stringify({ description }));
+    INSERT INTO economy_transactions (id, user_id, related_user_id, type, amount, wallet_after, bank_after, created_at, metadata_json, idempotency_key)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(randomUUID(), userId, relatedUserId, type, amount, walletAfter, bankAfter, now, JSON.stringify({ description, ...metadata }), idempotencyKey);
 }
 
 function recordEconomyAudit(db, { actorId, targetId = 'economy', action, reason = '', previousValue = null, newValue = null, details = {}, now = new Date().toISOString() }) {
@@ -187,10 +189,18 @@ function withdrawFromBank(db, userId, amount, description = 'Bank withdrawal', n
   })();
 }
 
-function transferToPlayer(db, fromUserId, toUserId, amount, description = 'Player transfer', now = new Date().toISOString()) {
+function transferToPlayer(db, fromUserId, toUserId, amount, description = 'Player transfer', now = new Date().toISOString(), idempotencyKey = null) {
   if (fromUserId === toUserId) throw new Error('You cannot transfer money to yourself.');
   if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Transfer amount must be a positive whole number.');
   return db.transaction(() => {
+    const senderKey = typeof idempotencyKey === 'string' && idempotencyKey ? `${idempotencyKey}:sender` : null;
+    if (senderKey) {
+      const previous = db.prepare('SELECT related_user_id FROM economy_transactions WHERE idempotency_key = ?').get(senderKey);
+      if (previous) {
+        if (previous.related_user_id !== toUserId) throw new Error('This transfer request was already used for a different recipient.');
+        return { sender: getWallet(db, fromUserId, now), recipient: getWallet(db, toUserId, now), amount, duplicate: true };
+      }
+    }
     const sender = ensureEconomyAccount(db, fromUserId, now);
     const recipient = ensureEconomyAccount(db, toUserId, now);
     if (sender.wallet_balance < amount) throw new Error('You do not have enough wallet cash to make that transfer.');
@@ -200,8 +210,8 @@ function transferToPlayer(db, fromUserId, toUserId, amount, description = 'Playe
     if (!Number.isSafeInteger(recipientWallet) || !Number.isSafeInteger(transferredTotal)) throw new Error('Transfer would exceed a safe account balance limit.');
     db.prepare('UPDATE economy_accounts SET wallet_balance = ?, total_transferred = ? WHERE user_id = ?').run(senderWallet, transferredTotal, fromUserId);
     db.prepare('UPDATE economy_accounts SET wallet_balance = ? WHERE user_id = ?').run(recipientWallet, toUserId);
-    recordEconomyTransaction(db, { userId: fromUserId, relatedUserId: toUserId, type: 'player_transfer', amount, walletAfter: senderWallet, bankAfter: sender.bank_balance, description, now });
-    recordEconomyTransaction(db, { userId: toUserId, relatedUserId: fromUserId, type: 'player_transfer_received', amount, walletAfter: recipientWallet, bankAfter: recipient.bank_balance, description: `Incoming transfer from <@${fromUserId}>`, now });
+    recordEconomyTransaction(db, { userId: fromUserId, relatedUserId: toUserId, type: 'player_transfer', amount, walletAfter: senderWallet, bankAfter: sender.bank_balance, description, metadata: { recipientId: toUserId }, idempotencyKey: senderKey, now });
+    recordEconomyTransaction(db, { userId: toUserId, relatedUserId: fromUserId, type: 'player_transfer_received', amount, walletAfter: recipientWallet, bankAfter: recipient.bank_balance, description: `Incoming transfer from <@${fromUserId}>`, idempotencyKey: senderKey ? `${idempotencyKey}:recipient` : null, now });
     return { sender: getWallet(db, fromUserId, now), recipient: getWallet(db, toUserId, now), amount };
   })();
 }
@@ -306,9 +316,17 @@ function getPlayerPurchaseHistory(db, userId, limit = 20) {
   `).all(userId, limit);
 }
 
-function purchaseShopItem(db, userId, itemId, quantity = 1, now = new Date().toISOString()) {
+function purchaseShopItem(db, userId, itemId, quantity = 1, now = new Date().toISOString(), idempotencyKey = null) {
   if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new Error('Purchase quantity must be a positive whole number.');
   return db.transaction(() => {
+    if (typeof idempotencyKey === 'string' && idempotencyKey) {
+      const previous = db.prepare('SELECT * FROM economy_transactions WHERE idempotency_key = ?').get(idempotencyKey);
+      if (previous) {
+        if (previous.type !== 'shop_purchase') throw new Error('This purchase request was already used for another transaction.');
+        const account = getWallet(db, userId, now);
+        return { purchased: true, duplicate: true, itemId, totalCost: previous.amount, walletAfter: account.wallet_balance, bankAfter: account.bank_balance };
+      }
+    }
     const item = db.prepare('SELECT * FROM economy_shop_items WHERE id = ?').get(itemId);
     if (!item || item.deleted) return { purchased: false, reason: 'missing' };
     if (!item.enabled) return { purchased: false, reason: 'disabled' };
@@ -343,7 +361,7 @@ function purchaseShopItem(db, userId, itemId, quantity = 1, now = new Date().toI
       INSERT INTO economy_purchase_history (id, user_id, item_id, item_name, quantity, price, total_cost, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(randomUUID(), userId, item.id, item.name, quantity, item.price, totalCost, now);
-    recordEconomyTransaction(db, { userId, type: 'shop_purchase', amount: totalCost, walletAfter: newWallet, bankAfter: newBank, description: `${item.name} x${quantity}`, now });
+    recordEconomyTransaction(db, { userId, type: 'shop_purchase', amount: totalCost, walletAfter: newWallet, bankAfter: newBank, description: `${item.name} x${quantity}`, metadata: { itemId: item.id, quantity }, idempotencyKey, now });
     return { purchased: true, itemId: item.id, totalCost, walletAfter: newWallet, bankAfter: newBank, remainingStock: item.stock - quantity };
   })();
 }
@@ -371,12 +389,20 @@ function adjustPlayerBalance(db, actorId, userId, amount, reason, now = new Date
   })();
 }
 
-function getEconomyLeaderboard(db, limit = 10) {
+function getEconomyLeaderboard(db, limit = 10, ranking = 'wealth') {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Leaderboard limit must be from 1 to 100.');
+  const rankingExpressions = {
+    wealth: 'wallet_balance + bank_balance',
+    wallet: 'wallet_balance',
+    bank: 'bank_balance',
+    earnings: 'lifetime_earnings',
+  };
+  const rankingExpression = rankingExpressions[ranking];
+  if (!rankingExpression) throw new Error('Choose wealth, wallet, bank, or earnings for the leaderboard.');
   return db.prepare(`
     SELECT user_id, wallet_balance, bank_balance, lifetime_earnings
     FROM economy_accounts
-      ORDER BY wallet_balance + bank_balance DESC, lifetime_earnings DESC, user_id ASC
+      ORDER BY ${rankingExpression} DESC, lifetime_earnings DESC, user_id ASC
     LIMIT ?
   `).all(limit);
 }
@@ -392,6 +418,31 @@ function cashDropComponents(dropId) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gv:economy:drop:claim:${dropId}`).setLabel('Claim Cash Drop').setEmoji('💵').setStyle(ButtonStyle.Success),
   )];
+}
+
+function createManualEconomyCashDrop(db, { channelId, amount, maxClaims, lifetimeMinutes, actorId }, now = new Date()) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Cash drop time is invalid.');
+  if (!validId(channelId) || !Number.isSafeInteger(amount) || amount < 1 || amount > 1_000_000_000
+    || !Number.isSafeInteger(maxClaims) || maxClaims < 1 || maxClaims > 100
+    || !Number.isSafeInteger(lifetimeMinutes) || lifetimeMinutes < 1 || lifetimeMinutes > 1440) {
+    throw new Error('Cash drop channel, amount, claim limit, or lifetime is invalid.');
+  }
+  const nowIso = nowDate.toISOString();
+  const dropId = randomUUID();
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO economy_cash_drops (drop_id, channel_id, amount, max_claims, status, created_at, expires_at)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?)
+    `).run(dropId, channelId, amount, maxClaims, nowIso, new Date(nowDate.getTime() + lifetimeMinutes * 60_000).toISOString());
+    recordEconomyAudit(db, {
+      actorId,
+      action: 'cash_drop_created',
+      newValue: JSON.stringify({ amount, maxClaims, lifetimeMinutes, channelId, manual: true }),
+      now: nowIso,
+    });
+  })();
+  return db.prepare('SELECT * FROM economy_cash_drops WHERE drop_id = ?').get(dropId);
 }
 
 function claimEconomyCashDrop(db, dropId, userId, now = new Date()) {
@@ -452,10 +503,12 @@ async function postPendingCashDrop(client, db, drop, processedAt) {
     db.transaction(() => {
       db.prepare("UPDATE economy_cash_drops SET message_id = ?, status = 'open' WHERE drop_id = ? AND status = 'pending'")
         .run(message.id, drop.drop_id);
-      const currentNextAt = Date.parse(getConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT'));
-      const nextAfterPost = processedAt.getTime() + getEconomySettings(db).cashDropIntervalMinutes * 60_000;
-      if (!Number.isFinite(currentNextAt) || currentNextAt < nextAfterPost) {
-        setConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT', new Date(nextAfterPost).toISOString());
+      if (drop.schedule_key) {
+        const currentNextAt = Date.parse(getConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT'));
+        const nextAfterPost = processedAt.getTime() + getEconomySettings(db).cashDropIntervalMinutes * 60_000;
+        if (!Number.isFinite(currentNextAt) || currentNextAt < nextAfterPost) {
+          setConfigValue(db, 'ECONOMY_CASH_DROP_NEXT_AT', new Date(nextAfterPost).toISOString());
+        }
       }
     })();
     return { posted: true, dropId: drop.drop_id, messageId: message.id };
@@ -467,15 +520,19 @@ async function postPendingCashDrop(client, db, drop, processedAt) {
 
 async function processEconomyCashDrops(client, db, now = new Date()) {
   const settings = getEconomySettings(db);
-  if (!settings.cashDropsEnabled) return { created: false, reason: 'disabled' };
-  if (!validId(settings.cashDropChannelId)) return { created: false, reason: 'channel' };
   const nowDate = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(nowDate.getTime())) throw new Error('Cash drop scheduler time is invalid.');
   const nowIso = nowDate.toISOString();
   db.prepare("UPDATE economy_cash_drops SET status = 'expired' WHERE status = 'open' AND expires_at <= ?").run(nowIso);
 
   let pending = db.prepare("SELECT * FROM economy_cash_drops WHERE status = 'pending' ORDER BY created_at LIMIT 1").get();
+  if (pending && pending.expires_at <= nowIso) {
+    db.prepare("UPDATE economy_cash_drops SET status = 'expired' WHERE drop_id = ? AND status = 'pending'").run(pending.drop_id);
+    pending = db.prepare("SELECT * FROM economy_cash_drops WHERE status = 'pending' AND expires_at > ? ORDER BY created_at LIMIT 1").get(nowIso);
+  }
   if (!pending) {
+    if (!settings.cashDropsEnabled) return { created: false, reason: 'disabled' };
+    if (!validId(settings.cashDropChannelId)) return { created: false, reason: 'channel' };
     const intervalMinutes = settings.cashDropIntervalMinutes;
     if (!Number.isSafeInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1440
       || !Number.isSafeInteger(settings.cashDropAmount) || settings.cashDropAmount < 1
@@ -755,6 +812,7 @@ async function configureEconomy(interaction, ctx) {
   const deliveryMinimumReward = options.getInteger('delivery-minimum') ?? current.deliveryMinimumReward;
   const deliveryMaximumReward = options.getInteger('delivery-maximum') ?? current.deliveryMaximumReward;
   const deliveryCooldownMinutes = options.getInteger('delivery-cooldown-minutes') ?? current.deliveryCooldownMinutes;
+  const maximumBet = options.getInteger('maximum-bet') ?? current.maximumBet;
   const dropChannel = options.getChannel('drop-channel');
   const dropAmount = options.getInteger('drop-amount') ?? current.cashDropAmount;
   const dropClaims = options.getInteger('drop-claims') ?? current.cashDropMaxClaims;
@@ -767,6 +825,9 @@ async function configureEconomy(interaction, ctx) {
   if (settingsError) return interaction.reply({ content: settingsError, ephemeral: true });
   const deliveryError = validateDeliverySettings({ deliveryMinimumReward, deliveryMaximumReward, deliveryCooldownMinutes });
   if (deliveryError) return interaction.reply({ content: deliveryError, ephemeral: true });
+  if (!Number.isSafeInteger(maximumBet) || maximumBet < 1 || maximumBet > 1_000_000_000) {
+    return interaction.reply({ content: 'Maximum game wager must be from 1 to 1,000,000,000.', ephemeral: true });
+  }
   if (!Number.isSafeInteger(dropAmount) || dropAmount < 1 || dropAmount > 1_000_000_000
     || !Number.isSafeInteger(dropClaims) || dropClaims < 1 || dropClaims > 100
     || !Number.isSafeInteger(dropInterval) || dropInterval < 1 || dropInterval > 1440
@@ -788,6 +849,7 @@ async function configureEconomy(interaction, ctx) {
   if (options.getInteger('delivery-minimum') !== null) changes.push(['ECONOMY_DELIVERY_MIN_REWARD', deliveryMinimumReward]);
   if (options.getInteger('delivery-maximum') !== null) changes.push(['ECONOMY_DELIVERY_MAX_REWARD', deliveryMaximumReward]);
   if (options.getInteger('delivery-cooldown-minutes') !== null) changes.push(['ECONOMY_DELIVERY_COOLDOWN_MINUTES', deliveryCooldownMinutes]);
+  if (options.getInteger('maximum-bet') !== null) changes.push(['ECONOMY_GAME_MAX_BET', maximumBet]);
   if (options.getInteger('drop-amount') !== null) changes.push(['ECONOMY_CASH_DROP_AMOUNT', dropAmount]);
   if (options.getInteger('drop-claims') !== null) changes.push(['ECONOMY_CASH_DROP_MAX_CLAIMS', dropClaims]);
   if (options.getInteger('drop-interval-minutes') !== null) changes.push(['ECONOMY_CASH_DROP_INTERVAL_MINUTES', dropInterval]);
@@ -943,18 +1005,22 @@ async function handleBankCommand(interaction, ctx) {
   const action = interaction.options.getSubcommand();
   const amount = interaction.options.getInteger('amount', true);
   const description = interaction.options.getString('description') || 'Economy transfer';
-  if (action === 'deposit') {
-    const result = depositToBank(ctx.db, interaction.user.id, amount, description);
-    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🏦 Bank Deposit', `Deposited **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** to your bank account.\n**Wallet:** ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}\n**Bank:** ${formatCurrency(result.bankAfter, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
-  }
-  if (action === 'withdraw') {
-    const result = withdrawFromBank(ctx.db, interaction.user.id, amount, description);
-    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🏦 Bank Withdrawal', `Withdrew **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** from your bank account.\n**Wallet:** ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}\n**Bank:** ${formatCurrency(result.bankAfter, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
-  }
-  if (action === 'transfer') {
-    const target = interaction.options.getUser('member', true);
-    const result = transferToPlayer(ctx.db, interaction.user.id, target.id, amount, description);
-    return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, '💸 Transfer Complete', `Transferred **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** to <@${target.id}>.\n**Sender wallet:** ${formatCurrency(result.sender.wallet_balance, getEconomySettings(ctx.db).currencyName)}\n**Recipient wallet:** ${formatCurrency(result.recipient.wallet_balance, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+  try {
+    if (action === 'deposit') {
+      const result = depositToBank(ctx.db, interaction.user.id, amount, description);
+      return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🏦 Bank Deposit', `Deposited **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** to your bank account.\n**Wallet:** ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}\n**Bank:** ${formatCurrency(result.bankAfter, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+    }
+    if (action === 'withdraw') {
+      const result = withdrawFromBank(ctx.db, interaction.user.id, amount, description);
+      return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🏦 Bank Withdrawal', `Withdrew **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** from your bank account.\n**Wallet:** ${formatCurrency(result.walletAfter, getEconomySettings(ctx.db).currencyName)}\n**Bank:** ${formatCurrency(result.bankAfter, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+    }
+    if (action === 'transfer') {
+      const target = interaction.options.getUser('member', true);
+      const result = transferToPlayer(ctx.db, interaction.user.id, target.id, amount, description, new Date().toISOString(), interaction.id);
+      return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, '💸 Transfer Complete', `Transferred **${formatCurrency(amount, getEconomySettings(ctx.db).currencyName)}** to <@${target.id}>.\n**Sender wallet:** ${formatCurrency(result.sender.wallet_balance, getEconomySettings(ctx.db).currencyName)}\n**Recipient wallet:** ${formatCurrency(result.recipient.wallet_balance, getEconomySettings(ctx.db).currencyName)}`)], ephemeral: true });
+    }
+  } catch (error) {
+    return interaction.reply({ content: error.message, ephemeral: true });
   }
   return interaction.reply({ content: 'Bank action not recognized.', ephemeral: true });
 }
@@ -971,7 +1037,7 @@ async function handleDailyRewardCommand(interaction, ctx) {
 function shopPagePayload(db, page = 0) {
   const settings = getEconomySettings(db);
   const items = listShopItems(db, false).filter((item) => item.stock > 0);
-  const pageSize = 10;
+  const pageSize = 5;
   const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
   const safePage = Math.min(Math.max(0, page), pageCount - 1);
   const shown = items.slice(safePage * pageSize, (safePage + 1) * pageSize);
@@ -979,9 +1045,15 @@ function shopPagePayload(db, page = 0) {
     ? shown.map((item) => `**${item.name}** • ${formatCurrency(item.price, settings.currencyName)} • Stock: ${item.stock}\n${item.description || 'No description'}\nID: \`${item.id}\``).join('\n\n').slice(0, 3900)
     : 'The shop is empty right now.';
   const rows = [];
-  for (let index = 0; index < shown.length; index += 5) {
-    rows.push(new ActionRowBuilder().addComponents(shown.slice(index, index + 5).map((item) =>
-      new ButtonBuilder().setCustomId(`gv:economy:shop:buy:${item.id}`).setLabel(`Buy ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Success))));
+  for (let index = 0; index < shown.length; index += 2) {
+    const row = new ActionRowBuilder();
+    for (const item of shown.slice(index, index + 2)) {
+      row.addComponents(
+        new ButtonBuilder().setCustomId(`gv:economy:shop:view:${item.id}`).setLabel(`Details: ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`gv:economy:shop:buy:${item.id}`).setLabel(`Buy ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Success),
+      );
+    }
+    rows.push(row);
   }
   if (pageCount > 1) {
     rows.push(new ActionRowBuilder().addComponents(
@@ -1222,7 +1294,7 @@ async function handleShopCommand(interaction, ctx) {
   if (action === 'purchase') {
     const itemId = interaction.options.getString('item-id', true);
     const quantity = interaction.options.getInteger('quantity') ?? 1;
-    const result = purchaseShopItem(ctx.db, interaction.user.id, itemId, quantity, new Date().toISOString());
+    const result = purchaseShopItem(ctx.db, interaction.user.id, itemId, quantity, new Date().toISOString(), interaction.id);
     if (!result.purchased) {
       const reasons = { missing: 'That item does not exist.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough wallet balance.', limit: 'You have reached the purchase limit for that item.' };
       return interaction.reply({ content: reasons[result.reason] || 'That purchase could not be completed.', ephemeral: true });
@@ -1244,6 +1316,13 @@ function economyStaffComponents() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gv:economy:staff:toggle-drops').setLabel('Toggle Cash Drops').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:economy:staff:work-rewards').setLabel('Work & Daily Rewards').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:manual-drop').setLabel('Manual Cash Drop').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('gv:economy:staff:drop-history').setLabel('Drop History').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:purchases').setLabel('Purchase Review').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:economy:staff:transactions').setLabel('Transaction Review').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:staff:game-settings').setLabel('Delivery Rush Settings').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('mgmt:overview').setLabel('Back to Management').setStyle(ButtonStyle.Secondary),
     ),
   ];
@@ -1291,6 +1370,31 @@ function economyWorkRewardsModal() {
   return modal;
 }
 
+function economyDeliverySettingsModal(db) {
+  const settings = getEconomySettings(db);
+  const modal = new ModalBuilder().setCustomId('gv:economy:modal:staff-delivery-settings').setTitle('Game & Delivery Rush Settings');
+  for (const [id, label, value] of [
+    ['game-max-bet', 'Maximum game wager', settings.maximumBet],
+    ['delivery-min', 'Minimum delivery reward', settings.deliveryMinimumReward],
+    ['delivery-max', 'Maximum delivery reward', settings.deliveryMaximumReward],
+    ['delivery-cooldown', 'Cooldown in minutes', settings.deliveryCooldownMinutes],
+  ]) {
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(12).setValue(String(value)),
+    ));
+  }
+  return modal;
+}
+
+function economyManualDropModal(db) {
+  const settings = getEconomySettings(db);
+  return new ModalBuilder().setCustomId('gv:economy:modal:staff-drop').setTitle('Create Manual Cash Drop')
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Cash per player').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12).setValue(String(settings.cashDropAmount))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('claims').setLabel('Maximum number of claimants').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3).setValue(String(settings.cashDropMaxClaims))),
+    );
+}
+
 function economyProductModal(mode, item = null) {
   const modal = new ModalBuilder()
     .setCustomId(mode === 'add' ? 'gv:economy:modal:staff-product:add' : `gv:economy:modal:staff-product:edit:${item.id}`)
@@ -1310,6 +1414,13 @@ function economyProductModal(mode, item = null) {
     ));
   }
   return modal;
+}
+
+function economyProductImageModal(item) {
+  return new ModalBuilder().setCustomId(`gv:economy:modal:staff-product-image:${item.id}`).setTitle('Set Product Image')
+    .addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('image').setLabel('HTTPS image URL (blank removes image)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(500).setValue(item.image_url ?? ''),
+    ));
 }
 
 function economyProductsPayload(db) {
@@ -1355,12 +1466,13 @@ async function handleEconomyManagementButton(interaction, ctx) {
   if (interaction.customId === 'mgmt:economy') {
     return interaction.update({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents() });
   }
-  const productAction = interaction.customId.match(/^gv:economy:staff:product:(edit|toggle|remove):([a-f0-9-]{36})$/);
+  const productAction = interaction.customId.match(/^gv:economy:staff:product:(edit|toggle|remove|image):([a-f0-9-]{36})$/);
   if (productAction) {
     const [, action, itemId] = productAction;
     const item = ctx.db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0').get(itemId);
     if (!item) return interaction.reply({ content: 'That economy product is no longer available.', ephemeral: true });
     if (action === 'edit') return interaction.showModal(economyProductModal('edit', item));
+    if (action === 'image') return interaction.showModal(economyProductImageModal(item));
     if (action === 'remove') {
       removeShopItem(ctx.db, itemId, interaction.user.id);
       return interaction.update(economyProductsPayload(ctx.db));
@@ -1371,6 +1483,8 @@ async function handleEconomyManagementButton(interaction, ctx) {
   const action = interaction.customId.split(':').at(-1);
   if (action === 'settings') return interaction.showModal(economyStaffSettingsModal());
   if (action === 'work-rewards') return interaction.showModal(economyWorkRewardsModal());
+  if (action === 'game-settings') return interaction.showModal(economyDeliverySettingsModal(ctx.db));
+  if (action === 'manual-drop') return interaction.showModal(economyManualDropModal(ctx.db));
   if (action === 'balance') return interaction.showModal(economyBalanceModal());
   if (action === 'add-product') return interaction.showModal(economyProductModal('add'));
   if (action === 'back') return interaction.update({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents() });
@@ -1397,6 +1511,31 @@ async function handleEconomyManagementButton(interaction, ctx) {
       : 'No economy staff actions have been audited yet.';
     return interaction.update({ embeds: [makeEmbed(config.EMBED_COLORS.info, 'Economy Staff Audit', description.slice(0, 4000))], components: economyStaffComponents() });
   }
+  if (action === 'drop-history') {
+    const rows = ctx.db.prepare('SELECT * FROM economy_cash_drops ORDER BY created_at DESC LIMIT 15').all();
+    const description = rows.length
+      ? rows.map((row) => `**${formatCurrency(row.amount, getEconomySettings(ctx.db).currencyName)}** • ${row.claim_count}/${row.max_claims} claimed • **${row.status}**\n<#${row.channel_id}> • <t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`).join('\n\n')
+      : 'No cash drops have been recorded.';
+    return interaction.update({ embeds: [makeEmbed(config.EMBED_COLORS.info, 'Recent Economy Cash Drops', description.slice(0, 4000))], components: economyStaffComponents() });
+  }
+  if (action === 'purchases') {
+    const rows = ctx.db.prepare('SELECT * FROM economy_purchase_history ORDER BY created_at DESC LIMIT 15').all();
+    const description = rows.length
+      ? rows.map((row) => `**${row.item_name}** • ${row.quantity}x • ${formatCurrency(row.total_cost, getEconomySettings(ctx.db).currencyName)}\n<@${row.user_id}> • <t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`).join('\n\n')
+      : 'No shop purchases have been recorded.';
+    return interaction.update({ embeds: [makeEmbed(config.EMBED_COLORS.info, 'Recent Shop Purchases', description.slice(0, 4000))], components: economyStaffComponents() });
+  }
+  if (action === 'transactions') {
+    const rows = getEconomyTransactions(ctx.db, null, 15);
+    const description = rows.length
+      ? rows.map((row) => {
+        let note = '';
+        try { note = JSON.parse(row.metadata_json).description || ''; } catch {}
+        return `**${row.type.replaceAll('_', ' ')}** • ${formatCurrency(row.amount, getEconomySettings(ctx.db).currencyName)}\n<@${row.user_id}>${note ? ` • ${note}` : ''} • <t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:R>`;
+      }).join('\n\n')
+      : 'No economy transactions have been recorded.';
+    return interaction.update({ embeds: [makeEmbed(config.EMBED_COLORS.info, 'Recent Economy Transactions', description.slice(0, 4000))], components: economyStaffComponents() });
+  }
   return interaction.reply({ content: 'Unknown economy management action.', ephemeral: true });
 }
 
@@ -1415,19 +1554,22 @@ async function handleEconomyManagementSelect(interaction, ctx) {
         new ButtonBuilder().setCustomId(`gv:economy:staff:product:edit:${item.id}`).setLabel('Edit').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`gv:economy:staff:product:toggle:${item.id}`).setLabel(item.enabled ? 'Disable' : 'Enable').setStyle(item.enabled ? ButtonStyle.Secondary : ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`gv:economy:staff:product:remove:${item.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`gv:economy:staff:product:image:${item.id}`).setLabel('Image').setStyle(ButtonStyle.Secondary),
       ),
       new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('gv:economy:staff:products').setLabel('Back to Products').setStyle(ButtonStyle.Secondary)),
     ],
   });
 }
 
-async function handleEconomyLeaderboard(interaction, ctx) {
-  const rows = getEconomyLeaderboard(ctx.db, 10);
+async function handleEconomyLeaderboard(interaction, ctx, ranking = 'wealth') {
+  const rows = getEconomyLeaderboard(ctx.db, 10, ranking);
   const currency = getEconomySettings(ctx.db).currencyName;
+  const labels = { wealth: 'Total', wallet: 'Wallet balance', bank: 'Bank balance', earnings: 'Lifetime earnings' };
+  const metric = { wealth: (row) => row.wallet_balance + row.bank_balance, wallet: (row) => row.wallet_balance, bank: (row) => row.bank_balance, earnings: (row) => row.lifetime_earnings }[ranking];
   const description = rows.length
-    ? rows.map((row, index) => `${index + 1}. <@${row.user_id}> • Total ${formatCurrency(row.wallet_balance + row.bank_balance, currency)} (wallet ${formatCurrency(row.wallet_balance, currency)} • bank ${formatCurrency(row.bank_balance, currency)})`).join('\n')
+    ? rows.map((row, index) => `${index + 1}. <@${row.user_id}> • ${labels[ranking]} ${formatCurrency(metric(row), currency)}${ranking === 'wealth' ? ` (wallet ${formatCurrency(row.wallet_balance, currency)} • bank ${formatCurrency(row.bank_balance, currency)})` : ''}`).join('\n')
     : 'No economy accounts have been created yet.';
-  return interaction.reply({ embeds: [makeEmbed(getEconomySettings(ctx.db).panelColor, '🏆 Economy Leaderboard', description.slice(0, 4000))], ephemeral: true });
+  return interaction.reply({ embeds: [makeEmbed(getEconomySettings(ctx.db).panelColor, `🏆 Economy Leaderboard • ${labels[ranking]}`, description.slice(0, 4000))], ephemeral: true });
 }
 
 async function handleEconomyAdmin(interaction, ctx) {
@@ -1460,7 +1602,7 @@ async function handleEconomyCommand(interaction, ctx) {
   if (action === 'deposit' || action === 'withdraw' || action === 'transfer') return handleBankCommand(interaction, ctx);
   if (action === 'shop' || action === 'inventory' || action === 'history' || action === 'purchase'
     || action.startsWith('item-') || action === 'manage') return handleShopCommand(interaction, ctx);
-  if (action === 'leaderboard') return handleEconomyLeaderboard(interaction, ctx);
+  if (action === 'leaderboard') return handleEconomyLeaderboard(interaction, ctx, interaction.options.getString?.('ranking') ?? 'wealth');
   if (action === 'transactions') return handleEconomyTransactions(interaction, ctx);
   if (action === 'admin') return handleEconomyAdmin(interaction, ctx);
   if (action === 'blackjack') return startBlackjackInteraction(interaction, ctx, interaction.options.getInteger('bet', true));
@@ -1472,6 +1614,75 @@ async function handleEconomyCommand(interaction, ctx) {
 }
 
 async function handleEconomyModal(interaction, ctx) {
+  if (interaction.customId === 'gv:economy:modal:staff-drop') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const settings = getEconomySettings(ctx.db);
+    if (!validId(settings.cashDropChannelId)) {
+      return interaction.reply({ content: 'Configure the cash drop channel with `/economy configure drop-channel:<channel>` first.', ephemeral: true });
+    }
+    const amount = Number(interaction.fields.getTextInputValue('amount').trim());
+    const maxClaims = Number(interaction.fields.getTextInputValue('claims').trim());
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1_000_000_000
+      || !Number.isSafeInteger(maxClaims) || maxClaims < 1 || maxClaims > 100) {
+      return interaction.reply({ content: 'Amount must be 1–1,000,000,000 and claimants must be 1–100.', ephemeral: true });
+    }
+    const drop = createManualEconomyCashDrop(ctx.db, {
+      channelId: settings.cashDropChannelId,
+      amount,
+      maxClaims,
+      lifetimeMinutes: settings.cashDropLifetimeMinutes,
+      actorId: interaction.user.id,
+    });
+    const posted = await postPendingCashDrop(interaction.client, ctx.db, drop, new Date());
+    return interaction.reply({
+      content: posted.posted
+        ? `Manual cash drop posted in <#${drop.channel_id}> for ${formatCurrency(amount, settings.currencyName)} per player (${maxClaims} claimants).`
+        : `Manual cash drop saved as pending. It will be retried by the scheduled worker; check the channel and bot permissions.`,
+      ephemeral: true,
+    });
+  }
+  const imageModal = interaction.customId.match(/^gv:economy:modal:staff-product-image:([a-f0-9-]{36})$/);
+  if (imageModal) {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const imageUrl = interaction.fields.getTextInputValue('image').trim();
+    try {
+      const result = editShopItem(ctx.db, imageModal[1], { imageUrl: imageUrl || null }, interaction.user.id);
+      return interaction.reply({ content: result.updated ? `Image ${imageUrl ? 'saved' : 'removed'} for **${result.item.name}**.` : 'That product no longer exists.', ephemeral: true });
+    } catch (error) {
+      return interaction.reply({ content: error.message, ephemeral: true });
+    }
+  }
+  if (interaction.customId === 'gv:economy:modal:staff-delivery-settings') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    const current = getEconomySettings(ctx.db);
+    const fields = [
+      ['game-max-bet', 'ECONOMY_GAME_MAX_BET', 'maximumBet', current.maximumBet],
+      ['delivery-min', 'ECONOMY_DELIVERY_MIN_REWARD', 'deliveryMinimumReward', current.deliveryMinimumReward],
+      ['delivery-max', 'ECONOMY_DELIVERY_MAX_REWARD', 'deliveryMaximumReward', current.deliveryMaximumReward],
+      ['delivery-cooldown', 'ECONOMY_DELIVERY_COOLDOWN_MINUTES', 'deliveryCooldownMinutes', current.deliveryCooldownMinutes],
+    ];
+    const next = { ...current };
+    const changes = [];
+    for (const [field, key, setting, fallback] of fields) {
+      const raw = String(interaction.fields.getTextInputValue(field) ?? '').trim();
+      if (!raw) continue;
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value)) return interaction.reply({ content: `${field} must be a whole number.`, ephemeral: true });
+      next[setting] = value;
+      if (value !== fallback) changes.push([key, value]);
+    }
+    const invalid = validateDeliverySettings(next);
+    if (invalid) return interaction.reply({ content: invalid, ephemeral: true });
+    if (!Number.isSafeInteger(next.maximumBet) || next.maximumBet < 1 || next.maximumBet > 1_000_000_000) {
+      return interaction.reply({ content: 'Maximum game wager must be from 1 to 1,000,000,000.', ephemeral: true });
+    }
+    if (!changes.length) return interaction.reply({ content: 'No game settings were changed.', ephemeral: true });
+    ctx.db.transaction(() => {
+      for (const [key, value] of changes) setConfigValue(ctx.db, key, value);
+      recordEconomyAudit(ctx.db, { actorId: interaction.user.id, action: 'delivery_settings_updated', newValue: JSON.stringify(Object.fromEntries(changes)) });
+    })();
+    return interaction.reply({ content: 'Game wager and Delivery Rush settings were saved.', ephemeral: true });
+  }
   if (interaction.customId === 'gv:economy:modal:staff-work-rewards') {
     if (!await ensureManagement(interaction, ctx.db)) return;
     const current = getEconomySettings(ctx.db);
@@ -1576,8 +1787,9 @@ async function handleEconomyModal(interaction, ctx) {
   const gameMatch = interaction.customId.match(/^gv:economy:modal:game:(blackjack|coinflip|roulette|chicken)$/);
   if (gameMatch) {
     const bet = Number(interaction.fields.getTextInputValue('bet'));
-    if (!Number.isSafeInteger(bet) || bet < 1 || bet > 1_000_000_000) {
-      return interaction.reply({ content: 'Enter a whole-number wager from 1 to 1,000,000,000.', ephemeral: true });
+    const maximumBet = getEconomySettings(ctx.db).maximumBet;
+    if (!Number.isSafeInteger(bet) || bet < 1 || bet > maximumBet) {
+      return interaction.reply({ content: `Enter a whole-number wager from 1 to ${maximumBet.toLocaleString('en-US')}.`, ephemeral: true });
     }
     if (gameMatch[1] === 'blackjack') return startBlackjackInteraction(interaction, ctx, bet);
     if (gameMatch[1] === 'chicken') return startChickenInteraction(interaction, ctx, bet);
@@ -1636,9 +1848,24 @@ async function handleEconomyButton(interaction, ctx) {
     delete payload.ephemeral;
     return interaction.update(payload);
   }
+  const shopView = interaction.customId.match(/^gv:economy:shop:view:([a-f0-9-]{36})$/);
+  if (shopView) {
+    const item = ctx.db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0 AND enabled = 1 AND stock > 0').get(shopView[1]);
+    if (!item) return interaction.reply({ content: 'That product is no longer available.', ephemeral: true });
+    const settings = getEconomySettings(ctx.db);
+    const embed = makeEmbed(settings.shopColor, item.name,
+      `${item.description || 'No description'}\n\n**Price:** ${formatCurrency(item.price, settings.currencyName)}\n**Category:** ${item.category}\n**Stock:** ${item.stock}${item.purchase_limit ? `\n**Purchase limit:** ${item.purchase_limit}` : ''}`);
+    if (item.image_url) embed.setImage(item.image_url);
+    return interaction.reply({
+      embeds: [embed],
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+        .setCustomId(`gv:economy:shop:buy:${item.id}`).setLabel(`Buy ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Success))],
+      ephemeral: true,
+    });
+  }
   const shopBuy = interaction.customId.match(/^gv:economy:shop:buy:([a-f0-9-]{36})$/);
   if (shopBuy) {
-    const result = purchaseShopItem(ctx.db, interaction.user.id, shopBuy[1]);
+    const result = purchaseShopItem(ctx.db, interaction.user.id, shopBuy[1], 1, new Date().toISOString(), interaction.id);
     if (!result.purchased) {
       const reasons = { missing: 'That item is no longer available.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough combined wallet and bank funds.', limit: 'You have reached the purchase limit for that item.' };
       return interaction.reply({ content: reasons[result.reason] ?? 'Purchase could not be completed.', ephemeral: true });
@@ -1692,6 +1919,7 @@ module.exports = {
   listShopItems,
   makeDeliveryGameComponents,
   processEconomyCashDrops,
+  createManualEconomyCashDrop,
   recordEconomyAudit,
   purchaseShopItem,
   removeShopItem,

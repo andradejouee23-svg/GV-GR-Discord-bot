@@ -20,6 +20,7 @@ const panelDefinitions = {
   economy: { label: 'Economy Panel', title: '💰 GV GR | ECONOMY', description: 'Manage your virtual roleplay money from one place.', color: '#1F7AE0' },
   shop: { label: 'Economy Shop', title: '🛍️ GV GR Shop', description: 'Browse available GV GR products.', color: '#9B5DE5' },
   townjobs: { label: 'Town Jobs Panel', title: 'GV GR | TOWN JOBS', description: 'Choose a Town Job below.', color: '#8B63C7' },
+  vehicle: { label: 'Vehicle Registration Panel', title: '🚘 GV GR VEHICLE REGISTRATION', description: 'Register your roleplay vehicle before driving it in Greenville. Applications are reviewed by GV GR staff.', color: '#36A765' },
   welcome: { label: 'Welcome Messages', title: 'WELCOME TO GV GR!', description: 'Welcome to Greenville RP. We are glad you are here.', color: '#36A765' },
   blacklist: { label: 'Blacklist Management', title: '🛡️ GV GR • BLACKLIST MANAGEMENT', description: 'Manage saved blacklist records and appeals.', color: '#8B63C7' },
   tempadmin: { label: 'Temporary Admin Applications', title: 'Temporary Admin Application', description: 'Apply for temporary GV GR administration.', color: '#8B63C7' },
@@ -140,10 +141,12 @@ function editorPreview(draft) {
   const embed = makeEmbed(color ?? config.EMBED_COLORS.info, `Preview • ${data.title}`, data.description || ' ');
   if (data.authorText) embed.setAuthor({ name: data.authorText });
   if (data.footerText) embed.setFooter({ text: data.footerText });
-  if (data.headerImageUrl) embed.addFields({ name: 'Header image', value: 'Will be posted as a separate image message immediately above the refreshed panel.' });
   if (data.fields?.length) embed.addFields(...data.fields.slice(0, 10).map((field) => ({ name: field.name, value: field.value, inline: Boolean(field.inline) })));
   if (data.buttonLabels?.length) embed.addFields({ name: 'Button labels', value: data.buttonLabels.map((button, index) => `${index + 1}. ${button.label || '(unchanged)'}`).join('\n').slice(0, 1000) });
-  return { embeds: [embed], components: editorButtons(draft) };
+  const embeds = data.headerImageUrl && isHttpsUrl(data.headerImageUrl)
+    ? [new EmbedBuilder().setColor(color ?? config.EMBED_COLORS.info).setImage(data.headerImageUrl), embed]
+    : [embed];
+  return { embeds, components: editorButtons(draft) };
 }
 
 function textModal(draft) {
@@ -179,6 +182,7 @@ function panelTarget(db, key) {
     staff: ['STAFF_ACTIVITY_CHANNEL_ID', 'panel_message'],
     economy: ['ECONOMY_PANEL_MESSAGE_CHANNEL_ID', 'ECONOMY_PANEL_MESSAGE_ID'],
     townjobs: ['TOWN_JOBS_PANEL_CHANNEL_ID', 'TOWN_JOBS_PANEL_MESSAGE_ID'],
+    vehicle: ['VEHICLE_REGISTRATION_CHANNEL_ID', 'vehicle_panel_message_id'],
     blacklist: ['BLACKLIST_PANEL_CHANNEL_ID', 'BLACKLIST_PANEL_MESSAGE_ID'],
     tempadmin: ['TEMP_ADMIN_APPLICATION_CHANNEL_ID', 'TEMP_ADMIN_APPLICATION_MESSAGE_ID'],
     forms: ['TEMP_ADMIN_APPLICATION_CHANNEL_ID', 'TEMP_ADMIN_APPLICATION_MESSAGE_ID'],
@@ -244,6 +248,10 @@ async function renderPanelPayload(db, key, client) {
     const settings = townjobs.getTownJobsSettings(db);
     embed = townjobs.makeJobEmbed(settings);
     components = townjobs.makeJobComponents(settings.options);
+  } else if (key === 'vehicle') {
+    const vehicles = require('./vehicles');
+    embed = vehicles.vehiclePanelEmbed();
+    components = vehicles.vehiclePanelComponents();
   } else if (key === 'blacklist') {
     const blacklist = require('./blacklist');
     embed = blacklist.panelEmbed(db);

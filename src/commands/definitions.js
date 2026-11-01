@@ -288,6 +288,7 @@ const commands = [
       .addIntegerOption((option) => option.setName('delivery-minimum').setDescription('Minimum Delivery Rush reward').setMinValue(1).setMaxValue(1000000))
       .addIntegerOption((option) => option.setName('delivery-maximum').setDescription('Maximum Delivery Rush reward').setMinValue(1).setMaxValue(1000000))
       .addIntegerOption((option) => option.setName('delivery-cooldown-minutes').setDescription('Delivery Rush cooldown').setMinValue(1).setMaxValue(10080))
+      .addIntegerOption((option) => option.setName('maximum-bet').setDescription('Maximum wager allowed in economy games').setMinValue(1).setMaxValue(1000000000))
       .addBooleanOption((option) => option.setName('drop-enabled').setDescription('Enable or disable automatic cash drops'))
       .addIntegerOption((option) => option.setName('drop-amount').setDescription('Cash drop amount per player').setMinValue(1).setMaxValue(1000000000))
       .addIntegerOption((option) => option.setName('drop-claims').setDescription('Maximum players per drop').setMinValue(1).setMaxValue(100))
@@ -312,7 +313,14 @@ const commands = [
     .addSubcommand((subcommand) => subcommand.setName('purchase').setDescription('Purchase a shop item by ID.')
       .addStringOption((option) => option.setName('item-id').setDescription('Item ID shown in the shop').setRequired(true))
       .addIntegerOption((option) => option.setName('quantity').setDescription('Quantity').setMinValue(1).setMaxValue(100)))
-    .addSubcommand((subcommand) => subcommand.setName('leaderboard').setDescription('View the richest GV GR players.'))
+    .addSubcommand((subcommand) => subcommand.setName('leaderboard').setDescription('Rank players by wallet, bank, total wealth, or lifetime earnings.')
+      .addStringOption((option) => option.setName('ranking').setDescription('Balance or earnings to rank').setRequired(false)
+        .addChoices(
+          { name: 'Total wealth', value: 'wealth' },
+          { name: 'Wallet balance', value: 'wallet' },
+          { name: 'Bank balance', value: 'bank' },
+          { name: 'Lifetime earnings', value: 'earnings' },
+        )))
     .addSubcommand((subcommand) => subcommand.setName('transactions').setDescription('View your recent economy transactions.')
       .addUserOption((option) => option.setName('member').setDescription('Player (management only)')))
     .addSubcommand((subcommand) => subcommand.setName('admin').setDescription('Adjust a player wallet balance (management).')

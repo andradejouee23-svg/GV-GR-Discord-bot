@@ -45,8 +45,9 @@ function memberSalaryRoles(member, eligibleRoles) {
 
 function initializeEligibleSchedule(db, userId, nowIso, roles, policy) {
   return db.transaction(() => {
-    db.prepare('INSERT INTO economy_accounts (user_id, created_at) VALUES (?, ?) ON CONFLICT(user_id) DO NOTHING')
-      .run(userId, nowIso);
+    const startingBalance = Number(getConfigValue(db, 'ECONOMY_STARTING_BALANCE') ?? config.ECONOMY_STARTING_BALANCE ?? 0);
+    db.prepare('INSERT INTO economy_accounts (user_id, wallet_balance, created_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO NOTHING')
+      .run(userId, startingBalance, nowIso);
     const result = db.prepare(`
       INSERT INTO economy_salary_schedules (user_id, next_due_at, last_role_ids_json, last_policy)
       VALUES (?, ?, ?, ?)

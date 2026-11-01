@@ -30,6 +30,7 @@ function createPanelComponents() {
       .setEmoji('📣')
       .setStyle(ButtonStyle.Primary)),
     new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gv:session_panel:quick-start').setLabel('Quick Start Session').setEmoji('⚡').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:session_panel:start').setLabel('Start RP Session').setEmoji('🎙️').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:session_panel:end').setLabel('End Session').setEmoji('🏁').setStyle(ButtonStyle.Danger),
     ),

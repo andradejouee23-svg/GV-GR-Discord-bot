@@ -5,6 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { createDatabase } = require('../src/database');
 const { getWallet } = require('../src/commands/economy');
+const { setConfigValue } = require('../src/utils/discord');
 const {
   beginBlackjack,
   playCoinFlip,
@@ -66,6 +67,16 @@ test('coin flip and roulette apply their documented payouts and standard wheel c
   const green = playRoulette(store.db, 'casino-player', 100, 'green', now, () => 0);
   assert.equal(green.payout, 3600);
   assert.equal(getWallet(store.db, 'casino-player').wallet_balance, 4700);
+});
+
+test('configured maximum wager is enforced before game funds are moved', (t) => {
+  const store = makeStore(t);
+  setWallet(store.db, 'limited-player', 1000);
+  setConfigValue(store.db, 'ECONOMY_GAME_MAX_BET', 50);
+  assert.throws(() => beginBlackjack(store.db, 'limited-player', 51), /whole number from 1 to 50/);
+  assert.equal(getWallet(store.db, 'limited-player').wallet_balance, 1000);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_games').get().count, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_transactions').get().count, 0);
 });
 
 test('Chicken Road supports progressive cashout, rejects repeat settlement, and expires old sessions', (t) => {

@@ -129,6 +129,17 @@ async function publishSessionAnnouncement(interaction, ctx, host, name, descript
 }
 
 async function handleSessionPanelButton(interaction, ctx) {
+  if (interaction.customId === 'gv:session_panel:quick-start') {
+    const host = await fetchGuildMember(interaction.guild, interaction.user.id);
+    if (!host || !getStaffRoleName(host, ctx.db)) {
+      return interaction.reply({ content: 'Starting a GV GR session is available to configured staff members only.', ephemeral: true });
+    }
+    if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) {
+      return interaction.reply({ content: 'An RP session is already active. End it before starting another.', ephemeral: true });
+    }
+    return publishSessionAnnouncement(interaction, ctx, host, 'Greenville RP Session',
+      'A new Greenville RP session is now live. Staff can join using the button below.');
+  }
   if (interaction.customId === 'gv:session_panel:start') {
     const host = await fetchGuildMember(interaction.guild, interaction.user.id);
     if (!host || !getStaffRoleName(host, ctx.db)) {

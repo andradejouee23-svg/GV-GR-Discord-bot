@@ -10,6 +10,7 @@ const {
   claimDailyReward,
   claimEconomyCashDrop,
   claimWorkReward,
+  createManualEconomyCashDrop,
   createShopItem,
   depositToBank,
   editShopItem,
@@ -116,9 +117,13 @@ test('new accounts begin with the default balance and support daily reward, bank
   assert.equal(deposited.bankAfter, 150);
 
   const recipient = getWallet(store.db, 'recipient-user', '2026-11-01T21:00:00.000Z');
-  const transferred = transferToPlayer(store.db, 'starter-user', 'recipient-user', 50, 'thanks', '2026-11-01T21:05:00.000Z');
+  const transferred = transferToPlayer(store.db, 'starter-user', 'recipient-user', 50, 'thanks', '2026-11-01T21:05:00.000Z', 'transfer-request-1');
   assert.equal(transferred.sender.wallet_balance, deposited.walletAfter - 50);
   assert.equal(transferred.recipient.wallet_balance, recipient.wallet_balance + 50);
+  const repeatedTransfer = transferToPlayer(store.db, 'starter-user', 'recipient-user', 50, 'thanks', '2026-11-01T21:05:00.000Z', 'transfer-request-1');
+  assert.equal(repeatedTransfer.duplicate, true);
+  assert.equal(repeatedTransfer.sender.wallet_balance, transferred.sender.wallet_balance);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'player_transfer'").get().count, 1);
 
   const withdrew = withdrawFromBank(store.db, 'starter-user', 25, 'withdraw-test', '2026-11-01T21:10:00.000Z');
   assert.equal(withdrew.walletAfter, transferred.sender.wallet_balance + 25);
@@ -126,13 +131,51 @@ test('new accounts begin with the default balance and support daily reward, bank
   const itemId = createShopItem(store.db, { name: 'Coffee', description: 'Warm drink', price: 120, stock: 3, category: 'Food', imageUrl: 'https://example.com/coffee.png', enabled: true, purchaseLimit: 2 }, 'admin-1');
   assert.ok(itemId);
   assert.equal(editShopItem(store.db, itemId, { price: 100 }, 'admin-1').updated, true);
-  const purchase = purchaseShopItem(store.db, 'starter-user', itemId, 1, '2026-11-01T21:30:00.000Z');
+  const purchase = purchaseShopItem(store.db, 'starter-user', itemId, 1, '2026-11-01T21:30:00.000Z', 'purchase-request-1');
   assert.equal(purchase.purchased, true);
+  const repeatedPurchase = purchaseShopItem(store.db, 'starter-user', itemId, 1, '2026-11-01T21:30:00.000Z', 'purchase-request-1');
+  assert.equal(repeatedPurchase.duplicate, true);
+  assert.equal(store.db.prepare('SELECT stock FROM economy_shop_items WHERE id = ?').get(itemId).stock, 2);
   assert.equal(store.db.prepare('SELECT quantity FROM economy_inventory WHERE user_id = ? AND item_id = ?').get('starter-user', itemId).quantity, 1);
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'shop_purchase'").get().count, 1);
   assert.equal(removeShopItem(store.db, itemId, 'admin-1').removed, true);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_shop_items WHERE id = ? AND deleted = 0').get(itemId).count, 0);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_purchase_history WHERE item_id = ?').get(itemId).count, 1);
+});
+
+test('default Town Job and vehicle exception review products are visible, purchasable, and seeded once', async (t) => {
+  const store = makeTempDatabase(t);
+  const ids = [
+    '00000000-0000-4000-8000-000000000001',
+    '00000000-0000-4000-8000-000000000002',
+  ];
+  const items = store.db.prepare('SELECT * FROM economy_shop_items WHERE id IN (?, ?) ORDER BY id').all(...ids);
+  assert.equal(items.length, 2);
+  assert.match(items[0].name, /Town Job Upgrade Request/);
+  assert.match(items[0].description, /staff approval is required/i);
+  assert.match(items[1].name, /Blacklisted Vehicle Exception Review/);
+  assert.match(items[1].description, /does not bypass blacklist status/i);
+
+  const account = getWallet(store.db, 'catalog-player');
+  store.db.prepare('UPDATE economy_accounts SET wallet_balance = 2000 WHERE user_id = ?').run(account.user_id);
+  const env = createPanelEnvironment(store.db);
+  const listing = await handleEconomyCommand(env.interaction('shop', {}, account.user_id), { db: store.db });
+  assert.match(listing.embeds[0].data.description, /Town Job Upgrade Request/);
+  assert.match(listing.embeds[0].data.description, /Blacklisted Vehicle Exception Review/);
+  const buyId = listing.components.flatMap((row) => row.components)
+    .find((button) => button.data.custom_id === `gv:economy:shop:buy:${ids[0]}`).data.custom_id;
+  let purchaseReply;
+  await handleButton({
+    customId: buyId,
+    user: { id: account.user_id },
+    reply: async (payload) => { purchaseReply = payload; return payload; },
+  }, { db: store.db });
+  assert.match(purchaseReply.content, /Purchase complete/);
+  assert.equal(store.db.prepare('SELECT quantity FROM economy_inventory WHERE user_id = ? AND item_id = ?').get(account.user_id, ids[0]).quantity, 1);
+
+  const reopened = store.reopen();
+  assert.equal(reopened.prepare('SELECT COUNT(*) AS count FROM economy_shop_items WHERE id IN (?, ?)').get(...ids).count, 2);
+  assert.equal(reopened.prepare('SELECT stock FROM economy_shop_items WHERE id = ?').get(ids[0]).stock, 99);
 });
 
 test('cash drops recover pending posts after restart, follow persisted intervals, and pay each player once', async (t) => {
@@ -190,14 +233,20 @@ test('cash drops recover pending posts after restart, follow persisted intervals
 test('Discord shop, bank, inventory, and transaction controls reach their persisted handlers', async (t) => {
   const store = makeTempDatabase(t);
   const env = createPanelEnvironment(store.db);
-  const itemId = createShopItem(store.db, { name: 'GV Hoodie', description: 'Community merch', price: 75, stock: 2 }, managerId);
+  const itemId = createShopItem(store.db, { name: 'GV Hoodie', description: 'Community merch', price: 75, stock: 2, imageUrl: 'https://example.com/hoodie.png' }, managerId);
   const account = getWallet(store.db, 'economy-player');
   store.db.prepare('UPDATE economy_accounts SET wallet_balance = 300 WHERE user_id = ?').run(account.user_id);
 
   const shop = await handleEconomyCommand(env.interaction('shop', {}, 'economy-player'), { db: store.db });
   assert.equal(shop.ephemeral, true);
   assert.match(shop.embeds[0].data.description, /GV Hoodie/);
-  const buyId = shop.components[0].components[0].data.custom_id;
+  const viewId = shop.components[0].components[0].data.custom_id;
+  assert.equal(viewId, `gv:economy:shop:view:${itemId}`);
+  let detailReply;
+  await handleButton({ customId: viewId, user: { id: 'economy-player' }, reply: async (payload) => { detailReply = payload; return payload; } }, { db: store.db });
+  assert.match(detailReply.embeds[0].data.description, /Community merch/);
+  assert.equal(detailReply.embeds[0].data.image.url, 'https://example.com/hoodie.png');
+  const buyId = shop.components[0].components[1].data.custom_id;
   assert.equal(buyId, `gv:economy:shop:buy:${itemId}`);
   let buyReply;
   await handleButton({ customId: buyId, user: { id: 'economy-player' }, reply: async (payload) => { buyReply = payload; return payload; } }, { db: store.db });
@@ -225,6 +274,11 @@ test('Discord shop, bank, inventory, and transaction controls reach their persis
   }, { db: store.db });
   assert.match(modalReply.content, /Deposited 100 GV Credits/);
   assert.equal(getWallet(store.db, 'economy-player').bank_balance, 100);
+  const invalidDeposit = await handleEconomyCommand(env.interaction('deposit', {
+    getInteger: () => 10000,
+    getString: () => null,
+  }, 'economy-player'), { db: store.db });
+  assert.match(invalidDeposit.content, /not have enough wallet cash/);
 });
 
 test('economy leaderboard ranks combined wallet and bank wealth and is available from Discord', async (t) => {
@@ -235,9 +289,18 @@ test('economy leaderboard ranks combined wallet and bank wealth and is available
   }
   const rows = getEconomyLeaderboard(store.db);
   assert.equal(rows[0].user_id, 'bank-rich');
+  assert.equal(getEconomyLeaderboard(store.db, 10, 'wallet')[0].user_id, 'wallet-rich');
+  assert.equal(getEconomyLeaderboard(store.db, 10, 'bank')[0].user_id, 'bank-rich');
+  store.db.prepare('UPDATE economy_accounts SET lifetime_earnings = ? WHERE user_id = ?').run(300, 'wallet-rich');
+  store.db.prepare('UPDATE economy_accounts SET lifetime_earnings = ? WHERE user_id = ?').run(500, 'bank-rich');
+  assert.equal(getEconomyLeaderboard(store.db, 10, 'earnings')[0].user_id, 'bank-rich');
+  assert.throws(() => getEconomyLeaderboard(store.db, 10, 'invalid'), /Choose wealth, wallet, bank, or earnings/);
   const env = createPanelEnvironment(store.db);
   const leaderboard = await handleEconomyCommand(env.interaction('leaderboard', {}, 'economy-player'), { db: store.db });
   assert.match(leaderboard.embeds[0].data.description, /<@bank-rich>.*Total 2,600 GV Credits/);
+  const walletLeaderboard = await handleEconomyCommand(env.interaction('leaderboard', { getString: () => 'wallet' }, 'economy-player'), { db: store.db });
+  assert.match(walletLeaderboard.embeds[0].data.title, /Wallet balance/);
+  assert.match(walletLeaderboard.embeds[0].data.description, /<@wallet-rich>.*Wallet balance 900 GV Credits/);
 });
 
 test('economy game slash commands and decision buttons connect to persistent game state', async (t) => {
@@ -386,6 +449,25 @@ test('management dashboard exposes economy controls and persists settings, adjus
     reply: async (payload) => payload,
   }, { db: store.db });
   assert.match(selectedProduct.embeds[0].data.description, /Community hoodie/);
+  const imageId = selectedProduct.components[0].components[3].data.custom_id;
+  let imageModal;
+  await handleEconomyManagementButton({
+    customId: imageId,
+    guild: env.guild,
+    user: { id: managerId },
+    showModal: async (modal) => { imageModal = modal; },
+    reply: async (payload) => payload,
+  }, { db: store.db });
+  assert.equal(imageModal.data.custom_id, `gv:economy:modal:staff-product-image:${createdItem.id}`);
+  const imageReply = await handleEconomyModal({
+    customId: imageModal.data.custom_id,
+    guild: env.guild,
+    user: { id: managerId },
+    fields: { getTextInputValue: () => 'https://example.com/product.png' },
+    reply: async (payload) => payload,
+  }, { db: store.db });
+  assert.match(imageReply.content, /Image saved/);
+  assert.equal(store.db.prepare('SELECT image_url FROM economy_shop_items WHERE id = ?').get(createdItem.id).image_url, 'https://example.com/product.png');
   let editProductModal;
   await handleEconomyManagementButton({
     customId: selectedProduct.components[0].components[0].data.custom_id,
@@ -439,12 +521,102 @@ test('management dashboard exposes economy controls and persists settings, adjus
   }), { db: store.db });
   assert.match(commandAdjustment.content, /Updated <@1666064708795306158>/);
   assert.equal(getWallet(store.db, targetId).wallet_balance, 100);
-  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action LIKE 'economy_%'").get().count, 8);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action LIKE 'economy_%'").get().count, 9);
   const reopened = store.reopen();
   assert.equal(getEconomySettings(reopened).cashDropAmount, 400);
   assert.equal(getEconomySettings(reopened).minimumReward, 60);
   assert.equal(getEconomySettings(reopened).panelColor, 0x123abc);
   assert.equal(getEconomySettings(reopened).shopColor, 0xabcdef);
+});
+
+test('staff economy controls publish manual drops, recover pending drops, and review purchases and transactions', async (t) => {
+  const store = makeTempDatabase(t);
+  const env = createPanelEnvironment(store.db);
+  setConfigValue(store.db, 'ECONOMY_CASH_DROP_CHANNEL_ID', channelId);
+  const button = (customId) => ({
+    customId,
+    guild: env.guild,
+    user: { id: managerId },
+    update: async (payload) => payload,
+    reply: async (payload) => payload,
+  });
+
+  const manualModal = await handleEconomyManagementButton({
+    ...button('gv:economy:staff:manual-drop'),
+    showModal: async (modal) => modal,
+  }, { db: store.db });
+  assert.equal(manualModal.data.custom_id, 'gv:economy:modal:staff-drop');
+  const manualReply = await handleEconomyModal({
+    customId: manualModal.data.custom_id,
+    guild: env.guild,
+    client: env.client,
+    user: { id: managerId },
+    fields: { getTextInputValue: (key) => ({ amount: '450', claims: '3' })[key] },
+    reply: async (payload) => payload,
+  }, { db: store.db });
+  assert.match(manualReply.content, /Manual cash drop posted/);
+  const postedDrop = store.db.prepare('SELECT * FROM economy_cash_drops ORDER BY created_at DESC LIMIT 1').get();
+  assert.equal(postedDrop.status, 'open');
+  assert.equal(postedDrop.amount, 450);
+  assert.equal(postedDrop.max_claims, 3);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM settings WHERE key = 'ECONOMY_CASH_DROP_NEXT_AT'").get().count, 0);
+
+  const gameSettingsModal = await handleEconomyManagementButton({
+    ...button('gv:economy:staff:game-settings'),
+    showModal: async (modal) => modal,
+  }, { db: store.db });
+  const gameSettingsReply = await handleEconomyModal({
+    customId: gameSettingsModal.data.custom_id,
+    guild: env.guild,
+    user: { id: managerId },
+    fields: { getTextInputValue: (key) => ({ 'game-max-bet': '5000', 'delivery-min': '125', 'delivery-max': '275', 'delivery-cooldown': '40' })[key] },
+    reply: async (payload) => payload,
+  }, { db: store.db });
+  assert.match(gameSettingsReply.content, /Game wager and Delivery Rush/);
+  assert.equal(getEconomySettings(store.db).maximumBet, 5000);
+  assert.equal(getEconomySettings(store.db).deliveryMinimumReward, 125);
+  assert.equal(getEconomySettings(store.db).deliveryMaximumReward, 275);
+  assert.equal(getEconomySettings(store.db).deliveryCooldownMinutes, 40);
+
+  const productId = createShopItem(store.db, { name: 'Review Item', price: 40, stock: 2 }, managerId);
+  const player = getWallet(store.db, 'purchase-review-player');
+  store.db.prepare('UPDATE economy_accounts SET wallet_balance = 100 WHERE user_id = ?').run(player.user_id);
+  purchaseShopItem(store.db, player.user_id, productId, 1, '2026-11-01T12:05:00.000Z');
+  const purchases = await handleEconomyManagementButton(button('gv:economy:staff:purchases'), { db: store.db });
+  assert.match(purchases.embeds[0].data.description, /Review Item/);
+  assert.match(purchases.embeds[0].data.description, /purchase-review-player/);
+  const transactions = await handleEconomyManagementButton(button('gv:economy:staff:transactions'), { db: store.db });
+  assert.match(transactions.embeds[0].data.description, /shop purchase/);
+  const dropHistory = await handleEconomyManagementButton(button('gv:economy:staff:drop-history'), { db: store.db });
+  assert.match(dropHistory.embeds[0].data.description, /450 GV Credits.*0\/3 claimed.*open/);
+
+  const pending = createManualEconomyCashDrop(store.db, {
+    channelId,
+    amount: 125,
+    maxClaims: 2,
+    lifetimeMinutes: 10,
+    actorId: managerId,
+  }, new Date('2026-11-01T12:10:00.000Z'));
+  setConfigValue(store.db, 'ECONOMY_CASH_DROPS_ENABLED', false);
+  const reopened = store.reopen();
+  const recoveryClient = { channels: { fetch: async () => ({
+    isTextBased: () => true,
+    send: async () => ({ id: 'recovered-manual-drop' }),
+  }) } };
+  const recovered = await processEconomyCashDrops(recoveryClient, reopened, new Date('2026-11-01T12:11:00.000Z'));
+  assert.equal(recovered.posted, true);
+  assert.equal(reopened.prepare('SELECT status FROM economy_cash_drops WHERE drop_id = ?').get(pending.drop_id).status, 'open');
+  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM settings WHERE key = 'ECONOMY_CASH_DROP_NEXT_AT'").get().count, 0);
+  const expiredPending = createManualEconomyCashDrop(reopened, {
+    channelId,
+    amount: 125,
+    maxClaims: 2,
+    lifetimeMinutes: 1,
+    actorId: managerId,
+  }, new Date('2026-11-01T12:00:00.000Z'));
+  const expiredRecovery = await processEconomyCashDrops(recoveryClient, reopened, new Date('2026-11-01T12:02:00.000Z'));
+  assert.equal(expiredRecovery.reason, 'disabled');
+  assert.equal(reopened.prepare('SELECT status FROM economy_cash_drops WHERE drop_id = ?').get(expiredPending.drop_id).status, 'expired');
 });
 
 test('wallet accounts are created lazily, use Discord IDs, and persist after reopen', (t) => {
@@ -466,14 +638,29 @@ test('wallet accounts are created lazily, use Discord IDs, and persist after reo
   assert.equal(reopened.prepare('SELECT COUNT(*) AS count FROM economy_accounts').get().count, 1);
 });
 
+test('a configured starting balance is awarded once even if account creation repeats', (t) => {
+  const store = makeTempDatabase(t);
+  setConfigValue(store.db, 'ECONOMY_STARTING_BALANCE', 250);
+  const first = getWallet(store.db, 'one-time-starter', '2026-10-31T12:00:00.000Z');
+  setConfigValue(store.db, 'ECONOMY_STARTING_BALANCE', 900);
+  const repeated = getWallet(store.db, 'one-time-starter', '2026-10-31T13:00:00.000Z');
+  assert.equal(first.wallet_balance, 250);
+  assert.equal(repeated.wallet_balance, 250);
+  assert.equal(repeated.created_at, '2026-10-31T12:00:00.000Z');
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_accounts WHERE user_id = ?').get('one-time-starter').count, 1);
+});
+
 test('economy schema upgrades legacy wallet rows additively without resetting balances', (t) => {
   const store = makeTempDatabase(t);
   getWallet(store.db, 'legacy-wallet', '2026-10-31T12:00:00.000Z');
   store.db.prepare('UPDATE economy_accounts SET wallet_balance = 4321 WHERE user_id = ?').run('legacy-wallet');
   store.db.exec('ALTER TABLE economy_accounts DROP COLUMN last_daily_reward_at');
+  store.db.exec('DROP INDEX economy_transactions_idempotency; ALTER TABLE economy_transactions DROP COLUMN idempotency_key;');
   const reopened = store.reopen();
   const columns = new Set(reopened.pragma('table_info(economy_accounts)').map((column) => column.name));
+  const transactionColumns = new Set(reopened.pragma('table_info(economy_transactions)').map((column) => column.name));
   assert.ok(columns.has('last_daily_reward_at'));
+  assert.ok(transactionColumns.has('idempotency_key'));
   assert.equal(getWallet(reopened, 'legacy-wallet').wallet_balance, 4321);
 });
 
@@ -517,12 +704,14 @@ test('management configures and updates one panel; Wallet and Work stay private'
       'delivery-minimum': 200,
       'delivery-maximum': 300,
       'delivery-cooldown-minutes': 45,
+      'maximum-bet': 7000,
     }[name] ?? null),
   });
   const configured = await handleEconomyCommand(configure, { db: store.db });
   assert.match(configured.content, /Updated Economy settings/);
   assert.equal(getEconomySettings(store.db).minimumReward, 75);
   assert.equal(getEconomySettings(store.db).deliveryMaximumReward, 300);
+  assert.equal(getEconomySettings(store.db).maximumBet, 7000);
 
   const panel = await handleEconomyCommand(env.interaction('panel', {}), { db: store.db });
   const refreshed = await handleEconomyCommand(env.interaction('panel', {}), { db: store.db });

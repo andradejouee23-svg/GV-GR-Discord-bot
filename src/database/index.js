@@ -258,7 +258,8 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       wallet_after INTEGER NOT NULL CHECK(wallet_after >= 0),
       bank_after INTEGER NOT NULL DEFAULT 0 CHECK(bank_after >= 0),
       created_at TEXT NOT NULL,
-      metadata_json TEXT NOT NULL DEFAULT '{}'
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      idempotency_key TEXT
     );
 
     CREATE INDEX IF NOT EXISTS economy_transactions_user_created
@@ -657,6 +658,15 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     db.exec('ALTER TABLE economy_accounts ADD COLUMN last_daily_reward_at TEXT');
   }
 
+  const transactionColumns = new Set(db.pragma('table_info(economy_transactions)').map((column) => column.name));
+  if (!transactionColumns.has('idempotency_key')) {
+    db.exec('ALTER TABLE economy_transactions ADD COLUMN idempotency_key TEXT');
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS economy_transactions_idempotency
+      ON economy_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL;
+  `);
+
   const shopColumns = new Set(db.pragma('table_info(economy_shop_items)').map((column) => column.name));
   if (!shopColumns.has('deleted')) {
     db.exec('ALTER TABLE economy_shop_items ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0, 1))');
@@ -687,6 +697,33 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     CREATE INDEX IF NOT EXISTS temporary_admin_trial_expiration
       ON temporary_admin_applications(status, expires_at, trial_reminder_sent_at);
   `);
+
+  const defaultShopItems = [
+    {
+      id: '00000000-0000-4000-8000-000000000001',
+      name: 'Town Job Upgrade Request',
+      description: 'Request management review for a higher-paying configured Town Job. Purchase does not grant a role or guarantee a raise; staff approval is required.',
+      price: 500,
+      category: 'Town Jobs',
+    },
+    {
+      id: '00000000-0000-4000-8000-000000000002',
+      name: 'Blacklisted Vehicle Exception Review',
+      description: 'Request management review for an exception related to a blacklisted vehicle. This purchase does not bypass blacklist status; approval is required.',
+      price: 750,
+      category: 'Vehicle Services',
+    },
+  ];
+  const seededAt = new Date().toISOString();
+  db.transaction(() => {
+    for (const item of defaultShopItems) {
+      db.prepare(`
+        INSERT INTO economy_shop_items (id, name, description, price, category, stock, enabled, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 100, 1, 'system', ?, ?)
+        ON CONFLICT(id) DO NOTHING
+      `).run(item.id, item.name, item.description, item.price, item.category, seededAt, seededAt);
+    }
+  })();
 
   return db;
 }

@@ -17,12 +17,18 @@ function recordTransaction(db, userId, type, amount, account, description, now) 
   `).run(randomUUID(), userId, type, amount, account.wallet_balance, account.bank_balance, now, JSON.stringify({ description }));
 }
 
-function validBet(bet) {
-  if (!Number.isSafeInteger(bet) || bet < 1 || bet > 1_000_000_000) throw new Error('Your bet must be a whole number from 1 to 1,000,000,000.');
+function validBet(db, bet) {
+  const maximumBet = Number(getConfigValue(db, 'ECONOMY_GAME_MAX_BET') ?? config.ECONOMY_GAME_MAX_BET ?? 1_000_000_000);
+  if (!Number.isSafeInteger(maximumBet) || maximumBet < 1 || maximumBet > 1_000_000_000) {
+    throw new Error('Economy game wager settings are invalid. Contact management.');
+  }
+  if (!Number.isSafeInteger(bet) || bet < 1 || bet > maximumBet) {
+    throw new Error(`Your bet must be a whole number from 1 to ${maximumBet.toLocaleString('en-US')}.`);
+  }
 }
 
 function beginGame(db, userId, gameType, bet, state, nowDate) {
-  validBet(bet);
+  validBet(db, bet);
   const now = nowDate.toISOString();
   return db.transaction(() => {
     db.prepare("UPDATE economy_games SET status = 'expired', resolved_at = ? WHERE user_id = ? AND status = 'active' AND expires_at <= ?")

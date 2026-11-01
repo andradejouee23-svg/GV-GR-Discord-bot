@@ -96,6 +96,7 @@ test('Town Jobs salaries start after 30 minutes and pay once per due schedule ac
   addSalary(db, roleA, 120);
   addSalary(db, roleB, 80);
   addSalary(db, staleRole, 999);
+  setConfigValue(db, 'ECONOMY_STARTING_BALANCE', 500);
   const member = makeMember('salary-player', [roleA, roleB, staleRole]);
   const guild = createGuild([member]);
   const client = { guilds: { cache: new Map([[config.SERVER_ID, guild]]) } };
@@ -109,14 +110,14 @@ test('Town Jobs salaries start after 30 minutes and pay once per due schedule ac
 
   assert.equal(await processTownJobsSalaries(client, db, new Date(start.getTime() + salaryIntervalMs - 1)), 0);
   assert.equal(await processTownJobsSalaries(client, db, new Date(start.getTime() + salaryIntervalMs)), 1);
-  assert.equal(db.prepare('SELECT wallet_balance FROM economy_accounts WHERE user_id = ?').get(member.id).wallet_balance, 120);
+  assert.equal(db.prepare('SELECT wallet_balance FROM economy_accounts WHERE user_id = ?').get(member.id).wallet_balance, 620);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'salary'").get().count, 1);
   assert.equal(await processTownJobsSalaries(client, db, new Date(start.getTime() + salaryIntervalMs)), 0);
 
   const reopened = store.reopen();
   assert.equal(await processTownJobsSalaries(client, reopened, new Date(start.getTime() + salaryIntervalMs + 1)), 0);
   assert.equal(await processTownJobsSalaries(client, reopened, new Date(start.getTime() + salaryIntervalMs * 2)), 1);
-  assert.equal(reopened.prepare('SELECT wallet_balance FROM economy_accounts WHERE user_id = ?').get(member.id).wallet_balance, 240);
+  assert.equal(reopened.prepare('SELECT wallet_balance FROM economy_accounts WHERE user_id = ?').get(member.id).wallet_balance, 740);
   assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'salary'").get().count, 2);
   const metadata = JSON.parse(reopened.prepare("SELECT metadata_json FROM economy_transactions WHERE type = 'salary' ORDER BY created_at DESC LIMIT 1").get().metadata_json);
   assert.equal(metadata.policy, 'highest');
