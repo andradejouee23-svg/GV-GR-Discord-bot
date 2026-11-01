@@ -58,6 +58,7 @@ function makeTempDatabase(t) {
 
 function createPanelEnvironment(db) {
   db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managementRoleId]));
+  setConfigValue(db, 'ECONOMY_MANAGEMENT_ROLE_ID', managementRoleId);
   const manager = { id: managerId, roles: { cache: new Map([[managementRoleId, { id: managementRoleId, name: 'Admin' }]]) } };
   const regularPlayer = { id: 'economy-player', roles: { cache: new Map() } };
   const guild = {
@@ -99,6 +100,7 @@ function createPanelEnvironment(db) {
 
 test('new accounts begin with the default balance and support daily reward, bank, and transfer flows', (t) => {
   const store = makeTempDatabase(t);
+  setConfigValue(store.db, 'ECONOMY_STARTING_BALANCE', 500);
   const settings = getEconomySettings(store.db);
   const starter = getWallet(store.db, 'starter-user', '2026-11-01T12:00:00.000Z');
   assert.equal(starter.wallet_balance, settings.startingBalance);
@@ -164,14 +166,57 @@ test('default Town Job and vehicle exception review products are visible, purcha
   assert.match(listing.embeds[0].data.description, /Blacklisted Vehicle Exception Review/);
   const buyId = listing.components.flatMap((row) => row.components)
     .find((button) => button.data.custom_id === `gv:economy:shop:buy:${ids[0]}`).data.custom_id;
-  let purchaseReply;
+  let purchasePrompt;
   await handleButton({
     customId: buyId,
     user: { id: account.user_id },
-    reply: async (payload) => { purchaseReply = payload; return payload; },
+    reply: async (payload) => { purchasePrompt = payload; return payload; },
+  }, { db: store.db });
+  assert.match(purchasePrompt.embeds[0].data.description, /\*\*Price:\*\* \$500/);
+  assert.deepEqual(purchasePrompt.components[0].components.map((button) => button.data.label), ['Confirm Purchase', 'Cancel']);
+  assert.equal(getWallet(store.db, account.user_id).wallet_balance, 2000);
+  assert.equal(store.db.prepare('SELECT stock FROM economy_shop_items WHERE id = ?').get(ids[0]).stock, 100);
+  let duplicatePrompt;
+  await handleButton({
+    customId: buyId,
+    user: { id: account.user_id },
+    reply: async (payload) => { duplicatePrompt = payload; return payload; },
+  }, { db: store.db });
+  assert.match(duplicatePrompt.content, /pending confirmation/);
+  const cancelId = purchasePrompt.components[0].components[1].data.custom_id;
+  let cancelled;
+  await handleButton({
+    customId: cancelId,
+    user: { id: account.user_id },
+    update: async (payload) => { cancelled = payload; return payload; },
+  }, { db: store.db });
+  assert.match(cancelled.content, /cancelled/i);
+  assert.equal(getWallet(store.db, account.user_id).wallet_balance, 2000);
+
+  const commandPurchase = await handleEconomyCommand(env.interaction('purchase', {
+    getString: () => ids[0],
+    getInteger: () => 1,
+  }, account.user_id), { db: store.db });
+  assert.deepEqual(commandPurchase.components[0].components.map((button) => button.data.label), ['Confirm Purchase', 'Cancel']);
+  assert.equal(getWallet(store.db, account.user_id).wallet_balance, 2000);
+  await handleButton({
+    customId: commandPurchase.components[0].components[1].data.custom_id,
+    user: { id: account.user_id },
+    update: async () => ({}),
+  }, { db: store.db });
+
+  let secondPrompt;
+  await handleButton({ customId: buyId, user: { id: account.user_id }, reply: async (payload) => { secondPrompt = payload; return payload; } }, { db: store.db });
+  let purchaseReply;
+  const confirmId = secondPrompt.components[0].components[0].data.custom_id;
+  await handleButton({
+    customId: confirmId,
+    user: { id: account.user_id },
+    update: async (payload) => { purchaseReply = payload; return payload; },
   }, { db: store.db });
   assert.match(purchaseReply.content, /Purchase complete/);
   assert.equal(store.db.prepare('SELECT quantity FROM economy_inventory WHERE user_id = ? AND item_id = ?').get(account.user_id, ids[0]).quantity, 1);
+  assert.equal(getWallet(store.db, account.user_id).wallet_balance, 1500);
 
   const reopened = store.reopen();
   assert.equal(reopened.prepare('SELECT COUNT(*) AS count FROM economy_shop_items WHERE id IN (?, ?)').get(...ids).count, 2);
@@ -183,6 +228,7 @@ test('cash drops recover pending posts after restart, follow persisted intervals
   const channelIdForDrop = '1666064708795306156';
   setConfigValue(store.db, 'ECONOMY_CASH_DROP_CHANNEL_ID', channelIdForDrop);
   setConfigValue(store.db, 'ECONOMY_CASH_DROP_MAX_CLAIMS', 1);
+  setConfigValue(store.db, 'ECONOMY_CASH_DROP_LIFETIME_MINUTES', 1440);
   const sends = [];
   const unavailableClient = { channels: { fetch: async () => ({ isTextBased: () => true, send: async () => { throw new Error('temporary outage'); } }) } };
   const start = new Date('2026-11-01T12:00:00.000Z');
@@ -191,6 +237,7 @@ test('cash drops recover pending posts after restart, follow persisted intervals
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_cash_drops WHERE status = 'pending'").get().count, 1);
 
   const reopened = store.reopen();
+  const updatedDrops = [];
   const workingClient = {
     channels: {
       fetch: async (id) => ({
@@ -200,6 +247,7 @@ test('cash drops recover pending posts after restart, follow persisted intervals
           sends.push(payload);
           return { id: `drop-message-${sends.length}` };
         },
+        messages: { fetch: async () => ({ edit: async (payload) => { updatedDrops.push(payload); return payload; } }) },
       }),
     },
   };
@@ -209,23 +257,40 @@ test('cash drops recover pending posts after restart, follow persisted intervals
   const firstDrop = reopened.prepare('SELECT * FROM economy_cash_drops WHERE drop_id = ?').get(recovered.dropId);
   assert.equal(firstDrop.status, 'open');
   assert.equal(firstDrop.message_id, 'drop-message-1');
+  assert.notEqual(sends[0].embeds[0].data.color, config.EMBED_COLORS.error);
+  assert.equal(sends[0].components[0].components[0].data.disabled, false);
 
   let claimReply;
   await handleButton({
     customId: `gv:economy:drop:claim:${recovered.dropId}`,
     user: { id: 'cash-player' },
     message: { edit: async () => ({}) },
+    client: workingClient,
     reply: async (payload) => { claimReply = payload; return payload; },
   }, { db: reopened });
   assert.match(claimReply.content, /Cash drop claimed/);
+  const claimed = reopened.prepare('SELECT * FROM economy_cash_drops WHERE drop_id = ?').get(recovered.dropId);
+  assert.equal(claimed.status, 'claimed');
+  assert.equal(claimed.claimed_by, 'cash-player');
+  assert.ok(claimed.claimed_at);
+  assert.equal(updatedDrops[0].embeds[0].data.color, config.EMBED_COLORS.error);
+  assert.match(updatedDrops[0].embeds[0].data.description, /<@cash-player>/);
+  assert.equal(updatedDrops[0].components[0].components[0].data.label, 'Claimed');
+  assert.equal(updatedDrops[0].components[0].components[0].data.disabled, true);
   assert.equal(claimEconomyCashDrop(reopened, recovered.dropId, 'cash-player', new Date(start.getTime() + 3 * 60_000)).reason, 'closed');
+  assert.equal(claimEconomyCashDrop(reopened, recovered.dropId, 'another-player', new Date(start.getTime() + 3 * 60_000)).reason, 'closed');
   assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM economy_transactions WHERE type = 'cash_drop'").get().count, 1);
 
-  const notDue = await processEconomyCashDrops(workingClient, reopened, new Date(start.getTime() + 14 * 60_000));
+  reopened.prepare('UPDATE economy_cash_drops SET claimed_message_updated_at = NULL WHERE drop_id = ?').run(recovered.dropId);
+  const restarted = store.reopen();
+  await processEconomyCashDrops(workingClient, restarted, new Date(start.getTime() + 4 * 60_000));
+  assert.ok(restarted.prepare('SELECT claimed_message_updated_at FROM economy_cash_drops WHERE drop_id = ?').get(recovered.dropId).claimed_message_updated_at);
+
+  const notDue = await processEconomyCashDrops(workingClient, restarted, new Date(start.getTime() + 14 * 60_000));
   assert.equal(notDue.reason, 'not-due');
-  const stillWaiting = await processEconomyCashDrops(workingClient, reopened, new Date(start.getTime() + 15 * 60_000));
+  const stillWaiting = await processEconomyCashDrops(workingClient, restarted, new Date(start.getTime() + 15 * 60_000));
   assert.equal(stillWaiting.reason, 'not-due');
-  const nextDrop = await processEconomyCashDrops(workingClient, reopened, new Date(start.getTime() + 16 * 60_000));
+  const nextDrop = await processEconomyCashDrops(workingClient, restarted, new Date(start.getTime() + 16 * 60_000));
   assert.equal(nextDrop.posted, true);
   assert.equal(sends.length, 2);
 });
@@ -240,17 +305,27 @@ test('Discord shop, bank, inventory, and transaction controls reach their persis
   const shop = await handleEconomyCommand(env.interaction('shop', {}, 'economy-player'), { db: store.db });
   assert.equal(shop.ephemeral, true);
   assert.match(shop.embeds[0].data.description, /GV Hoodie/);
-  const viewId = shop.components[0].components[0].data.custom_id;
-  assert.equal(viewId, `gv:economy:shop:view:${itemId}`);
-  let detailReply;
-  await handleButton({ customId: viewId, user: { id: 'economy-player' }, reply: async (payload) => { detailReply = payload; return payload; } }, { db: store.db });
-  assert.match(detailReply.embeds[0].data.description, /Community merch/);
-  assert.equal(detailReply.embeds[0].data.image.url, 'https://example.com/hoodie.png');
-  const buyId = shop.components[0].components[1].data.custom_id;
+  assert.doesNotMatch(shop.embeds[0].data.description, new RegExp(itemId));
+  const buyId = shop.components[0].components[0].data.custom_id;
   assert.equal(buyId, `gv:economy:shop:buy:${itemId}`);
+  let prompt;
+  await handleButton({ customId: buyId, id: 'shop-buy-1', user: { id: 'economy-player' }, reply: async (payload) => { prompt = payload; return payload; } }, { db: store.db });
+  assert.match(prompt.embeds[0].data.description, /Community merch/);
+  assert.match(prompt.embeds[0].data.description, /\*\*Price:\*\* \$75/);
+  assert.equal(prompt.embeds[0].data.image.url, 'https://example.com/hoodie.png');
+  assert.deepEqual(prompt.components[0].components.map((button) => button.data.label), ['Confirm Purchase', 'Cancel']);
+  assert.equal(getWallet(store.db, 'economy-player').wallet_balance, 300);
+  let cancelled;
+  await handleButton({ customId: prompt.components[0].components[1].data.custom_id, user: { id: 'economy-player' }, update: async (payload) => { cancelled = payload; return payload; } }, { db: store.db });
+  assert.match(cancelled.content, /cancelled/i);
+  assert.equal(getWallet(store.db, 'economy-player').wallet_balance, 300);
+  let secondPrompt;
+  await handleButton({ customId: buyId, id: 'shop-buy-2', user: { id: 'economy-player' }, reply: async (payload) => { secondPrompt = payload; return payload; } }, { db: store.db });
   let buyReply;
-  await handleButton({ customId: buyId, user: { id: 'economy-player' }, reply: async (payload) => { buyReply = payload; return payload; } }, { db: store.db });
+  const confirmId = secondPrompt.components[0].components[0].data.custom_id;
+  await handleButton({ customId: confirmId, id: 'shop-confirm-1', user: { id: 'economy-player' }, update: async (payload) => { buyReply = payload; return payload; } }, { db: store.db });
   assert.match(buyReply.content, /Purchase complete/);
+  assert.equal(getWallet(store.db, 'economy-player').wallet_balance, 225);
 
   const inventory = await handleEconomyCommand(env.interaction('inventory', {}, 'economy-player'), { db: store.db });
   assert.match(inventory.embeds[0].data.description, /GV Hoodie/);
@@ -272,13 +347,41 @@ test('Discord shop, bank, inventory, and transaction controls reach their persis
     fields: { getTextInputValue: () => '100' },
     reply: async (payload) => { modalReply = payload; return payload; },
   }, { db: store.db });
-  assert.match(modalReply.content, /Deposited 100 GV Credits/);
+  assert.match(modalReply.content, /Deposited \$100/);
   assert.equal(getWallet(store.db, 'economy-player').bank_balance, 100);
   const invalidDeposit = await handleEconomyCommand(env.interaction('deposit', {
     getInteger: () => 10000,
     getString: () => null,
   }, 'economy-player'), { db: store.db });
   assert.match(invalidDeposit.content, /not have enough wallet cash/);
+});
+
+test('economy purchase slash command resolves product names and only charges after confirmation', async (t) => {
+  const store = makeTempDatabase(t);
+  const env = createPanelEnvironment(store.db);
+  const itemId = createShopItem(store.db, { name: 'Greenville Tow Truck Job', description: 'Request a job review.', price: 80, stock: 3 }, managerId);
+  const account = getWallet(store.db, 'slash-shop-player');
+  store.db.prepare('UPDATE economy_accounts SET wallet_balance = 200 WHERE user_id = ?').run(account.user_id);
+  const started = await handleEconomyCommand(env.interaction('purchase', {
+    getString: (name) => name === 'product' ? 'Greenville Tow Truck Job' : null,
+    getInteger: () => 1,
+  }, account.user_id), { db: store.db });
+  assert.match(started.embeds[0].data.title, /Confirm Purchase/);
+  assert.equal(getWallet(store.db, account.user_id).wallet_balance, 200);
+  assert.equal(store.db.prepare('SELECT stock FROM economy_shop_items WHERE id = ?').get(itemId).stock, 3);
+
+  const confirmationId = started.components[0].components[0].data.custom_id;
+  let confirmed;
+  await handleButton({
+    customId: confirmationId,
+    user: { id: account.user_id },
+    interaction: { id: 'slash-confirm-1' },
+    id: 'slash-confirm-1',
+    update: async (payload) => { confirmed = payload; return payload; },
+  }, { db: store.db });
+  assert.match(confirmed.content, /\$80/);
+  assert.equal(getWallet(store.db, account.user_id).wallet_balance, 120);
+  assert.equal(store.db.prepare('SELECT stock FROM economy_shop_items WHERE id = ?').get(itemId).stock, 2);
 });
 
 test('economy leaderboard ranks combined wallet and bank wealth and is available from Discord', async (t) => {
@@ -297,10 +400,10 @@ test('economy leaderboard ranks combined wallet and bank wealth and is available
   assert.throws(() => getEconomyLeaderboard(store.db, 10, 'invalid'), /Choose wealth, wallet, bank, or earnings/);
   const env = createPanelEnvironment(store.db);
   const leaderboard = await handleEconomyCommand(env.interaction('leaderboard', {}, 'economy-player'), { db: store.db });
-  assert.match(leaderboard.embeds[0].data.description, /<@bank-rich>.*Total 2,600 GV Credits/);
+  assert.match(leaderboard.embeds[0].data.description, /<@bank-rich>.*Total \$2,600/);
   const walletLeaderboard = await handleEconomyCommand(env.interaction('leaderboard', { getString: () => 'wallet' }, 'economy-player'), { db: store.db });
   assert.match(walletLeaderboard.embeds[0].data.title, /Wallet balance/);
-  assert.match(walletLeaderboard.embeds[0].data.description, /<@wallet-rich>.*Wallet balance 900 GV Credits/);
+  assert.match(walletLeaderboard.embeds[0].data.description, /<@wallet-rich>.*Wallet balance \$900/);
 });
 
 test('economy game slash commands and decision buttons connect to persistent game state', async (t) => {
@@ -362,6 +465,24 @@ test('economy game slash commands and decision buttons connect to persistent gam
 test('management dashboard exposes economy controls and persists settings, adjustments, and audit history', async (t) => {
   const store = makeTempDatabase(t);
   const env = createPanelEnvironment(store.db);
+  const economyRoleId = '1666064708795306198';
+  setConfigValue(store.db, 'ECONOMY_MANAGEMENT_ROLE_ID', economyRoleId);
+  let deniedDashboard;
+  await handleEconomyManagementButton({
+    customId: 'mgmt:economy',
+    guild: env.guild,
+    user: { id: managerId },
+    update: async () => { throw new Error('Unauthorized member reached Economy controls.'); },
+    reply: async (payload) => { deniedDashboard = payload; return payload; },
+  }, { db: store.db });
+  assert.match(deniedDashboard.content, /configured Economy Management role/i);
+
+  const configuredRole = await handleEconomyCommand(env.interaction('access-role', {
+    getRole: () => ({ id: economyRoleId }),
+  }), { db: store.db });
+  assert.match(configuredRole.content, /restricted to/);
+  const manager = await env.guild.members.fetch(managerId);
+  manager.roles.cache.set(economyRoleId, { id: economyRoleId, name: 'Economy' });
   let dashboard;
   await handleEconomyManagementButton({
     customId: 'mgmt:economy',
@@ -521,7 +642,7 @@ test('management dashboard exposes economy controls and persists settings, adjus
   }), { db: store.db });
   assert.match(commandAdjustment.content, /Updated <@1666064708795306158>/);
   assert.equal(getWallet(store.db, targetId).wallet_balance, 100);
-  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action LIKE 'economy_%'").get().count, 9);
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action LIKE 'economy_%'").get().count, 10);
   const reopened = store.reopen();
   assert.equal(getEconomySettings(reopened).cashDropAmount, 400);
   assert.equal(getEconomySettings(reopened).minimumReward, 60);
@@ -588,7 +709,7 @@ test('staff economy controls publish manual drops, recover pending drops, and re
   const transactions = await handleEconomyManagementButton(button('gv:economy:staff:transactions'), { db: store.db });
   assert.match(transactions.embeds[0].data.description, /shop purchase/);
   const dropHistory = await handleEconomyManagementButton(button('gv:economy:staff:drop-history'), { db: store.db });
-  assert.match(dropHistory.embeds[0].data.description, /450 GV Credits.*0\/3 claimed.*open/);
+  assert.match(dropHistory.embeds[0].data.description, /\$450.*0\/3 claimed.*open/);
 
   const pending = createManualEconomyCashDrop(store.db, {
     channelId,
@@ -656,11 +777,16 @@ test('economy schema upgrades legacy wallet rows additively without resetting ba
   store.db.prepare('UPDATE economy_accounts SET wallet_balance = 4321 WHERE user_id = ?').run('legacy-wallet');
   store.db.exec('ALTER TABLE economy_accounts DROP COLUMN last_daily_reward_at');
   store.db.exec('DROP INDEX economy_transactions_idempotency; ALTER TABLE economy_transactions DROP COLUMN idempotency_key;');
+  store.db.exec('ALTER TABLE economy_cash_drops DROP COLUMN claimed_message_updated_at; ALTER TABLE economy_cash_drops DROP COLUMN claimed_at; ALTER TABLE economy_cash_drops DROP COLUMN claimed_by;');
   const reopened = store.reopen();
   const columns = new Set(reopened.pragma('table_info(economy_accounts)').map((column) => column.name));
   const transactionColumns = new Set(reopened.pragma('table_info(economy_transactions)').map((column) => column.name));
+  const cashDropColumns = new Set(reopened.pragma('table_info(economy_cash_drops)').map((column) => column.name));
   assert.ok(columns.has('last_daily_reward_at'));
   assert.ok(transactionColumns.has('idempotency_key'));
+  assert.ok(cashDropColumns.has('claimed_by'));
+  assert.ok(cashDropColumns.has('claimed_at'));
+  assert.ok(cashDropColumns.has('claimed_message_updated_at'));
   assert.equal(getWallet(reopened, 'legacy-wallet').wallet_balance, 4321);
 });
 
@@ -734,7 +860,7 @@ test('management configures and updates one panel; Wallet and Work stay private'
     reply: async (payload) => { walletReply = payload; return payload; },
   }, { db: store.db });
   assert.equal(walletReply.ephemeral, true);
-  assert.match(walletReply.embeds[0].data.description, /300 GV Credits/);
+  assert.match(walletReply.embeds[0].data.description, /\$300/);
 
   let unauthorizedReply;
   const unauthorized = env.interaction('configure', {
@@ -743,7 +869,7 @@ test('management configures and updates one panel; Wallet and Work stay private'
   }, 'economy-player');
   await handleEconomyCommand(unauthorized, { db: store.db });
   unauthorizedReply = unauthorized.lastReply;
-  assert.match(unauthorizedReply.content, /management roles only/i);
+  assert.match(unauthorizedReply.content, /configured Economy Management role/i);
 });
 
 test('Delivery Rush respects cooldown, resolves once, and pays only through the existing wallet ledger', (t) => {

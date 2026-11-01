@@ -86,22 +86,10 @@ function blacklistDetailsModal(draftId, data = {}) {
 }
 
 function appealModalOne(draftId) {
-  return new ModalBuilder().setCustomId(`gv:blacklist:modal:appeal:${draftId}:1`).setTitle('GV GR • Blacklist Appeal')
+  return new ModalBuilder().setCustomId(`gv:blacklist:modal:appeal:${draftId}`).setTitle('GV GR • Blacklist Appeal')
     .addComponents(
       textInput('roblox_name', 'Roblox Username', { required: true, maxLength: 50 }),
-      textInput('roblox_id', 'Roblox User ID (if available)', { maxLength: 32 }),
-      textInput('discord_name', 'Discord Username', { required: true, maxLength: 100 }),
-      textInput('record_id', 'Blacklist Record ID (if known)', { maxLength: 32 }),
-      textInput('reconsideration', 'Why should this be reconsidered?', { required: true, style: TextInputStyle.Paragraph, maxLength: 800 }),
-    );
-}
-
-function appealModalTwo(draftId) {
-  return new ModalBuilder().setCustomId(`gv:blacklist:modal:appeal:${draftId}:2`).setTitle('GV GR • Appeal Details')
-    .addComponents(
-      textInput('incident', 'Explain what happened', { required: true, style: TextInputStyle.Paragraph, maxLength: 1000 }),
-      textInput('return_reason', 'Why should you be allowed back?', { required: true, style: TextInputStyle.Paragraph, maxLength: 1000 }),
-      textInput('evidence', 'Evidence or Additional Information', { style: TextInputStyle.Paragraph, maxLength: 1000 }),
+      textInput('reconsideration', 'Reason for appealing', { required: true, style: TextInputStyle.Paragraph, maxLength: 1000 }),
     );
 }
 
@@ -246,7 +234,19 @@ async function completeBlacklistCreate(interaction, ctx, draftId) {
   const data = Object.fromEntries(['roblox_name', 'roblox_id', 'discord_name', 'discord_id', 'reason'].map((key) => [key, interaction.fields.getTextInputValue(key).trim()]));
   if (Object.values(data).some((value) => !value)) return interaction.reply({ content: 'Complete every required blacklist field.', ephemeral: true });
   updateDraft(ctx.db, draftId, interaction.user.id, { stage: 2, data });
-  return interaction.showModal(blacklistDetailsModal(draftId));
+  return interaction.reply({
+    content: 'Player details saved. Continue to enter evidence, duration, and private staff notes.',
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(`gv:blacklist:continue:create:${draftId}`).setLabel('Continue Blacklist Form').setStyle(ButtonStyle.Primary))],
+    ephemeral: true,
+  });
+}
+
+async function continueBlacklistCreate(interaction, ctx, draftId) {
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'blacklist');
+  if (!draft || draft.stage !== 2) return interaction.reply({ content: 'This blacklist form expired. Start again from the panel.', ephemeral: true });
+  return interaction.showModal(blacklistDetailsModal(draftId, draft.data));
 }
 
 async function saveBlacklistCreate(interaction, ctx, draftId) {
@@ -282,33 +282,22 @@ async function saveBlacklistCreate(interaction, ctx, draftId) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE' || /already has active blacklist/.test(error.message)) {
       return interaction.reply({ content: error.message, ephemeral: true });
     }
-    throw error;
+    console.error('Could not save blacklist record:', error);
+    return interaction.reply({ content: 'The blacklist record could not be saved. No record was announced; check the bot logs and try again.', ephemeral: true });
   }
   const record = ctx.db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(recordId);
   const posted = await postRecord(interaction.client, ctx.db, record);
-  return interaction.reply({ content: posted ? `Blacklist record **${recordId}** was saved and posted.` : `Blacklist record **${recordId}** was saved. Configure the record channel to publish its announcement.`, ephemeral: true });
+  return interaction.reply({
+    content: posted ? `Player was blacklisted. Record **${recordId}** was saved and posted.` : `Player was blacklisted. Record **${recordId}** was saved. Configure the record channel to publish its announcement.`,
+    embeds: [recordEmbed(record)],
+    ephemeral: true,
+  });
 }
 
 async function startAppeal(interaction, ctx) {
   if (interaction.user.bot) return interaction.reply({ content: 'Bot accounts cannot submit blacklist appeals.', ephemeral: true });
   const id = createDraft(ctx.db, interaction.user.id, 'appeal', null, { discord_id: interaction.user.id });
   return interaction.showModal(appealModalOne(id));
-}
-
-async function continueAppeal(interaction, ctx, draftId) {
-  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'appeal');
-  if (!draft || draft.stage !== 1) return interaction.reply({ content: 'This appeal form expired. Start again from the blacklist panel.', ephemeral: true });
-  const data = {
-    ...draft.data,
-    roblox_name: interaction.fields.getTextInputValue('roblox_name').trim(),
-    roblox_id: interaction.fields.getTextInputValue('roblox_id').trim(),
-    discord_name: interaction.fields.getTextInputValue('discord_name').trim(),
-    record_id_input: interaction.fields.getTextInputValue('record_id').trim(),
-    reconsideration: interaction.fields.getTextInputValue('reconsideration').trim(),
-  };
-  if (!data.roblox_name || !data.discord_name || !data.reconsideration) return interaction.reply({ content: 'Complete the required appeal fields.', ephemeral: true });
-  updateDraft(ctx.db, draftId, interaction.user.id, { stage: 2, data });
-  return interaction.showModal(appealModalTwo(draftId));
 }
 
 async function postAppeal(client, db, appeal) {
@@ -329,26 +318,21 @@ async function postAppeal(client, db, appeal) {
 
 async function submitAppeal(interaction, ctx, draftId) {
   const draft = getDraft(ctx.db, draftId, interaction.user.id, 'appeal');
-  if (!draft || draft.stage !== 2) return interaction.reply({ content: 'This appeal form expired. Start again from the blacklist panel.', ephemeral: true });
+  if (!draft || draft.stage !== 1) return interaction.reply({ content: 'This appeal form expired. Start again from the blacklist panel.', ephemeral: true });
   const data = {
     ...draft.data,
-    incident: interaction.fields.getTextInputValue('incident').trim(),
-    return_reason: interaction.fields.getTextInputValue('return_reason').trim(),
-    evidence: interaction.fields.getTextInputValue('evidence').trim(),
+    roblox_name: interaction.fields.getTextInputValue('roblox_name').trim(),
+    reconsideration: interaction.fields.getTextInputValue('reconsideration').trim(),
   };
-  if (!data.incident || !data.return_reason) return interaction.reply({ content: 'Complete the required appeal fields.', ephemeral: true });
-  let record = null;
-  if (data.record_id_input) {
-    record = ctx.db.prepare('SELECT * FROM blacklist_records WHERE upper(record_id) = upper(?)').get(data.record_id_input);
-  }
-  if (!record) {
-    record = ctx.db.prepare(`
-      SELECT * FROM blacklist_records WHERE status IN ('active', 'expired') AND
-        ((roblox_user_id = ? AND ? != '') OR (discord_user_id = ?) OR lower(roblox_username) = lower(?))
-      ORDER BY status = 'active' DESC, created_at DESC LIMIT 1
-    `).get(data.roblox_id, data.roblox_id, interaction.user.id, data.roblox_name);
-  }
-  if (!record) return interaction.reply({ content: 'I could not find a saved blacklist record matching this appeal. Ask management for the record ID and try again.', ephemeral: true });
+  if (!data.roblox_name || !data.reconsideration) return interaction.reply({ content: 'Enter the Roblox username and a reason for appealing.', ephemeral: true });
+  const record = ctx.db.prepare(`
+    SELECT * FROM blacklist_records
+    WHERE status IN ('active', 'expired')
+      AND lower(roblox_username) = lower(?)
+      AND (discord_user_id = ? OR discord_user_id IS NULL OR discord_user_id = '')
+    ORDER BY status = 'active' DESC, created_at DESC LIMIT 1
+  `).get(data.roblox_name, interaction.user.id);
+  if (!record) return interaction.reply({ content: 'No active or expired blacklist record for that Roblox username is linked to your Discord account.', ephemeral: true });
   const appealId = makeId('AP');
   const submittedAt = new Date().toISOString();
   try {
@@ -359,9 +343,9 @@ async function submitAppeal(interaction, ctx, draftId) {
         INSERT INTO blacklist_appeals (appeal_id, record_id, applicant_id, roblox_username, roblox_user_id,
           discord_username, blacklist_record_id, reconsideration_reason, incident_explanation, return_reason, evidence, status, submitted_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-      `).run(appealId, record.record_id, interaction.user.id, data.roblox_name, data.roblox_id, data.discord_name,
-        data.record_id_input || record.record_id, data.reconsideration, data.incident, data.return_reason, data.evidence, submittedAt);
-      writeAppealHistory(ctx.db, appealId, interaction.user.id, 'submitted', { recordId: record.record_id }, submittedAt);
+      `).run(appealId, record.record_id, interaction.user.id, record.roblox_username, record.roblox_user_id ?? '',
+        interaction.user.username, record.record_id, data.reconsideration, '', '', '', submittedAt);
+      writeAppealHistory(ctx.db, appealId, interaction.user.id, 'submitted', { recordId: record.record_id, reason: data.reconsideration }, submittedAt);
       ctx.db.prepare('DELETE FROM blacklist_form_drafts WHERE draft_id = ?').run(draftId);
     })();
   } catch (error) {
@@ -624,6 +608,13 @@ async function startRecordEdit(interaction, ctx, recordId) {
   return interaction.showModal(editModalOne(draft));
 }
 
+async function continueRecordEdit(interaction, ctx, draftId) {
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'edit');
+  if (!draft || draft.stage !== 2) return interaction.reply({ content: 'This edit form expired. Search the record again.', ephemeral: true });
+  return interaction.showModal(editModalTwo(draft));
+}
+
 async function continueEdit(interaction, ctx, draftId, stage) {
   if (!await ensureManagement(interaction, ctx.db)) return;
   const draft = getDraft(ctx.db, draftId, interaction.user.id, 'edit');
@@ -633,7 +624,12 @@ async function continueEdit(interaction, ctx, draftId, stage) {
     for (const key of ['roblox_name', 'roblox_id', 'discord_name', 'discord_id', 'reason']) data.current[key] = interaction.fields.getTextInputValue(key).trim();
     if (!data.current.roblox_name || !data.current.discord_name || !data.current.reason) return interaction.reply({ content: 'Roblox username, Discord username, and reason are required.', ephemeral: true });
     updateDraft(ctx.db, draftId, interaction.user.id, { stage: 2, data });
-    return interaction.showModal(editModalTwo({ ...draft, data }));
+    return interaction.reply({
+      content: `Player details for ${draft.record_id} saved. Continue to edit duration, expiration, status, evidence, and staff notes.`,
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+        .setCustomId(`gv:blacklist:continue:edit:${draftId}`).setLabel('Continue Editing').setStyle(ButtonStyle.Primary))],
+      ephemeral: true,
+    });
   }
   const data = { ...draft.data };
   const next = {};
@@ -794,6 +790,10 @@ async function handleBlacklistButton(interaction, ctx) {
   const customId = interaction.customId;
   if (customId === 'gv:blacklist:blacklist') return startBlacklistDraft(interaction, ctx);
   if (customId === 'gv:blacklist:appeal') return startAppeal(interaction, ctx);
+  const createContinue = customId.match(/^gv:blacklist:continue:create:([a-f0-9]{32})$/);
+  if (createContinue) return continueBlacklistCreate(interaction, ctx, createContinue[1]);
+  const editContinue = customId.match(/^gv:blacklist:continue:edit:([a-f0-9]{32})$/);
+  if (editContinue) return continueRecordEdit(interaction, ctx, editContinue[1]);
   if (customId === 'gv:blacklist:edit') {
     if (!await ensureManagement(interaction, ctx.db)) return;
     return interaction.showModal(searchModal('edit'));
@@ -852,8 +852,8 @@ async function handleBlacklistSelect(interaction, ctx) {
 async function handleBlacklistModal(interaction, ctx) {
   const create = interaction.customId.match(/^gv:blacklist:modal:create:([a-f0-9]{32}):(1|2)$/);
   if (create) return create[2] === '1' ? completeBlacklistCreate(interaction, ctx, create[1]) : saveBlacklistCreate(interaction, ctx, create[1]);
-  const appeal = interaction.customId.match(/^gv:blacklist:modal:appeal:([a-f0-9]{32}):(1|2)$/);
-  if (appeal) return appeal[2] === '1' ? continueAppeal(interaction, ctx, appeal[1]) : submitAppeal(interaction, ctx, appeal[1]);
+  const appeal = interaction.customId.match(/^gv:blacklist:modal:appeal:([a-f0-9]{32})$/);
+  if (appeal) return submitAppeal(interaction, ctx, appeal[1]);
   const search = interaction.customId.match(/^gv:blacklist:modal:search:(search|edit)$/);
   if (search) {
     if (!await ensureManagement(interaction, ctx.db)) return;

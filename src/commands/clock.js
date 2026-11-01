@@ -29,6 +29,11 @@ function createPanelComponents() {
       .setLabel('Create Announcement')
       .setEmoji('📣')
       .setStyle(ButtonStyle.Primary)),
+    new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId('mgmt:economy')
+      .setLabel('Economy')
+      .setEmoji('💰')
+      .setStyle(ButtonStyle.Success)),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gv:session_panel:quick-start').setLabel('Quick Start Session').setEmoji('⚡').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:session_panel:start').setLabel('Start RP Session').setEmoji('🎙️').setStyle(ButtonStyle.Success),

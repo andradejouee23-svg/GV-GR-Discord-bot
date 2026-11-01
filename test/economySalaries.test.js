@@ -152,13 +152,14 @@ test('management configures roles, policy, pause/resume and history; players can
   const store = makeTempDatabase(t);
   const { db } = store;
   db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRoleId]));
+  setConfigValue(db, 'ECONOMY_MANAGEMENT_ROLE_ID', managerRoleId);
   seedTownJob(db);
 
   const add = await handleSalaryCommand(commandInteraction(db, 'add', {
     getRole: () => ({ id: roleA }),
     getInteger: () => 110,
   }), { db });
-  assert.match(add.content, /Enabled .*salary at 110 GV Credits/);
+  assert.match(add.content, /Enabled .*salary at \$110/);
   const duplicate = await handleSalaryCommand(commandInteraction(db, 'add', {
     getRole: () => ({ id: roleA }),
     getInteger: () => 100,
@@ -169,7 +170,7 @@ test('management configures roles, policy, pause/resume and history; players can
     getRole: () => ({ id: roleA }),
     getInteger: () => 125,
   }), { db });
-  assert.match(set.content, /125 GV Credits/);
+  assert.match(set.content, /\$125/);
   const disabled = await handleSalaryCommand(commandInteraction(db, 'toggle', {
     getRole: () => ({ id: roleA }),
     getBoolean: () => false,
@@ -210,7 +211,7 @@ test('management configures roles, policy, pause/resume and history; players can
 
   const unauthorized = commandInteraction(db, 'remove', { getRole: () => ({ id: roleA }) }, 'player');
   await handleSalaryCommand(unauthorized, { db });
-  assert.match(unauthorized.lastReply.content, /management roles only/i);
+  assert.match(unauthorized.lastReply.content, /configured Economy Management role/i);
 
   const member = makeMember('history-player', [roleA]);
   const guild = createGuild([member]);
@@ -220,7 +221,7 @@ test('management configures roles, policy, pause/resume and history; players can
   await processTownJobsSalaries(client, db, new Date(start.getTime() + salaryIntervalMs));
   const history = await handleSalaryCommand(commandInteraction(db, 'history', { getRole: () => ({ id: roleA }) }), { db });
   assert.match(history.embeds[0].data.description, /history-player/);
-  assert.match(history.embeds[0].data.description, /125 GV Credits/);
+  assert.match(history.embeds[0].data.description, /\$125/);
   const remove = await handleSalaryCommand(commandInteraction(db, 'remove', { getRole: () => ({ id: roleA }) }), { db });
   assert.match(remove.content, /Removed/);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM staff_audit_logs WHERE action LIKE 'economy_salary_%' OR action IN ('economy_salaries_paused', 'economy_salaries_resumed')").get().count, 8);

@@ -172,27 +172,31 @@ async function endSession(interaction, ctx) {
   if (!session) return interaction.reply({ content: 'There is no active RP session to end.', ephemeral: true });
 
   const endedAt = new Date().toISOString();
-  const durationSeconds = Math.max(0, Math.floor((Date.now() - new Date(session.started_at).getTime()) / 1000));
-  ctx.db.prepare("UPDATE sessions SET ended_at = ?, duration_seconds = ?, status = 'completed' WHERE id = ?").run(endedAt, durationSeconds, session.id);
-
-  if (session.channel_id && session.message_id) {
-    try {
-      const channel = await interaction.client.channels.fetch(session.channel_id);
-      const message = await channel.messages.fetch(session.message_id);
-      await message.edit({ components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`gv:session_join:${session.id}`).setLabel('Session Ended').setStyle(ButtonStyle.Secondary).setDisabled(true),
-      )] });
-    } catch (error) {
-      console.error(`Could not update session #${session.id} announcement:`, error.message);
-    }
-  }
+  const durationSeconds = Math.max(0, Math.floor((Date.parse(endedAt) - new Date(session.started_at).getTime()) / 1000));
+  const claimed = ctx.db.prepare("UPDATE sessions SET ended_at = ?, duration_seconds = ?, status = 'completed' WHERE id = ? AND status = 'active'")
+    .run(endedAt, durationSeconds, session.id);
+  if (!claimed.changes) return interaction.reply({ content: 'This RP session was already ended.', ephemeral: true });
 
   const embed = makeEmbed(config.EMBED_COLORS.info, '🎙️ RP Session Ended',
     `**SESSION CONCLUDED**\n\n🎙️ **${session.name}**\n👤 **Host:** <@${session.host_id}>\n🕒 **Started:** ${unixTime(session.started_at)}\n🏁 **Ended:** ${unixTime(endedAt)}\n⏱️ **Duration:** ${formatDuration(durationSeconds)}`)
     .setFooter({ text: 'GREENVILLE ROLEPLAY • Session announcement' })
     .setTimestamp(new Date(endedAt));
-  await sendToChannel(interaction.client, getConfigValue(ctx.db, 'SESSION_CHANNEL_ID'), { embeds: [embed] });
-  await logStaffAction(interaction.client, ctx.db, { embeds: [embed] });
+  let originalUpdated = false;
+  if (session.channel_id && session.message_id) {
+    try {
+      const channel = await interaction.client.channels.fetch(session.channel_id);
+      const message = channel?.isTextBased() ? await channel.messages.fetch(session.message_id) : null;
+      if (message && message.author?.id === interaction.client.user?.id) {
+        await message.edit({ embeds: [embed], components: [] });
+        originalUpdated = true;
+      }
+    } catch (error) {
+      console.error(`Could not update session #${session.id} announcement:`, error.message);
+    }
+  }
+  if (!originalUpdated) {
+    await sendToChannel(interaction.client, getConfigValue(ctx.db, 'SESSION_CHANNEL_ID'), { embeds: [embed] });
+  }
   return interaction.reply({ content: `Session #${session.id} ended. Duration: **${formatDuration(durationSeconds)}**.`, ephemeral: true });
 }
 

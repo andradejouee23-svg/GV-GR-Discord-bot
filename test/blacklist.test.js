@@ -86,14 +86,24 @@ test('blacklist records are created from Discord modals, reject active duplicate
     reply: async (payload) => payload,
   }, { db: env.db });
   const createId = firstModal.data.custom_id;
-  const secondModal = await handleBlacklistModal(modalInteraction(env, managerId, createId, {
+  const createContinue = await handleBlacklistModal(modalInteraction(env, managerId, createId, {
     roblox_name: 'GreenvilleDriver', roblox_id: 'roblox-123', discord_name: 'AppealPlayer', discord_id: applicantId, reason: 'Repeated exploit use',
   }), { db: env.db });
-  const created = await handleBlacklistModal(modalInteraction(env, managerId, secondModal.data.custom_id, {
+  let detailsModal;
+  await handleBlacklistButton({
+    customId: createContinue.components[0].components[0].data.custom_id,
+    user: { id: managerId }, guild: env.guild, client: env.client,
+    showModal: async (modal) => { detailsModal = modal; return modal; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
+  const created = await handleBlacklistModal(modalInteraction(env, managerId, detailsModal.data.custom_id, {
     evidence: 'https://example.com/evidence', duration: '7d', staff_notes: 'Reviewed by management',
   }), { db: env.db });
   const recordId = env.db.prepare('SELECT record_id FROM blacklist_records').get().record_id;
   assert.match(created.content, /saved and posted/);
+  assert.match(created.content, /Player was blacklisted/);
+  assert.match(created.embeds[0].data.title, new RegExp(recordId));
+  assert.match(created.embeds[0].data.description, /Repeated exploit use/);
   let record = env.db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(recordId);
   assert.equal(record.status, 'active');
   assert.equal(record.duration_hours, 168);
@@ -105,10 +115,17 @@ test('blacklist records are created from Discord modals, reject active duplicate
     customId: 'gv:blacklist:blacklist', user: { id: managerId }, guild: env.guild, client: env.client,
     showModal: async (modal) => { duplicateModal = modal; return modal; }, reply: async (payload) => payload,
   }, { db: env.db });
-  const duplicateSecond = await handleBlacklistModal(modalInteraction(env, managerId, duplicateModal.data.custom_id, {
+  const duplicateContinue = await handleBlacklistModal(modalInteraction(env, managerId, duplicateModal.data.custom_id, {
     roblox_name: 'AnotherAlias', roblox_id: 'roblox-123', discord_name: 'Other', discord_id: '1666064708795306161', reason: 'Duplicate',
   }), { db: env.db });
-  const duplicateReply = await handleBlacklistModal(modalInteraction(env, managerId, duplicateSecond.data.custom_id, { duration: '1d' }), { db: env.db });
+  let duplicateDetails;
+  await handleBlacklistButton({
+    customId: duplicateContinue.components[0].components[0].data.custom_id,
+    user: { id: managerId }, guild: env.guild, client: env.client,
+    showModal: async (modal) => { duplicateDetails = modal; return modal; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
+  const duplicateReply = await handleBlacklistModal(modalInteraction(env, managerId, duplicateDetails.data.custom_id, { duration: '1d' }), { db: env.db });
   assert.match(duplicateReply.content, /already has active blacklist record/);
   assert.equal(env.db.prepare('SELECT COUNT(*) AS count FROM blacklist_records').get().count, 1);
 
@@ -119,9 +136,16 @@ test('blacklist records are created from Discord modals, reject active duplicate
     customId: `gv:blacklist:record:edit:${recordId}`, user: { id: managerId }, guild: env.guild, client: env.client,
     showModal: async (modal) => { editModal = modal; return modal; }, reply: async (payload) => payload,
   }, { db: env.db });
-  const nextEditModal = await handleBlacklistModal(modalInteraction(env, managerId, editModal.data.custom_id, {
+  const editContinue = await handleBlacklistModal(modalInteraction(env, managerId, editModal.data.custom_id, {
     roblox_name: 'GreenvilleDriver', roblox_id: 'roblox-123', discord_name: 'AppealPlayer', discord_id: applicantId, reason: 'Updated reason',
   }), { db: env.db });
+  let nextEditModal;
+  await handleBlacklistButton({
+    customId: editContinue.components[0].components[0].data.custom_id,
+    user: { id: managerId }, guild: env.guild, client: env.client,
+    showModal: async (modal) => { nextEditModal = modal; return modal; },
+    reply: async (payload) => payload,
+  }, { db: env.db });
   const preview = await handleBlacklistModal(modalInteraction(env, managerId, nextEditModal.data.custom_id, {
     evidence: 'https://example.com/new-evidence', duration: '14d', expiration: 'permanent', status: 'active', staff_notes: 'Updated notes',
   }), { db: env.db });
@@ -148,24 +172,19 @@ test('appeals link to saved records, prevent repeat pending submissions, support
     .run(recordId, 'AppealPlayer', 'roblox-appeal', 'AppealPlayer', applicantId, 'Test reason', 168, managerId, now, now);
 
   const appealModal = await handleBlacklistButton({ customId: 'gv:blacklist:appeal', user: { id: applicantId }, showModal: async (modal) => modal }, { db: env.db });
-  const second = await handleBlacklistModal(modalInteraction(env, applicantId, appealModal.data.custom_id, {
-    roblox_name: 'AppealPlayer', roblox_id: 'roblox-appeal', discord_name: 'AppealPlayer', record_id: recordId,
+  const submitted = await handleBlacklistModal(modalInteraction(env, applicantId, appealModal.data.custom_id, {
+    roblox_name: 'AppealPlayer',
     reconsideration: 'I would like management to reconsider the decision.',
-  }), { db: env.db });
-  const submitted = await handleBlacklistModal(modalInteraction(env, applicantId, second.data.custom_id, {
-    incident: 'I understand what happened.', return_reason: 'I will follow the rules.', evidence: 'No additional evidence.',
   }), { db: env.db });
   assert.match(submitted.content, /submitted for management review/);
   const appeal = env.db.prepare('SELECT * FROM blacklist_appeals').get();
   assert.equal(appeal.record_id, recordId);
   assert.equal(appeal.status, 'pending');
+  assert.equal(env.db.prepare('SELECT status FROM blacklist_records WHERE record_id = ?').get(recordId).status, 'active');
 
   const duplicateFirst = await handleBlacklistButton({ customId: 'gv:blacklist:appeal', user: { id: applicantId }, showModal: async (modal) => modal }, { db: env.db });
-  const duplicateSecond = await handleBlacklistModal(modalInteraction(env, applicantId, duplicateFirst.data.custom_id, {
-    roblox_name: 'AppealPlayer', roblox_id: 'roblox-appeal', discord_name: 'AppealPlayer', record_id: recordId, reconsideration: 'Another request.',
-  }), { db: env.db });
-  const duplicateReply = await handleBlacklistModal(modalInteraction(env, applicantId, duplicateSecond.data.custom_id, {
-    incident: 'A repeat.', return_reason: 'A repeat.', evidence: '',
+  const duplicateReply = await handleBlacklistModal(modalInteraction(env, applicantId, duplicateFirst.data.custom_id, {
+    roblox_name: 'AppealPlayer', reconsideration: 'Another request.',
   }), { db: env.db });
   assert.match(duplicateReply.content, /appeal in progress/);
 

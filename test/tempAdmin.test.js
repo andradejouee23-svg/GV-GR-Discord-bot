@@ -105,11 +105,11 @@ function addApplicant(env, userId, username = 'Applicant') {
 test('default application prompts cover required identities and trial criteria; choice pages stay within Discord row limits', async (t) => {
   const env = createEnvironment(t);
   const questions = getApplicationSettings(env.db).questions;
-  assert.ok(questions.some((question) => question.includes('Discord username')));
-  assert.ok(questions.some((question) => question.includes('Discord user ID')));
-  assert.ok(questions.some((question) => question.includes('Roblox username')));
-  assert.ok(questions.some((question) => question.includes('Roblox user ID')));
-  assert.ok(questions.some((question) => question.includes('staff member')));
+  const labels = questions.map((question) => typeof question === 'string' ? question : question.label);
+  assert.ok(questions.some((question) => question.label?.includes('Discord username') && question.required === false));
+  assert.ok(!labels.some((label) => /(?:Discord|Roblox) user ID/i.test(label)));
+  assert.ok(labels.some((label) => label.includes('Roblox username')));
+  assert.ok(labels.some((label) => label.includes('staff member')));
 
   setConfigValue(env.db, 'TEMP_ADMIN_APPLICATION_QUESTIONS', [
     { label: 'Shift', type: 'dropdown', required: true, options: ['Morning', 'Evening'] },
@@ -141,6 +141,19 @@ test('default application prompts cover required identities and trial criteria; 
   }, { db: env.db });
   assert.match(cancelled.content, /application cancelled/);
   assert.equal(env.db.prepare('SELECT COUNT(*) AS count FROM temporary_admin_application_drafts').get().count, 0);
+});
+
+test('Temporary Admin application submits when the optional Discord username is blank', async (t) => {
+  const env = createEnvironment(t);
+  const submitted = await submitApplication(env, 'optional-discord-name', [
+    '', 'GreenvilleDriver', '18', 'Community moderation', 'I want to support staff.',
+    'Weekends', 'I would follow the moderation process.', 'I would discuss it privately.',
+    'I agree to follow the staff rules.',
+  ]);
+  assert.match(submitted.content, /sent to management for review/);
+  const application = env.db.prepare('SELECT * FROM temporary_admin_applications WHERE applicant_id = ?').get('optional-discord-name');
+  assert.ok(application);
+  assert.equal(JSON.parse(application.answers_json)[0], '');
 });
 
 function managerInteraction(env, properties = {}) {

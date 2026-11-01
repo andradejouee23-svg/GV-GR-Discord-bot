@@ -1,5 +1,5 @@
 const config = require('../../config');
-const { ensureManagement } = require('./staff');
+const { ensureEconomyManagement } = require('./economy');
 const { getTownJobOptions } = require('./townJobs');
 const { getConfigValue, makeEmbed, setConfigValue } = require('../utils/discord');
 const { isSalaryEnabled, getSalaryPolicy } = require('../services/economySalaries');
@@ -18,11 +18,7 @@ function salaryRows(db) {
 }
 
 function formatAmount(amount) {
-  return `${new Intl.NumberFormat('en-US').format(amount)} ${getConfigValuePlaceholder()}`;
-}
-
-function getConfigValuePlaceholder() {
-  return config.ECONOMY_CURRENCY_NAME;
+  return `$${new Intl.NumberFormat('en-US').format(amount)}`;
 }
 
 function salaryListEmbed(db) {
@@ -37,7 +33,7 @@ function salaryListEmbed(db) {
 }
 
 async function addSalary(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   const role = interaction.options.getRole('role', true);
   const amount = interaction.options.getInteger('amount', true);
   const job = configuredJobForRole(ctx.db, role.id);
@@ -58,7 +54,7 @@ async function addSalary(interaction, ctx) {
 }
 
 async function setSalary(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   const role = interaction.options.getRole('role', true);
   const amount = interaction.options.getInteger('amount', true);
   const job = configuredJobForRole(ctx.db, role.id);
@@ -74,7 +70,7 @@ async function setSalary(interaction, ctx) {
 }
 
 async function removeSalary(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   const role = interaction.options.getRole('role', true);
   const result = ctx.db.prepare('DELETE FROM economy_job_salaries WHERE role_id = ?').run(role.id);
   if (result.changes) recordEconomyAudit(ctx.db, { actorId: interaction.user.id, targetId: role.id, action: 'salary_removed' });
@@ -84,7 +80,7 @@ async function removeSalary(interaction, ctx) {
 }
 
 async function toggleSalary(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   const role = interaction.options.getRole('role', true);
   const enabled = interaction.options.getBoolean('enabled', true);
   const result = ctx.db.prepare('UPDATE economy_job_salaries SET enabled = ?, updated_by = ?, updated_at = ? WHERE role_id = ?')
@@ -95,7 +91,7 @@ async function toggleSalary(interaction, ctx) {
 }
 
 async function setSalaryPolicy(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   const policy = interaction.options.getString('mode', true);
   if (!['highest', 'combined'].includes(policy)) {
     return interaction.reply({ content: 'Choose highest or combined salaries.', ephemeral: true });
@@ -106,7 +102,7 @@ async function setSalaryPolicy(interaction, ctx) {
 }
 
 async function pauseSalaries(interaction, ctx, enabled) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   setConfigValue(ctx.db, 'TOWN_JOBS_SALARIES_ENABLED', enabled);
   if (enabled) {
     const nextDueAt = new Date(Date.now() + 30 * 60_000).toISOString();
@@ -119,7 +115,7 @@ async function pauseSalaries(interaction, ctx, enabled) {
 }
 
 async function showSalaryHistory(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
+  if (!await ensureEconomyManagement(interaction, ctx.db)) return;
   const role = interaction.options.getRole('role');
   const rows = ctx.db.prepare(`
     SELECT user_id, amount, created_at, metadata_json
@@ -144,7 +140,7 @@ async function handleSalaryCommand(interaction, ctx) {
   if (action === 'remove') return removeSalary(interaction, ctx);
   if (action === 'toggle') return toggleSalary(interaction, ctx);
   if (action === 'list') {
-    if (!await ensureManagement(interaction, ctx.db)) return;
+    if (!await ensureEconomyManagement(interaction, ctx.db)) return;
     return interaction.reply({ embeds: [salaryListEmbed(ctx.db)], ephemeral: true });
   }
   if (action === 'policy') return setSalaryPolicy(interaction, ctx);

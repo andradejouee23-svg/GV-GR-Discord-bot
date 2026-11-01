@@ -373,6 +373,21 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     CREATE INDEX IF NOT EXISTS economy_cash_drops_status_expiry
       ON economy_cash_drops(status, expires_at);
 
+    CREATE TABLE IF NOT EXISTS economy_shop_purchase_confirmations (
+      confirmation_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      item_id TEXT NOT NULL REFERENCES economy_shop_items(id),
+      quantity INTEGER NOT NULL CHECK(quantity > 0),
+      quoted_price INTEGER NOT NULL CHECK(quoted_price > 0),
+      status TEXT NOT NULL CHECK(status IN ('pending', 'confirmed', 'cancelled', 'expired')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS economy_shop_purchase_confirmations_user_status
+      ON economy_shop_purchase_confirmations(user_id, status, expires_at);
+
     CREATE TABLE IF NOT EXISTS economy_cash_drop_claims (
       drop_id TEXT NOT NULL REFERENCES economy_cash_drops(drop_id),
       user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
@@ -514,6 +529,7 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       author_text TEXT,
       color_hex TEXT,
       header_image_url TEXT,
+      header_image_position TEXT NOT NULL DEFAULT 'top' CHECK(header_image_position IN ('top', 'bottom')),
       fields_json TEXT NOT NULL DEFAULT '[]',
       button_labels_json TEXT NOT NULL DEFAULT '[]',
       header_channel_id TEXT,
@@ -667,6 +683,20 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       ON economy_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL;
   `);
 
+  const cashDropColumns = new Set(db.pragma('table_info(economy_cash_drops)').map((column) => column.name));
+  if (!cashDropColumns.has('claimed_by')) db.exec('ALTER TABLE economy_cash_drops ADD COLUMN claimed_by TEXT');
+  if (!cashDropColumns.has('claimed_at')) db.exec('ALTER TABLE economy_cash_drops ADD COLUMN claimed_at TEXT');
+  if (!cashDropColumns.has('claimed_message_updated_at')) db.exec('ALTER TABLE economy_cash_drops ADD COLUMN claimed_message_updated_at TEXT');
+  db.exec(`
+    UPDATE economy_cash_drops
+    SET claimed_by = (
+      SELECT user_id FROM economy_cash_drop_claims WHERE drop_id = economy_cash_drops.drop_id ORDER BY claimed_at LIMIT 1
+    ), claimed_at = (
+      SELECT claimed_at FROM economy_cash_drop_claims WHERE drop_id = economy_cash_drops.drop_id ORDER BY claimed_at LIMIT 1
+    )
+    WHERE status = 'claimed' AND claimed_by IS NULL;
+  `);
+
   const shopColumns = new Set(db.pragma('table_info(economy_shop_items)').map((column) => column.name));
   if (!shopColumns.has('deleted')) {
     db.exec('ALTER TABLE economy_shop_items ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0, 1))');
@@ -691,6 +721,7 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
   if (!applicationDraftColumns.has('current_page')) db.exec('ALTER TABLE temporary_admin_application_drafts ADD COLUMN current_page INTEGER NOT NULL DEFAULT 0');
   const panelEditorColumns = new Set(db.pragma('table_info(panel_editor_configs)').map((column) => column.name));
   if (!panelEditorColumns.has('fields_json')) db.exec("ALTER TABLE panel_editor_configs ADD COLUMN fields_json TEXT NOT NULL DEFAULT '[]'");
+  if (!panelEditorColumns.has('header_image_position')) db.exec("ALTER TABLE panel_editor_configs ADD COLUMN header_image_position TEXT NOT NULL DEFAULT 'top'");
   const appealColumns = new Set(db.pragma('table_info(blacklist_appeals)').map((column) => column.name));
   if (!appealColumns.has('applicant_response')) db.exec("ALTER TABLE blacklist_appeals ADD COLUMN applicant_response TEXT NOT NULL DEFAULT ''");
   db.exec(`

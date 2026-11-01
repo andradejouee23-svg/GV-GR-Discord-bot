@@ -13,6 +13,7 @@ const { createDatabase } = require('./database');
 const { commands } = require('./commands/definitions');
 const { handleButton } = require('./buttons');
 const { handleClockCommand } = require('./commands/clock');
+const { handleClearBotMessagesButton, handleClearBotMessagesCommand } = require('./commands/clearBotMessages');
 const { handleOperationsCommand, handleSessionPanelModal, submitSessionModal } = require('./commands/operations');
 const { handleAnnouncementManagerInteraction } = require('./commands/announcementManager');
 const { handleVehicleCommand, handleVehicleModal, processVehicleExpirations } = require('./commands/vehicles');
@@ -141,7 +142,7 @@ if (requireSetup()) {
       }
 
       if (interaction.isChatInputCommand()) {
-        const handlers = [handleClockCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleBlacklistCommand, handlePanelEditorCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
+        const handlers = [handleClockCommand, handleClearBotMessagesCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleBlacklistCommand, handlePanelEditorCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
         for (const handler of handlers) {
           const result = await handler(interaction, context);
           if (result !== null && result !== undefined) return;
@@ -155,6 +156,7 @@ if (requireSetup()) {
 
       if (interaction.isButton()) {
         if (interaction.customId.startsWith('gv:panel_editor:')) return handlePanelEditorButton(interaction, context);
+        if (interaction.customId.startsWith('gv:clear-bots:')) return handleClearBotMessagesButton(interaction, context);
         if (interaction.customId === 'mgmt:economy') return handleEconomyManagementButton(interaction, context);
         if (interaction.customId.startsWith('mgmt:shift_confirm:') || interaction.customId.startsWith('mgmt:shift_cancel:')) {
           return handleManagementShiftConfirm(interaction, context);

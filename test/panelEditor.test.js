@@ -84,7 +84,7 @@ test('panel editor previews and saves separate HEX/image/text settings while ref
   assert.match(textPreview.embeds[0].data.title, /GV GR • Community Economy/);
 
   const sectionsModal = await handlePanelEditorButton(managerInteraction(env, {
-    customId: textPreview.components[0].components[3].data.custom_id,
+    customId: textPreview.components[0].components[4].data.custom_id,
     showModal: async (modal) => modal,
   }), { db: env.db });
   const sectionsPreview = await handlePanelEditorModal(managerInteraction(env, {
@@ -139,8 +139,22 @@ test('panel editor previews and saves separate HEX/image/text settings while ref
   const secondPreview = await handlePanelEditorSelect(managerInteraction(env, {
     customId: 'gv:panel_editor:select', values: ['economy'], update: async (payload) => payload,
   }), { db: env.db });
+  const positionPreview = await handlePanelEditorButton(managerInteraction(env, {
+    customId: secondPreview.components[0].components[3].data.custom_id,
+    update: async (payload) => payload,
+  }), { db: env.db });
+  assert.equal(positionPreview.embeds.length, 1);
+  assert.equal(positionPreview.embeds[0].data.image.url, 'https://example.com/gv-header.png');
+  await handlePanelEditorButton(managerInteraction(env, {
+    customId: positionPreview.components[1].components[0].data.custom_id,
+    update: async (payload) => payload,
+  }), { db: env.db });
+  assert.equal(getPanelEditorConfig(env.db, 'economy').headerImagePosition, 'bottom');
+  const savedBottomPreview = await handlePanelEditorSelect(managerInteraction(env, {
+    customId: 'gv:panel_editor:select', values: ['economy'], update: async (payload) => payload,
+  }), { db: env.db });
   const removeImageModal = await handlePanelEditorButton(managerInteraction(env, {
-    customId: secondPreview.components[0].components[2].data.custom_id,
+    customId: savedBottomPreview.components[0].components[2].data.custom_id,
     showModal: async (modal) => modal,
   }), { db: env.db });
   const removeImagePreview = await handlePanelEditorModal(managerInteraction(env, {

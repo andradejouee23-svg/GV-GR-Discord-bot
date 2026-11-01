@@ -40,7 +40,7 @@ test('staff panel starts and ends a branded RP session announcement through butt
       sent.push(payload);
       return { id: `session-message-${sent.length}`, channelId: sessionChannelId };
     },
-    messages: { fetch: async () => ({ edit: async (payload) => { edits.push(payload); return payload; } }) },
+    messages: { fetch: async () => ({ author: { id: 'session-bot' }, edit: async (payload) => { edits.push(payload); return payload; } }) },
   };
   const guild = {
     id: config.SERVER_ID,
@@ -48,8 +48,9 @@ test('staff panel starts and ends a branded RP session announcement through butt
     iconURL: () => null,
     members: { fetch: async (id) => memberCache.get(id), me: {} },
   };
-  const client = { channels: { fetch: async () => channel } };
+  const client = { user: { id: 'session-bot' }, channels: { fetch: async () => channel } };
   const panelButtons = createPanelComponents().flatMap((row) => row.components);
+  assert.ok(panelButtons.some((button) => button.data.custom_id === 'mgmt:economy' && button.data.label === 'Economy'));
   assert.ok(panelButtons.some((button) => button.data.custom_id === 'gv:session_panel:quick-start' && button.data.label === 'Quick Start Session'));
   assert.ok(panelButtons.some((button) => button.data.custom_id === 'gv:session_panel:start' && button.data.label === 'Start RP Session'));
   assert.ok(panelButtons.some((button) => button.data.custom_id === 'gv:session_panel:end' && button.data.label === 'End Session'));
@@ -100,8 +101,21 @@ test('staff panel starts and ends a branded RP session announcement through butt
   }, { db, client });
   assert.match(endedReply.content, /Session #1 ended/);
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id = 1").get().status, 'completed');
-  assert.equal(edits[0].components[0].components[0].data.disabled, true);
-  assert.ok(sent.some((payload) => payload.embeds?.[0]?.data.title === '🎙️ RP Session Ended'));
+  assert.equal(edits[0].embeds[0].data.title, '🎙️ RP Session Ended');
+  assert.equal(edits[0].components.length, 0);
+  assert.equal(sent.filter((payload) => payload.embeds?.[0]?.data.title === '🎙️ RP Session Ended').length, 0);
+  const messageCountBeforeRepeat = sent.length;
+  let repeatedEndReply;
+  await handleButton({
+    customId: 'gv:session_panel:end',
+    user: { id: managerId, username: 'Manager' },
+    guild,
+    client,
+    reply: async (payload) => { repeatedEndReply = payload; return payload; },
+  }, { db, client });
+  assert.match(repeatedEndReply.content, /no active RP session/i);
+  assert.equal(sent.length, messageCountBeforeRepeat);
+  assert.equal(edits.length, 1);
 
   let quickReply;
   await handleButton({

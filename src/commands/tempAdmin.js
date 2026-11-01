@@ -51,10 +51,19 @@ function validateQuestionAnswer(question, answer) {
 
 function getApplicationSettings(db) {
   const configuredQuestions = getConfigValue(db, 'TEMP_ADMIN_APPLICATION_QUESTIONS');
+  const questions = (Array.isArray(configuredQuestions) ? configuredQuestions : config.TEMP_ADMIN_APPLICATION_QUESTIONS)
+    .filter((question) => !/\b(?:Discord|Roblox) user ID\b/i.test(typeof question === 'string' ? question : question?.label ?? ''))
+    .map((question) => {
+      const label = typeof question === 'string' ? question : question?.label ?? '';
+      if (!/Discord username/i.test(label)) return question;
+      return typeof question === 'string'
+        ? { label, type: 'short', required: false }
+        : { ...question, type: 'short', required: false };
+    });
   return {
     title: getConfigValue(db, 'TEMP_ADMIN_APPLICATION_TITLE') ?? config.TEMP_ADMIN_APPLICATION_TITLE,
     description: getConfigValue(db, 'TEMP_ADMIN_APPLICATION_DESCRIPTION') ?? config.TEMP_ADMIN_APPLICATION_DESCRIPTION,
-    questions: Array.isArray(configuredQuestions) ? configuredQuestions : config.TEMP_ADMIN_APPLICATION_QUESTIONS,
+    questions,
     durationHours: Number(getConfigValue(db, 'TEMP_ADMIN_DURATION_HOURS') ?? config.TEMP_ADMIN_DURATION_HOURS),
     trialReminderHours: Number(getConfigValue(db, 'TEMP_ADMIN_TRIAL_REMINDER_HOURS') ?? config.TEMP_ADMIN_TRIAL_REMINDER_HOURS ?? 12),
     enabled: getConfigValue(db, 'TEMP_ADMIN_APPLICATIONS_ENABLED') !== false,

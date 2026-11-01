@@ -10,7 +10,7 @@ const {
   TextInputStyle,
 } = require('discord.js');
 const config = require('../../config');
-const { ensureManagement } = require('./staff');
+const { ensureManagement: ensureStaffManagement } = require('./staff');
 const {
   beginBlackjack,
   cardLabel,
@@ -23,7 +23,9 @@ const {
 } = require('../services/economyGames');
 const {
   getConfigValue,
+  getInteractionMember,
   makeEmbed,
+  memberRoleIds,
   setConfigValue,
   validId,
 } = require('../utils/discord');
@@ -56,6 +58,39 @@ function getEconomySettings(db) {
   };
 }
 
+function hasEconomyAccess(member, db) {
+  const roleId = getConfigValue(db, 'ECONOMY_MANAGEMENT_ROLE_ID');
+  return validId(roleId) && memberRoleIds(member).includes(roleId);
+}
+
+async function ensureManagement(interaction, db) {
+  const member = await getInteractionMember(interaction);
+  if (member && hasEconomyAccess(member, db)) return true;
+  const roleId = getConfigValue(db, 'ECONOMY_MANAGEMENT_ROLE_ID');
+  await interaction.reply({
+    content: validId(roleId)
+      ? 'This economy control is restricted to the configured Economy Management role.'
+      : 'Economy access is not configured. A manager can run `/economy access-role` first.',
+    ephemeral: true,
+  });
+  return false;
+}
+
+async function configureEconomyAccessRole(interaction, ctx) {
+  if (!await ensureStaffManagement(interaction, ctx.db)) return;
+  const role = interaction.options.getRole('role', true);
+  const previous = getConfigValue(ctx.db, 'ECONOMY_MANAGEMENT_ROLE_ID') ?? null;
+  setConfigValue(ctx.db, 'ECONOMY_MANAGEMENT_ROLE_ID', role.id);
+  recordEconomyAudit(ctx.db, {
+    actorId: interaction.user.id,
+    action: 'access_role_changed',
+    previousValue: previous,
+    newValue: role.id,
+    reason: 'Economy management access role configured',
+  });
+  return interaction.reply({ content: `Economy management access is now restricted to <@&${role.id}>.`, ephemeral: true });
+}
+
 function validateWorkSettings(settings) {
   if (!Number.isSafeInteger(settings.minimumReward) || settings.minimumReward < 1
     || !Number.isSafeInteger(settings.maximumReward) || settings.maximumReward < settings.minimumReward
@@ -82,8 +117,8 @@ function validateDeliverySettings(settings) {
   return null;
 }
 
-function formatCurrency(amount, currencyName) {
-  return `${new Intl.NumberFormat('en-US').format(amount)} ${currencyName}`;
+function formatCurrency(amount) {
+  return `$${new Intl.NumberFormat('en-US').format(amount)}`;
 }
 
 function ensureEconomyAccount(db, userId, now = new Date().toISOString()) {
@@ -366,6 +401,78 @@ function purchaseShopItem(db, userId, itemId, quantity = 1, now = new Date().toI
   })();
 }
 
+const shopPurchaseConfirmationLifetimeMs = 5 * 60_000;
+
+function prepareShopPurchase(db, userId, itemId, quantity = 1, now = new Date()) {
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new Error('Purchase quantity must be a positive whole number.');
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Purchase time is invalid.');
+  const nowIso = nowDate.toISOString();
+  return db.transaction(() => {
+    db.prepare("UPDATE economy_shop_purchase_confirmations SET status = 'expired' WHERE user_id = ? AND item_id = ? AND status = 'pending' AND expires_at <= ?")
+      .run(userId, itemId, nowIso);
+    const pending = db.prepare("SELECT confirmation_id FROM economy_shop_purchase_confirmations WHERE user_id = ? AND item_id = ? AND status = 'pending' LIMIT 1")
+      .get(userId, itemId);
+    if (pending) return { prepared: false, reason: 'pending', confirmationId: pending.confirmation_id };
+    const item = db.prepare('SELECT * FROM economy_shop_items WHERE id = ?').get(itemId);
+    if (!item || item.deleted) return { prepared: false, reason: 'missing' };
+    if (!item.enabled) return { prepared: false, reason: 'disabled' };
+    if (item.stock < quantity) return { prepared: false, reason: 'stock' };
+    const account = ensureEconomyAccount(db, userId, nowIso);
+    const totalCost = item.price * quantity;
+    if (!Number.isSafeInteger(totalCost)) throw new Error('Purchase total exceeds the safe currency limit.');
+    if (account.wallet_balance + account.bank_balance < totalCost) return { prepared: false, reason: 'funds' };
+    if (item.purchase_limit) {
+      const owned = db.prepare('SELECT COALESCE(SUM(quantity), 0) AS owned FROM economy_purchase_history WHERE user_id = ? AND item_id = ?').get(userId, itemId).owned;
+      if (owned + quantity > item.purchase_limit) return { prepared: false, reason: 'limit' };
+    }
+    const confirmationId = randomUUID().replaceAll('-', '');
+    const expiresAt = new Date(nowDate.getTime() + shopPurchaseConfirmationLifetimeMs).toISOString();
+    db.prepare(`
+      INSERT INTO economy_shop_purchase_confirmations (confirmation_id, user_id, item_id, quantity, quoted_price, status, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(confirmationId, userId, item.id, quantity, item.price, nowIso, expiresAt);
+    return { prepared: true, confirmationId, expiresAt, item, totalCost, quantity, panelColor: getEconomySettings(db).shopColor };
+  })();
+}
+
+function completeShopPurchase(db, confirmationId, userId, idempotencyKey, now = new Date()) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Purchase confirmation time is invalid.');
+  const nowIso = nowDate.toISOString();
+  return db.transaction(() => {
+    const confirmation = db.prepare('SELECT * FROM economy_shop_purchase_confirmations WHERE confirmation_id = ?').get(confirmationId);
+    if (!confirmation || confirmation.user_id !== userId) return { purchased: false, reason: 'owner' };
+    if (confirmation.status !== 'pending') return { purchased: false, reason: 'duplicate' };
+    if (confirmation.expires_at <= nowIso) {
+      db.prepare("UPDATE economy_shop_purchase_confirmations SET status = 'expired' WHERE confirmation_id = ? AND status = 'pending'").run(confirmationId);
+      return { purchased: false, reason: 'expired' };
+    }
+    const item = db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0 AND enabled = 1').get(confirmation.item_id);
+    if (!item || item.stock < confirmation.quantity) return { purchased: false, reason: 'stock' };
+    if (item.price !== confirmation.quoted_price) {
+      db.prepare("UPDATE economy_shop_purchase_confirmations SET status = 'expired' WHERE confirmation_id = ? AND status = 'pending'").run(confirmationId);
+      return { purchased: false, reason: 'price-changed' };
+    }
+    const claimed = db.prepare("UPDATE economy_shop_purchase_confirmations SET status = 'confirmed', completed_at = ? WHERE confirmation_id = ? AND user_id = ? AND status = 'pending'")
+      .run(nowIso, confirmationId, userId);
+    if (!claimed.changes) return { purchased: false, reason: 'duplicate' };
+    const result = purchaseShopItem(db, userId, confirmation.item_id, confirmation.quantity, nowIso, `shop-confirm:${confirmationId}:${idempotencyKey}`);
+    if (!result.purchased) {
+      db.prepare("UPDATE economy_shop_purchase_confirmations SET status = 'expired' WHERE confirmation_id = ? AND status = 'confirmed'").run(confirmationId);
+      return result;
+    }
+    return { ...result, confirmationId };
+  })();
+}
+
+function cancelShopPurchase(db, confirmationId, userId, now = new Date()) {
+  const nowIso = (now instanceof Date ? now : new Date(now)).toISOString();
+  const result = db.prepare("UPDATE economy_shop_purchase_confirmations SET status = 'cancelled', completed_at = ? WHERE confirmation_id = ? AND user_id = ? AND status = 'pending'")
+    .run(nowIso, confirmationId, userId);
+  return result.changes > 0;
+}
+
 function adjustPlayerBalance(db, actorId, userId, amount, reason, now = new Date().toISOString()) {
   if (!Number.isSafeInteger(amount) || amount === 0) throw new Error('Adjustment amount must be a nonzero whole number.');
   if (!reason?.trim()) throw new Error('A reason is required for balance adjustments.');
@@ -414,10 +521,46 @@ function getEconomyTransactions(db, userId = null, limit = 25) {
   return db.prepare('SELECT * FROM economy_transactions ORDER BY created_at DESC LIMIT ?').all(limit);
 }
 
-function cashDropComponents(dropId) {
+function cashDropComponents(dropId, claimedBy = null) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`gv:economy:drop:claim:${dropId}`).setLabel('Claim Cash Drop').setEmoji('💵').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`gv:economy:drop:claim:${dropId}`).setLabel(claimedBy ? 'Claimed' : 'Claim Cash Drop')
+      .setEmoji(claimedBy ? '✅' : '💵').setStyle(claimedBy ? ButtonStyle.Danger : ButtonStyle.Success).setDisabled(Boolean(claimedBy)),
   )];
+}
+
+function claimedCashDropEmbed(drop) {
+  const claimant = drop.claimed_by ? `<@${drop.claimed_by}>` : 'A player';
+  return makeEmbed(config.EMBED_COLORS.error, '💵 Cash Drop Claimed',
+    `This cash drop is no longer available.\n\n**Claimed by:** ${claimant}\n**Reward:** ${formatCurrency(drop.amount)}\n**Claimed:** <t:${Math.floor(new Date(drop.claimed_at).getTime() / 1000)}:R>`);
+}
+
+async function updateClaimedCashDropMessage(client, db, drop) {
+  if (!drop?.message_id || !drop.channel_id || !drop.claimed_by || drop.claimed_message_updated_at) return false;
+  try {
+    const channel = await client.channels.fetch(drop.channel_id);
+    const message = channel?.isTextBased() ? await channel.messages.fetch(drop.message_id) : null;
+    if (!message) return false;
+    await message.edit({
+      embeds: [claimedCashDropEmbed(drop)],
+      components: cashDropComponents(drop.drop_id, drop.claimed_by),
+      allowedMentions: { users: [drop.claimed_by] },
+    });
+    db.prepare('UPDATE economy_cash_drops SET claimed_message_updated_at = ? WHERE drop_id = ? AND claimed_by = ?')
+      .run(new Date().toISOString(), drop.drop_id, drop.claimed_by);
+    return true;
+  } catch (error) {
+    console.error(`Could not update claimed cash drop ${drop.drop_id}:`, error.message);
+    return false;
+  }
+}
+
+async function reconcileClaimedCashDropMessages(client, db) {
+  const pendingUpdates = db.prepare("SELECT * FROM economy_cash_drops WHERE status = 'claimed' AND claimed_by IS NOT NULL AND claimed_message_updated_at IS NULL ORDER BY claimed_at").all();
+  let updated = 0;
+  for (const drop of pendingUpdates) {
+    if (await updateClaimedCashDropMessage(client, db, drop)) updated += 1;
+  }
+  return updated;
 }
 
 function createManualEconomyCashDrop(db, { channelId, amount, maxClaims, lifetimeMinutes, actorId }, now = new Date()) {
@@ -468,10 +611,9 @@ function claimEconomyCashDrop(db, dropId, userId, now = new Date()) {
     }
     const updated = db.prepare(`
       UPDATE economy_cash_drops
-      SET claim_count = claim_count + 1,
-          status = CASE WHEN claim_count + 1 >= max_claims THEN 'claimed' ELSE status END
-      WHERE drop_id = ? AND status = 'open' AND expires_at > ? AND claim_count < max_claims
-    `).run(dropId, nowIso);
+      SET claim_count = claim_count + 1, status = 'claimed', claimed_by = ?, claimed_at = ?
+      WHERE drop_id = ? AND status = 'open' AND expires_at > ? AND claim_count = 0
+    `).run(userId, nowIso, dropId, nowIso);
     if (!updated.changes) return { claimed: false, reason: 'closed' };
     db.prepare('INSERT INTO economy_cash_drop_claims (drop_id, user_id, amount, claimed_at) VALUES (?, ?, ?, ?)')
       .run(dropId, userId, drop.amount, nowIso);
@@ -486,7 +628,7 @@ function claimEconomyCashDrop(db, dropId, userId, now = new Date()) {
       description: `Cash drop ${dropId}`,
       now: nowIso,
     });
-    return { claimed: true, amount: drop.amount, walletAfter, claimCount: drop.claim_count + 1, maxClaims: drop.max_claims };
+    return { claimed: true, amount: drop.amount, walletAfter, claimCount: drop.claim_count + 1, maxClaims: drop.max_claims, dropId };
   })();
 }
 
@@ -497,7 +639,7 @@ async function postPendingCashDrop(client, db, drop, processedAt) {
     if (!channel?.isTextBased() || !channel.send) return { posted: false, reason: 'channel' };
     const message = await channel.send({
       embeds: [makeEmbed(getEconomySettings(db).panelColor, '💵 GV GR Cash Drop',
-        `A cash drop is available! The first **${drop.max_claims}** players to claim receive **${formatCurrency(drop.amount, getEconomySettings(db).currencyName)}** each.\nExpires <t:${Math.floor(new Date(drop.expires_at).getTime() / 1000)}:R>.`)],
+        `A cash drop is available! The first player to claim receives **${formatCurrency(drop.amount, getEconomySettings(db).currencyName)}**.\nExpires <t:${Math.floor(new Date(drop.expires_at).getTime() / 1000)}:R>.`)],
       components: cashDropComponents(drop.drop_id),
     });
     db.transaction(() => {
@@ -523,6 +665,7 @@ async function processEconomyCashDrops(client, db, now = new Date()) {
   const nowDate = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(nowDate.getTime())) throw new Error('Cash drop scheduler time is invalid.');
   const nowIso = nowDate.toISOString();
+  await reconcileClaimedCashDropMessages(client, db);
   db.prepare("UPDATE economy_cash_drops SET status = 'expired' WHERE status = 'open' AND expires_at <= ?").run(nowIso);
 
   let pending = db.prepare("SELECT * FROM economy_cash_drops WHERE status = 'pending' ORDER BY created_at LIMIT 1").get();
@@ -1042,16 +1185,14 @@ function shopPagePayload(db, page = 0) {
   const safePage = Math.min(Math.max(0, page), pageCount - 1);
   const shown = items.slice(safePage * pageSize, (safePage + 1) * pageSize);
   const description = shown.length
-    ? shown.map((item) => `**${item.name}** • ${formatCurrency(item.price, settings.currencyName)} • Stock: ${item.stock}\n${item.description || 'No description'}\nID: \`${item.id}\``).join('\n\n').slice(0, 3900)
+    ? shown.map((item) => `**${item.name}** • ${formatCurrency(item.price)} • Stock: ${item.stock}\n${item.description || 'No description'}`).join('\n\n').slice(0, 3900)
     : 'The shop is empty right now.';
   const rows = [];
   for (let index = 0; index < shown.length; index += 2) {
     const row = new ActionRowBuilder();
     for (const item of shown.slice(index, index + 2)) {
-      row.addComponents(
-        new ButtonBuilder().setCustomId(`gv:economy:shop:view:${item.id}`).setLabel(`Details: ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`gv:economy:shop:buy:${item.id}`).setLabel(`Buy ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Success),
-      );
+      row.addComponents(new ButtonBuilder().setCustomId(`gv:economy:shop:buy:${item.id}`)
+        .setLabel(`Buy ${item.name}`.slice(0, 80)).setEmoji('🛒').setStyle(ButtonStyle.Success));
     }
     rows.push(row);
   }
@@ -1070,7 +1211,22 @@ function shopPagePayload(db, page = 0) {
   };
 }
 
-function amountModal(customId, title, label = 'Amount in GV Credits') {
+function shopPurchaseConfirmationPayload(prepared) {
+  const { item, quantity, totalCost, confirmationId, expiresAt } = prepared;
+  const embed = makeEmbed(prepared.panelColor, `🛒 Confirm Purchase • ${item.name}`,
+    `${item.description || 'No description'}\n\n**Price:** ${formatCurrency(totalCost)}${quantity > 1 ? ` (${quantity} × ${formatCurrency(item.price)})` : ''}\n**Available stock:** ${item.stock}\n\nConfirm to complete this purchase. This confirmation expires <t:${Math.floor(new Date(expiresAt).getTime() / 1000)}:R>.`);
+  if (item.image_url) embed.setImage(item.image_url);
+  return {
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`gv:economy:shop:confirm:${confirmationId}`).setLabel('Confirm Purchase').setEmoji('✅').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`gv:economy:shop:cancel:${confirmationId}`).setLabel('Cancel').setEmoji('✖️').setStyle(ButtonStyle.Secondary),
+    )],
+    ephemeral: true,
+  };
+}
+
+function amountModal(customId, title, label = 'Amount in dollars') {
   return new ModalBuilder().setCustomId(customId).setTitle(title).addComponents(
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('amount').setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12),
@@ -1292,14 +1448,22 @@ async function handleShopCommand(interaction, ctx) {
     return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.info, '🧾 Purchase History', description.slice(0, 4000))], ephemeral: true });
   }
   if (action === 'purchase') {
-    const itemId = interaction.options.getString('item-id', true);
+    const productQuery = interaction.options.getString('product', true).trim();
+    const item = ctx.db.prepare('SELECT id, name FROM economy_shop_items WHERE deleted = 0 AND (id = ? OR lower(name) = lower(?)) LIMIT 1')
+      .get(productQuery, productQuery);
+    if (!item) return interaction.reply({ content: 'That shop product could not be found. Browse `/economy shop` for available product names.', ephemeral: true });
     const quantity = interaction.options.getInteger('quantity') ?? 1;
-    const result = purchaseShopItem(ctx.db, interaction.user.id, itemId, quantity, new Date().toISOString(), interaction.id);
-    if (!result.purchased) {
-      const reasons = { missing: 'That item does not exist.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough wallet balance.', limit: 'You have reached the purchase limit for that item.' };
-      return interaction.reply({ content: reasons[result.reason] || 'That purchase could not be completed.', ephemeral: true });
+    let prepared;
+    try {
+      prepared = prepareShopPurchase(ctx.db, interaction.user.id, item.id, quantity);
+    } catch (error) {
+      return interaction.reply({ content: error.message, ephemeral: true });
     }
-    return interaction.reply({ content: `Purchased **${itemId}** for ${formatCurrency(result.totalCost, getEconomySettings(ctx.db).currencyName)}.`, ephemeral: true });
+    if (!prepared.prepared) {
+      const reasons = { missing: 'That item does not exist.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough money to purchase this item.', limit: 'You have reached the purchase limit for this item.', pending: 'You already have a pending confirmation for this item.' };
+      return interaction.reply({ content: reasons[prepared.reason] || 'That purchase could not be started.', ephemeral: true });
+    }
+    return interaction.reply(shopPurchaseConfirmationPayload(prepared));
   }
   return interaction.reply({ content: 'This shop action is not available yet.', ephemeral: true });
 }
@@ -1401,7 +1565,7 @@ function economyProductModal(mode, item = null) {
     .setTitle(mode === 'add' ? 'Add Economy Product' : 'Edit Economy Product');
   const fields = [
     ['name', 'Product name', item?.name ?? ''],
-    ['price', 'Price in GV Credits', String(item?.price ?? '')],
+    ['price', 'Price in dollars', String(item?.price ?? '')],
     ['stock', 'Available stock', String(item?.stock ?? '')],
     ['description', 'Product description', item?.description ?? ''],
     ['category', 'Category', item?.category ?? 'General'],
@@ -1426,7 +1590,7 @@ function economyProductImageModal(item) {
 function economyProductsPayload(db) {
   const items = listShopItems(db, true);
   const embedDescription = items.length
-    ? items.slice(0, 25).map((item) => `**${item.name}** • ${formatCurrency(item.price, getEconomySettings(db).currencyName)} • stock ${item.stock} • ${item.enabled ? 'enabled' : 'disabled'}\nID: \`${item.id}\``).join('\n\n')
+    ? items.slice(0, 25).map((item) => `**${item.name}** • ${formatCurrency(item.price, getEconomySettings(db).currencyName)} • stock ${item.stock} • ${item.enabled ? 'enabled' : 'disabled'}`).join('\n\n')
     : 'No products exist yet. Use Add Product to create the first item.';
   const components = [];
   if (items.length) {
@@ -1548,7 +1712,7 @@ async function handleEconomyManagementSelect(interaction, ctx) {
   const settings = getEconomySettings(ctx.db);
   return interaction.update({
     embeds: [makeEmbed(config.EMBED_COLORS.management, item.name,
-      `${item.description || 'No description'}\n\n**Price:** ${formatCurrency(item.price, settings.currencyName)}\n**Stock:** ${item.stock}\n**Category:** ${item.category}\n**Status:** ${item.enabled ? 'Enabled' : 'Disabled'}\n**ID:** \`${item.id}\``)],
+      `${item.description || 'No description'}\n\n**Price:** ${formatCurrency(item.price, settings.currencyName)}\n**Stock:** ${item.stock}\n**Category:** ${item.category}\n**Status:** ${item.enabled ? 'Enabled' : 'Disabled'}`)],
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`gv:economy:staff:product:edit:${item.id}`).setLabel('Edit').setStyle(ButtonStyle.Primary),
@@ -1594,6 +1758,7 @@ async function handleEconomyTransactions(interaction, ctx) {
 async function handleEconomyCommand(interaction, ctx) {
   if (interaction.commandName !== 'economy') return null;
   const action = interaction.options.getSubcommand();
+  if (action === 'access-role') return configureEconomyAccessRole(interaction, ctx);
   if (action === 'wallet') return showWallet(interaction, ctx);
   if (action === 'work') return work(interaction, ctx);
   if (action === 'configure') return configureEconomy(interaction, ctx);
@@ -1848,29 +2013,52 @@ async function handleEconomyButton(interaction, ctx) {
     delete payload.ephemeral;
     return interaction.update(payload);
   }
-  const shopView = interaction.customId.match(/^gv:economy:shop:view:([a-f0-9-]{36})$/);
-  if (shopView) {
-    const item = ctx.db.prepare('SELECT * FROM economy_shop_items WHERE id = ? AND deleted = 0 AND enabled = 1 AND stock > 0').get(shopView[1]);
-    if (!item) return interaction.reply({ content: 'That product is no longer available.', ephemeral: true });
-    const settings = getEconomySettings(ctx.db);
-    const embed = makeEmbed(settings.shopColor, item.name,
-      `${item.description || 'No description'}\n\n**Price:** ${formatCurrency(item.price, settings.currencyName)}\n**Category:** ${item.category}\n**Stock:** ${item.stock}${item.purchase_limit ? `\n**Purchase limit:** ${item.purchase_limit}` : ''}`);
-    if (item.image_url) embed.setImage(item.image_url);
-    return interaction.reply({
-      embeds: [embed],
-      components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
-        .setCustomId(`gv:economy:shop:buy:${item.id}`).setLabel(`Buy ${item.name}`.slice(0, 80)).setStyle(ButtonStyle.Success))],
-      ephemeral: true,
+  const purchaseConfirmation = interaction.customId.match(/^gv:economy:shop:(confirm|cancel):([a-f0-9]{32})$/);
+  if (purchaseConfirmation) {
+    const [, action, confirmationId] = purchaseConfirmation;
+    if (action === 'cancel') {
+      const cancelled = cancelShopPurchase(ctx.db, confirmationId, interaction.user.id);
+      return interaction.update({ content: cancelled ? 'Purchase cancelled. No money was charged.' : 'This purchase confirmation is no longer available.', embeds: [], components: [] });
+    }
+    let result;
+    try {
+      result = completeShopPurchase(ctx.db, confirmationId, interaction.user.id, interaction.id);
+    } catch (error) {
+      return interaction.update({ content: `Purchase could not be completed: ${error.message}`, embeds: [], components: [] });
+    }
+    if (!result.purchased) {
+      const reasons = {
+        owner: 'This purchase confirmation belongs to another player.',
+        duplicate: 'This purchase confirmation was already used.',
+        expired: 'This purchase confirmation expired. Start a new purchase from the shop.',
+        stock: 'There is not enough stock available to complete this purchase.',
+        'price-changed': 'The item price changed. Review the current price and confirm a new purchase.',
+        funds: 'You do not have enough money to complete this purchase.',
+        limit: 'You have reached the purchase limit for this item.',
+        missing: 'That item is no longer available.',
+        disabled: 'That item is disabled.',
+      };
+      return interaction.update({ content: reasons[result.reason] ?? 'Purchase could not be completed.', embeds: [], components: [] });
+    }
+    return interaction.update({
+      content: `Purchase complete. **${formatCurrency(result.totalCost)}** was charged.`,
+      embeds: [],
+      components: [],
     });
   }
   const shopBuy = interaction.customId.match(/^gv:economy:shop:buy:([a-f0-9-]{36})$/);
   if (shopBuy) {
-    const result = purchaseShopItem(ctx.db, interaction.user.id, shopBuy[1], 1, new Date().toISOString(), interaction.id);
-    if (!result.purchased) {
-      const reasons = { missing: 'That item is no longer available.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough combined wallet and bank funds.', limit: 'You have reached the purchase limit for that item.' };
-      return interaction.reply({ content: reasons[result.reason] ?? 'Purchase could not be completed.', ephemeral: true });
+    let prepared;
+    try {
+      prepared = prepareShopPurchase(ctx.db, interaction.user.id, shopBuy[1]);
+    } catch (error) {
+      return interaction.reply({ content: error.message, ephemeral: true });
     }
-    return interaction.reply({ content: `Purchase complete. **${formatCurrency(result.totalCost, getEconomySettings(ctx.db).currencyName)}** was charged.`, ephemeral: true });
+    if (!prepared.prepared) {
+      const reasons = { missing: 'That item is no longer available.', disabled: 'That item is disabled.', stock: 'There is not enough stock available.', funds: 'You do not have enough money to purchase this item.', limit: 'You have reached the purchase limit for this item.', pending: 'You already have a pending confirmation for this item. Finish or cancel it first.' };
+      return interaction.reply({ content: reasons[prepared.reason] ?? 'Purchase could not be started.', ephemeral: true });
+    }
+    return interaction.reply(shopPurchaseConfirmationPayload(prepared));
   }
   if (interaction.customId === 'gv:economy:delivery:start') return startDeliveryRush(interaction, ctx);
   const cashDropMatch = interaction.customId.match(/^gv:economy:drop:claim:([a-f0-9-]{36})$/);
@@ -1883,10 +2071,9 @@ async function handleEconomyButton(interaction, ctx) {
       duplicate: 'You have already claimed this cash drop.',
     };
     if (!result.claimed) return interaction.reply({ content: messages[result.reason] ?? 'That cash drop is unavailable.', ephemeral: true });
-    if (result.claimCount >= result.maxClaims) {
-      await interaction.message?.edit({ components: [] }).catch(() => {});
-    }
-    return interaction.reply({ content: `Cash drop claimed: **${formatCurrency(result.amount, getEconomySettings(ctx.db).currencyName)}** added to your wallet.`, ephemeral: true });
+    const drop = ctx.db.prepare('SELECT * FROM economy_cash_drops WHERE drop_id = ?').get(result.dropId);
+    await updateClaimedCashDropMessage(interaction.client, ctx.db, drop);
+    return interaction.reply({ content: `Cash drop claimed: **${formatCurrency(result.amount)}** added to your wallet.`, ephemeral: true });
   }
   const match = interaction.customId.match(/^gv:economy:delivery:choose:([a-f0-9-]{36}):(fast|safe|shortcut)$/);
   if (match) return chooseDeliveryRoute(interaction, ctx, match[1], match[2]);
@@ -1907,6 +2094,7 @@ module.exports = {
   ensureEconomyAccount,
   getEconomyLeaderboard,
   getEconomySettings,
+  ensureEconomyManagement: ensureManagement,
   getEconomyTransactions,
   getPlayerInventory,
   getPlayerPurchaseHistory,
@@ -1919,6 +2107,10 @@ module.exports = {
   listShopItems,
   makeDeliveryGameComponents,
   processEconomyCashDrops,
+  prepareShopPurchase,
+  completeShopPurchase,
+  cancelShopPurchase,
+  reconcileClaimedCashDropMessages,
   createManualEconomyCashDrop,
   recordEconomyAudit,
   purchaseShopItem,

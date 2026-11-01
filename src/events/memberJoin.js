@@ -70,7 +70,7 @@ async function welcomeNewMember(member, db, client) {
 
   const customized = applyPanelCustomization(db, 'welcome', buildWelcomeEmbed(member), buildWelcomeComponents(member.guild.id, howToJoinChannelId, rulesChannelId));
   const panel = getPanelEditorConfig(db, 'welcome');
-  if (panel.headerImageUrl) {
+  if (panel.headerImageUrl && panel.headerImagePosition === 'top') {
     await welcomeChannel.send({ embeds: [new EmbedBuilder().setImage(panel.headerImageUrl)], allowedMentions: { parse: [] } });
   }
   return welcomeChannel.send({

@@ -50,6 +50,7 @@ function getPanelEditorConfig(db, panelKey) {
     authorText: row?.author_text ?? '',
     colorHex: row?.color_hex ?? defaults.color,
     headerImageUrl: row?.header_image_url ?? '',
+    headerImagePosition: row?.header_image_position === 'bottom' ? 'bottom' : 'top',
     fields: row ? JSON.parse(row.fields_json ?? '[]') : [],
     buttonLabels: row ? JSON.parse(row.button_labels_json) : [],
     headerChannelId: row?.header_channel_id ?? null,
@@ -66,6 +67,7 @@ function applyPanelCustomization(db, panelKey, embed, components = []) {
   if (color !== null) embed.setColor(color);
   if (row.footer_text) embed.setFooter({ text: row.footer_text });
   if (row.author_text) embed.setAuthor({ name: row.author_text });
+  if (row.header_image_url && row.header_image_position === 'bottom') embed.setImage(row.header_image_url);
   const fieldOverrides = JSON.parse(row.fields_json ?? '[]');
   if (fieldOverrides.length) {
     const fields = (embed.data.fields ?? []).map((field) => ({ name: field.name, value: field.value, inline: Boolean(field.inline) }));
@@ -126,6 +128,7 @@ function editorButtons(draft) {
       new ButtonBuilder().setCustomId(`gv:panel_editor:text:${draft.draft_id}`).setLabel('Edit Text & Buttons').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`gv:panel_editor:color:${draft.draft_id}`).setLabel('Edit HEX Color').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`gv:panel_editor:image:${draft.draft_id}`).setLabel(draft.data.headerImageUrl ? 'Replace / Remove Image' : 'Add Header Image').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`gv:panel_editor:position:${draft.draft_id}`).setLabel(`Image: ${draft.data.headerImagePosition === 'bottom' ? 'Bottom' : 'Top'}`).setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`gv:panel_editor:sections:${draft.draft_id}`).setLabel('Edit Sections').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
@@ -144,7 +147,9 @@ function editorPreview(draft) {
   if (data.fields?.length) embed.addFields(...data.fields.slice(0, 10).map((field) => ({ name: field.name, value: field.value, inline: Boolean(field.inline) })));
   if (data.buttonLabels?.length) embed.addFields({ name: 'Button labels', value: data.buttonLabels.map((button, index) => `${index + 1}. ${button.label || '(unchanged)'}`).join('\n').slice(0, 1000) });
   const embeds = data.headerImageUrl && isHttpsUrl(data.headerImageUrl)
-    ? [new EmbedBuilder().setColor(color ?? config.EMBED_COLORS.info).setImage(data.headerImageUrl), embed]
+    ? data.headerImagePosition === 'bottom'
+      ? [embed.setImage(data.headerImageUrl)]
+      : [new EmbedBuilder().setColor(color ?? config.EMBED_COLORS.info).setImage(data.headerImageUrl), embed]
     : [embed];
   return { embeds, components: editorButtons(draft) };
 }
@@ -193,9 +198,9 @@ function panelTarget(db, key) {
 }
 
 async function ensurePanelHeader(client, db, panelKey, channel) {
-  const saved = db.prepare('SELECT header_image_url, header_channel_id, header_message_id FROM panel_editor_configs WHERE panel_key = ?').get(panelKey);
+  const saved = db.prepare('SELECT header_image_url, header_image_position, header_channel_id, header_message_id FROM panel_editor_configs WHERE panel_key = ?').get(panelKey);
   if (!saved) return { created: false, messageId: null };
-  if (!saved.header_image_url) {
+  if (!saved.header_image_url || saved.header_image_position === 'bottom') {
     if (saved.header_channel_id && saved.header_message_id) {
       try {
         const oldChannel = await client.channels.fetch(saved.header_channel_id);
@@ -289,7 +294,7 @@ async function refreshExistingPanel(client, db, panelKey, data) {
     try { oldMessage = await channel.messages.fetch(target.messageId); } catch {}
   }
   let headerMessage = null;
-  if (data.headerImageUrl) {
+  if (data.headerImageUrl && data.headerImagePosition !== 'bottom') {
     const imageEmbed = new EmbedBuilder().setColor(parseHex(data.colorHex) ?? config.EMBED_COLORS.info).setImage(data.headerImageUrl);
     headerMessage = await channel.send({ embeds: [imageEmbed], allowedMentions: { parse: [] } });
     const newMessage = await channel.send({ ...payload, allowedMentions: { parse: [] } });
@@ -310,7 +315,7 @@ async function refreshExistingPanel(client, db, panelKey, data) {
     const newMessage = await channel.send(payload);
     setConfigValue(db, target.messageKey, newMessage.id);
   }
-  if (!data.headerImageUrl) {
+  if (!data.headerImageUrl || data.headerImagePosition === 'bottom') {
     const savedConfig = db.prepare('SELECT header_channel_id, header_message_id FROM panel_editor_configs WHERE panel_key = ?').get(panelKey);
     if (savedConfig?.header_channel_id && savedConfig.header_message_id) {
       try {
@@ -329,14 +334,15 @@ async function saveConfiguration(interaction, ctx, draft) {
   const now = new Date().toISOString();
   ctx.db.prepare(`
     INSERT INTO panel_editor_configs (panel_key, title, description, footer_text, author_text, color_hex,
-      header_image_url, fields_json, button_labels_json, updated_by, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      header_image_url, header_image_position, fields_json, button_labels_json, updated_by, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(panel_key) DO UPDATE SET title = excluded.title, description = excluded.description,
       footer_text = excluded.footer_text, author_text = excluded.author_text, color_hex = excluded.color_hex,
-      header_image_url = excluded.header_image_url, fields_json = excluded.fields_json, button_labels_json = excluded.button_labels_json,
+      header_image_url = excluded.header_image_url, header_image_position = excluded.header_image_position,
+      fields_json = excluded.fields_json, button_labels_json = excluded.button_labels_json,
       updated_by = excluded.updated_by, updated_at = excluded.updated_at
   `).run(draft.panel_key, data.title, data.description, data.footerText, data.authorText, data.colorHex,
-    data.headerImageUrl, JSON.stringify(data.fields ?? []), JSON.stringify(data.buttonLabels), interaction.user.id, now);
+    data.headerImageUrl, data.headerImagePosition === 'bottom' ? 'bottom' : 'top', JSON.stringify(data.fields ?? []), JSON.stringify(data.buttonLabels), interaction.user.id, now);
   ctx.db.prepare('DELETE FROM panel_editor_drafts WHERE draft_id = ?').run(draft.draft_id);
   let refreshed = { refreshed: false, reason: 'no-existing-panel' };
   try { refreshed = await refreshExistingPanel(interaction.client, ctx.db, draft.panel_key, data); }
@@ -348,11 +354,11 @@ async function saveConfiguration(interaction, ctx, draft) {
 async function handlePanelEditorCommand(interaction, ctx) {
   if (interaction.commandName !== 'panel-editor') return null;
   if (!await ensureManagement(interaction, ctx.db)) return;
-  return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, '🎨 GV GR • PANEL EDITOR', 'Choose a panel to customize. Text, button labels, HEX color, and a top-positioned header image are saved separately for each panel.')], components: panelMenu(), ephemeral: true });
+  return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, '🎨 GV GR • PANEL EDITOR', 'Choose a panel to customize. Text, button labels, HEX color, and top or bottom image placement are saved separately for each panel.')], components: panelMenu(), ephemeral: true });
 }
 
 async function handlePanelEditorButton(interaction, ctx) {
-  const match = interaction.customId.match(/^gv:panel_editor:(text|color|image|sections|save|cancel):([a-f0-9]{32})$/);
+  const match = interaction.customId.match(/^gv:panel_editor:(text|color|image|position|sections|save|cancel):([a-f0-9]{32})$/);
   if (!match) return null;
   if (!await ensureManagement(interaction, ctx.db)) return;
   const draft = getDraft(ctx.db, match[2], interaction.user.id);
@@ -360,6 +366,11 @@ async function handlePanelEditorButton(interaction, ctx) {
   if (match[1] === 'text') return interaction.showModal(textModal(draft));
   if (match[1] === 'color') return interaction.showModal(colorModal(draft));
   if (match[1] === 'image') return interaction.showModal(imageModal(draft));
+  if (match[1] === 'position') {
+    draft.data.headerImagePosition = draft.data.headerImagePosition === 'bottom' ? 'top' : 'bottom';
+    saveDraft(ctx.db, draft.draft_id, interaction.user.id, draft.data);
+    return interaction.update(editorPreview(draft));
+  }
   if (match[1] === 'sections') return interaction.showModal(sectionsModal(draft));
   if (match[1] === 'cancel') {
     ctx.db.prepare('DELETE FROM panel_editor_drafts WHERE draft_id = ?').run(draft.draft_id);
