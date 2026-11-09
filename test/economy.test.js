@@ -231,7 +231,7 @@ test('cash drops recover pending posts after restart, follow persisted intervals
   setConfigValue(store.db, 'ECONOMY_CASH_DROP_LIFETIME_MINUTES', 1440);
   const sends = [];
   const unavailableClient = { channels: { fetch: async () => ({ isTextBased: () => true, send: async () => { throw new Error('temporary outage'); } }) } };
-  const start = new Date('2026-11-01T12:00:00.000Z');
+  const start = new Date(Date.now() - 60_000);
   const failedPost = await processEconomyCashDrops(unavailableClient, store.db, start);
   assert.deepEqual({ posted: failedPost.posted, reason: failedPost.reason }, { posted: false, reason: 'post' });
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM economy_cash_drops WHERE status = 'pending'").get().count, 1);
