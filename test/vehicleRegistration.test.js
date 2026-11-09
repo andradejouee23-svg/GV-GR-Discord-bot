@@ -24,6 +24,7 @@ const applicantId = 'vehicle-applicant';
 const roleId = '1556064708795306157';
 const reviewChannelId = '1666064708795306156';
 const panelChannelId = '1666064708795306157';
+const mediaChannelId = '1666064708795306158';
 
 function createEnvironment(t) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-vehicles-'));
@@ -47,6 +48,7 @@ function createEnvironment(t) {
   };
   const reviewPosts = [];
   const panelPosts = [];
+  const mediaPosts = [];
   const panelEdits = [];
   const reviewEdits = [];
   const dms = [];
@@ -76,13 +78,23 @@ function createEnvironment(t) {
       fetch: async () => ({ edit: async (payload) => { panelEdits.push(payload); return { id: '1776064708795306199' }; } }),
     },
   };
+  const mediaChannel = {
+    id: mediaChannelId,
+    guildId: guild.id,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    send: async (payload) => {
+      mediaPosts.push(payload);
+      return { id: `media-post-${mediaPosts.length}` };
+    },
+  };
   const client = {
-    channels: { fetch: async (id) => id === reviewChannelId ? reviewChannel : id === panelChannelId ? panelChannel : null },
+    channels: { fetch: async (id) => id === reviewChannelId ? reviewChannel : id === panelChannelId ? panelChannel : id === mediaChannelId ? mediaChannel : null },
     users: {
       fetch: async (id) => ({ send: async (payload) => { dms.push({ id, payload }); } }),
     },
   };
-  return { db, guild, client, reviewPosts, panelPosts, panelEdits, reviewEdits, dms };
+  return { db, guild, client, reviewPosts, panelPosts, panelEdits, reviewEdits, mediaPosts, dms };
 }
 
 function makeApplicationData(overrides = {}) {
@@ -436,4 +448,46 @@ test('Staff Panel vehicle management selects members and safely manages their re
   assert.equal(db.prepare('SELECT status FROM vehicle_applications WHERE id = ?').get(approvedId).status, 'revoked');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM vehicle_applications WHERE id = ?').get(approvedId).count, 1);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM vehicle_registration_history WHERE application_id = ? AND action = 'removed'").get(approvedId).count, 1);
+});
+
+test('only management can publish an approved vehicle with a photo to Media, once', async (t) => {
+  const env = createEnvironment(t);
+  setConfigValue(env.db, 'VEHICLE_MEDIA_CHANNEL_ID', mediaChannelId);
+  const vehicleId = savePendingApplication(env.db, applicantId, makeApplicationData({
+    plate: 'MEDIA 1', imageUrl: 'https://cdn.example.com/car.jpg',
+  }), reviewChannelId);
+  env.db.prepare("UPDATE vehicle_applications SET status = 'approved', reviewed_at = ?, reviewer_id = ?, registration_code = ? WHERE id = ?")
+    .run('2026-11-09T12:00:00.000Z', managerId, registrationCode(vehicleId), vehicleId);
+
+  let denied;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:publish_media:${applicantId}:${vehicleId}`,
+    user: { id: 'regular-player', username: 'Player' },
+    reply: async (payload) => { denied = payload; return payload; },
+  }), { db: env.db });
+  assert.match(denied.content, /management roles only/i);
+  assert.equal(env.mediaPosts.length, 0);
+
+  let postedView;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:publish_media:${applicantId}:${vehicleId}`,
+    update: async (payload) => { postedView = payload; return payload; },
+  }), { db: env.db });
+  const published = env.db.prepare('SELECT * FROM vehicle_applications WHERE id = ?').get(vehicleId);
+  assert.equal(env.mediaPosts.length, 1);
+  assert.equal(env.mediaPosts[0].embeds[0].data.image.url, 'https://cdn.example.com/car.jpg');
+  assert.doesNotMatch(env.mediaPosts[0].embeds[0].data.description, /MEDIA 1/);
+  assert.equal(published.media_channel_id, mediaChannelId);
+  assert.equal(published.media_message_id, 'media-post-1');
+  assert.ok(published.media_published_at);
+  assert.equal(env.db.prepare("SELECT action FROM vehicle_registration_history WHERE application_id = ? ORDER BY id DESC LIMIT 1").get(vehicleId).action, 'media_published');
+  assert.ok(postedView.components.flatMap((row) => row.components).some((button) => button.data.disabled && /Published in Media/.test(button.data.label)));
+
+  let duplicateReply;
+  await handleVehicleManagementButton(managerInteraction(env, {
+    customId: `mgmt:vehicle:publish_media:${applicantId}:${vehicleId}`,
+    reply: async (payload) => { duplicateReply = payload; return payload; },
+  }), { db: env.db });
+  assert.match(duplicateReply.content, /already been published/i);
+  assert.equal(env.mediaPosts.length, 1);
 });

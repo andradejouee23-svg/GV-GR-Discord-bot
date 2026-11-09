@@ -18,12 +18,12 @@ const draftLifetimeMs = 30 * 60_000;
 const panelDefinitions = {
   staff: { label: 'Staff Duty Panel', title: '🕐 GV GR STAFF DUTY', description: 'Clock in, clock out, or check who is currently on duty.', color: '#8B63C7' },
   economy: { label: 'Economy Panel', title: '💰 GV GR | ECONOMY', description: 'Manage your virtual roleplay money from one place.', color: '#1F7AE0' },
+  economy_daily: { label: 'Daily Economy Panel', title: '💰 GV GR | DAILY ECONOMY', description: 'Wallet, games, and shop.', color: '#1F7AE0' },
   shop: { label: 'Economy Shop', title: '🛍️ GV GR Shop', description: 'Browse available GV GR products.', color: '#9B5DE5' },
   townjobs: { label: 'Town Jobs Panel', title: 'GV GR | TOWN JOBS', description: 'Choose a Town Job below.', color: '#8B63C7' },
   vehicle: { label: 'Vehicle Registration Panel', title: '🚘 GV GR VEHICLE REGISTRATION', description: 'Register your roleplay vehicle before driving it in Greenville. Applications are reviewed by GV GR staff.', color: '#36A765' },
   welcome: { label: 'Welcome Messages', title: 'WELCOME TO GV GR!', description: 'Welcome to Greenville RP. We are glad you are here.', color: '#36A765' },
   blacklist: { label: 'Blacklist Management', title: '🛡️ GV GR • BLACKLIST MANAGEMENT', description: 'Manage saved blacklist records and appeals.', color: '#8B63C7' },
-  tempadmin: { label: 'Temporary Admin Applications', title: 'Temporary Admin Application', description: 'Apply for temporary GV GR administration.', color: '#8B63C7' },
   forms: { label: 'Forms', title: 'GV GR Forms', description: 'Select a form to submit.', color: '#4388D1' },
 };
 
@@ -186,11 +186,10 @@ function panelTarget(db, key) {
   const targets = {
     staff: ['STAFF_ACTIVITY_CHANNEL_ID', 'panel_message'],
     economy: ['ECONOMY_PANEL_MESSAGE_CHANNEL_ID', 'ECONOMY_PANEL_MESSAGE_ID'],
+    economy_daily: ['ECONOMY_DAILY_PANEL_MESSAGE_CHANNEL_ID', 'ECONOMY_DAILY_PANEL_MESSAGE_ID'],
     townjobs: ['TOWN_JOBS_PANEL_CHANNEL_ID', 'TOWN_JOBS_PANEL_MESSAGE_ID'],
     vehicle: ['VEHICLE_REGISTRATION_CHANNEL_ID', 'vehicle_panel_message_id'],
     blacklist: ['BLACKLIST_PANEL_CHANNEL_ID', 'BLACKLIST_PANEL_MESSAGE_ID'],
-    tempadmin: ['TEMP_ADMIN_APPLICATION_CHANNEL_ID', 'TEMP_ADMIN_APPLICATION_MESSAGE_ID'],
-    forms: ['TEMP_ADMIN_APPLICATION_CHANNEL_ID', 'TEMP_ADMIN_APPLICATION_MESSAGE_ID'],
   };
   if (!targets[key]) return null;
   const [channelKey, messageKey] = targets[key];
@@ -248,6 +247,11 @@ async function renderPanelPayload(db, key, client) {
     const settings = economy.getEconomySettings(db);
     embed = economy.economyPanelEmbed(settings);
     components = economy.economyPanelComponents();
+  } else if (key === 'economy_daily') {
+    const economy = require('./economy');
+    const settings = economy.getEconomySettings(db);
+    embed = economy.economyDailyPanelEmbed(settings);
+    components = economy.economyDailyPanelComponents();
   } else if (key === 'townjobs') {
     const townjobs = require('./townJobs');
     const settings = townjobs.getTownJobsSettings(db);
@@ -261,11 +265,9 @@ async function renderPanelPayload(db, key, client) {
     const blacklist = require('./blacklist');
     embed = blacklist.panelEmbed(db);
     components = blacklist.panelComponents();
-  } else if (key === 'tempadmin' || key === 'forms') {
-    const tempadmin = require('./tempAdmin');
-    const settings = tempadmin.getApplicationSettings(db);
-    embed = tempadmin.applicationPanelEmbed(settings);
-    components = tempadmin.applicationPanelComponents();
+  } else if (key === 'forms') {
+    embed = makeEmbed(config.EMBED_COLORS.info, '📝 GV GR • FORMS', 'Player reports, vehicle registration, and blacklist appeals. Customize this forms information panel through the editor.');
+    components = [];
   } else {
     return null;
   }
@@ -351,10 +353,14 @@ async function saveConfiguration(interaction, ctx, draft) {
   return interaction.update({ content: `${panelDefinitions[draft.panel_key].label} customization saved.${note}`, embeds: [], components: [] });
 }
 
-async function handlePanelEditorCommand(interaction, ctx) {
-  if (interaction.commandName !== 'panel-editor') return null;
+async function openPanelEditor(interaction, ctx) {
   if (!await ensureManagement(interaction, ctx.db)) return;
   return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, '🎨 GV GR • PANEL EDITOR', 'Choose a panel to customize. Text, button labels, HEX color, and top or bottom image placement are saved separately for each panel.')], components: panelMenu(), ephemeral: true });
+}
+
+async function handlePanelEditorCommand(interaction, ctx) {
+  if (interaction.commandName !== 'panel-editor') return null;
+  return openPanelEditor(interaction, ctx);
 }
 
 async function handlePanelEditorButton(interaction, ctx) {
@@ -440,6 +446,7 @@ module.exports = {
   applyPanelCustomization,
   getPanelEditorConfig,
   ensurePanelHeader,
+  openPanelEditor,
   handlePanelEditorButton,
   handlePanelEditorCommand,
   handlePanelEditorModal,

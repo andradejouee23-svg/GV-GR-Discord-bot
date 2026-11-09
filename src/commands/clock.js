@@ -29,11 +29,12 @@ function createPanelComponents() {
       .setLabel('Create Announcement')
       .setEmoji('📣')
       .setStyle(ButtonStyle.Primary)),
-    new ActionRowBuilder().addComponents(new ButtonBuilder()
-      .setCustomId('mgmt:economy')
-      .setLabel('Economy')
-      .setEmoji('💰')
-      .setStyle(ButtonStyle.Success)),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mgmt:economy').setLabel('Economy').setEmoji('💰').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('mgmt:forms').setLabel('Forms').setEmoji('📝').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('mgmt:vehicles').setLabel('Member Vehicles').setEmoji('🚘').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('mgmt:clear-bots').setLabel('Clear Bot Messages').setEmoji('🧹').setStyle(ButtonStyle.Danger),
+    ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gv:session_panel:quick-start').setLabel('Quick Start Session').setEmoji('⚡').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gv:session_panel:start').setLabel('Start RP Session').setEmoji('🎙️').setStyle(ButtonStyle.Success),
@@ -69,17 +70,17 @@ async function buildPanelEmbed(db, guild) {
     WHERE status = 'scheduled' AND starts_at >= ? AND starts_at < ?
   `).get(`${today}T00:00:00.000Z`, `${today}T23:59:59.999Z`).count;
 
-  return makeEmbed(config.EMBED_COLORS.management, '🕐 GV GR STAFF DUTY',
-    'Clock in, clock out, or check who is currently on duty.\n\n'
-    + '🟢 **Clock In**\nStart your GV GR staff shift.\n\n'
-    + '🔴 **Clock Out**\nEnd your current staff shift.\n\n'
-    + '📊 **Status**\nSee which staff members are currently on duty.\n\n'
-    + '📈 **My Activity**\nView your staff hours and activity.')
-    .addFields({
-      name: '📋 STAFF INFORMATION',
-      value: `🟢 Currently On Duty: **${onDuty.length}**\n👥 Staff Online: **${staffOnline}**\n🎙️ Active RP Sessions: **${activeSessions}**\n🎉 Events Today: **${eventsToday}**`,
-    })
-    .setFooter({ text: 'GV GR Staff • Use the buttons below to manage your shift' })
+  return makeEmbed(config.EMBED_COLORS.management, '🛡️ GV GR • STAFF OPERATIONS',
+    '**SHIFT DESK**\nStart or finish your shift, check your progress, and see who is on duty.\n\n'
+    + '**TEAM TOOLS**\nAnnouncements, forms, economy, vehicle management, and channel cleanup are grouped below.\n\n'
+    + '**LIVE SESSIONS**\nQuick Start uses the saved session template; management can end the active session.')
+    .addFields(
+      { name: '🟢 ON DUTY', value: String(onDuty.length), inline: true },
+      { name: '👥 STAFF ONLINE', value: String(staffOnline), inline: true },
+      { name: '🎙️ ACTIVE SESSIONS', value: String(activeSessions), inline: true },
+      { name: '📅 EVENTS TODAY', value: String(eventsToday), inline: true },
+    )
+    .setFooter({ text: 'GV GR • Staff Operations Center' })
     .setTimestamp();
 }
 

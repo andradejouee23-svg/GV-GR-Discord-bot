@@ -17,11 +17,13 @@ const {
   getEconomyLeaderboard,
   getEconomySettings,
   getWallet,
+  handleEconomyGameSelect,
   handleEconomyCommand,
   handleEconomyManagementButton,
   handleEconomyManagementSelect,
   handleEconomyModal,
   purchaseShopItem,
+  processEconomyDailyPanel,
   processEconomyCashDrops,
   removeShopItem,
   resolveDeliveryGame,
@@ -428,16 +430,42 @@ test('economy game slash commands and decision buttons connect to persistent gam
 
   const blackjack = await handleEconomyCommand(env.interaction('blackjack', { getInteger: () => 100 }, playerId), { db: store.db });
   assert.match(blackjack.embeds[0].data.title, /Blackjack/);
-  assert.equal(blackjack.components.length, blackjack.embeds[0].data.description.includes('Payout') ? 0 : 1);
-  if (blackjack.components.length) {
+  assert.equal(blackjack.components.length, 1);
+  if (blackjack.components[0].components.some((button) => button.data.custom_id.endsWith(':stand'))) {
     const standId = blackjack.components[0].components[1].data.custom_id;
     let denied;
     await handleButton({ customId: standId, user: { id: 'another-player' }, reply: async (payload) => { denied = payload; return payload; } }, { db: store.db });
     assert.match(denied.content, /Only the player who started/);
     let settled;
     await handleButton({ customId: standId, user: { id: playerId }, update: async (payload) => { settled = payload; return payload; } }, { db: store.db });
-    assert.equal(settled.components.length, 0);
+    assert.equal(settled.components.length, 1);
+    const shareId = settled.components[0].components[0].data.custom_id;
+    const publicMessages = [];
+    const publicChannel = { id: channelId, isTextBased: () => true, send: async (payload) => { publicMessages.push(payload); return { id: 'public-game-result' }; } };
+    let deniedShare;
+    await handleButton({ customId: shareId, user: { id: 'another-player' }, channel: publicChannel, reply: async (payload) => { deniedShare = payload; return payload; } }, { db: store.db });
+    assert.match(deniedShare.content, /Only the player who completed/);
+    assert.equal(publicMessages.length, 0);
+    let shared;
+    await handleButton({ customId: shareId, user: { id: playerId }, channel: publicChannel, update: async (payload) => { shared = payload; return payload; } }, { db: store.db });
+    assert.match(shared.content, /shared in this channel/);
+    assert.equal(publicMessages.length, 1);
+    assert.deepEqual(publicMessages[0].allowedMentions, { parse: [] });
+    assert.equal(store.db.prepare("SELECT status FROM economy_game_publications WHERE publication_id = ?").get(shareId.split(':').at(-1)).status, 'published');
   }
+
+  let gameMenu;
+  await handleButton({ customId: 'gv:economy:games', user: { id: playerId }, reply: async (payload) => { gameMenu = payload; return payload; } }, { db: store.db });
+  assert.equal(gameMenu.ephemeral, true);
+  assert.equal(gameMenu.components[0].components[0].data.custom_id, 'gv:economy:games:select');
+  assert.equal(gameMenu.components[0].components[0].options.length, 7);
+  let wagerModal;
+  await handleEconomyGameSelect({
+    customId: 'gv:economy:games:select',
+    values: ['dice'],
+    showModal: async (modal) => { wagerModal = modal; return modal; },
+  }, { db: store.db });
+  assert.equal(wagerModal.data.custom_id, 'gv:economy:modal:game:dice');
 
   let modal;
   await handleButton({ customId: 'gv:economy:chicken', showModal: async (value) => { modal = value; } }, { db: store.db });
@@ -455,10 +483,12 @@ test('economy game slash commands and decision buttons connect to persistent gam
   let chickenProgress;
   await handleButton({ customId: stepId, user: { id: playerId }, update: async (payload) => { chickenProgress = payload; return payload; } }, { db: store.db });
   assert.match(chickenProgress.embeds[0].data.title, /Chicken Road/);
-  if (chickenProgress.components.length) {
+  if (chickenProgress.components[0]?.components.some((button) => button.data.custom_id.endsWith(':cashout'))) {
     let cashedOut;
     await handleButton({ customId: chickenProgress.components[0].components[1].data.custom_id, user: { id: playerId }, update: async (payload) => { cashedOut = payload; return payload; } }, { db: store.db });
-    assert.equal(cashedOut.components.length, 0);
+    assert.equal(cashedOut.components[0].components[0].data.label, 'Share Result in Chat');
+  } else {
+    assert.equal(chickenProgress.components[0].components[0].data.label, 'Share Result in Chat');
   }
 });
 
@@ -484,14 +514,17 @@ test('management dashboard exposes economy controls and persists settings, adjus
   const manager = await env.guild.members.fetch(managerId);
   manager.roles.cache.set(economyRoleId, { id: economyRoleId, name: 'Economy' });
   let dashboard;
+  let updatedDashboard = false;
   await handleEconomyManagementButton({
     customId: 'mgmt:economy',
     guild: env.guild,
     user: { id: managerId },
-    update: async (payload) => { dashboard = payload; return payload; },
-    reply: async (payload) => payload,
+    update: async () => { updatedDashboard = true; },
+    reply: async (payload) => { dashboard = payload; return payload; },
   }, { db: store.db });
   assert.match(dashboard.embeds[0].data.title, /Economy Management/);
+  assert.equal(dashboard.ephemeral, true);
+  assert.equal(updatedDashboard, false);
   assert.ok(dashboard.components.flatMap((row) => row.components).some((button) => button.data.custom_id === 'gv:economy:staff:balance'));
 
   let settingsModal;
@@ -899,7 +932,7 @@ test('management configures and updates one panel; Wallet and Work stay private'
   assert.equal(env.edits.length, 1);
   const panelButtons = env.posts[0].components.flatMap((row) => row.components);
   assert.deepEqual(panelButtons.map((button) => button.data.label), [
-    'My Wallet', 'Work', 'Bank', 'Shop', 'Leaderboard', 'Blackjack', 'Coin Flip', 'Roulette', 'Chicken Road', 'History', 'Daily Rewards', 'Delivery Rush', 'Inventory',
+    'My Wallet', 'Work', 'Bank', 'Shop', 'Leaderboard', 'Games Arcade', 'History', 'Daily Rewards', 'Delivery Rush', 'Inventory',
   ]);
   assert.ok(panelButtons.every((button) => !button.data.disabled));
 
@@ -924,6 +957,31 @@ test('management configures and updates one panel; Wallet and Work stay private'
   await handleEconomyCommand(unauthorized, { db: store.db });
   unauthorizedReply = unauthorized.lastReply;
   assert.match(unauthorizedReply.content, /configured Economy Management role/i);
+});
+
+test('compact Economy panel publishes at 11 AM Eastern once per date with only Wallet, Games, and Shop', async (t) => {
+  const store = makeTempDatabase(t);
+  const env = createPanelEnvironment(store.db);
+  env.client.guilds = { cache: new Map([[config.SERVER_ID, env.guild]]), fetch: async () => env.guild };
+  setConfigValue(store.db, 'ECONOMY_PANEL_CHANNEL_ID', channelId);
+
+  const early = await processEconomyDailyPanel(env.client, store.db, new Date('2026-11-09T15:59:00.000Z'));
+  assert.deepEqual(early, { posted: false, reason: 'not-due' });
+  const posted = await processEconomyDailyPanel(env.client, store.db, new Date('2026-11-09T16:00:00.000Z'));
+  assert.equal(posted.posted, true);
+  assert.equal(env.posts.length, 1);
+  assert.deepEqual(env.posts[0].components.flatMap((row) => row.components).map((button) => button.data.label), ['Wallet', 'Games', 'Shop']);
+  assert.deepEqual(env.posts[0].components.flatMap((row) => row.components).map((button) => button.data.custom_id), [
+    'gv:economy:wallet', 'gv:economy:games', 'gv:economy:shop',
+  ]);
+  assert.equal(JSON.parse(store.db.prepare("SELECT value FROM settings WHERE key = 'ECONOMY_DAILY_PANEL_LAST_DATE'").get().value), '2026-11-09');
+
+  const duplicate = await processEconomyDailyPanel(env.client, store.db, new Date('2026-11-09T16:15:00.000Z'));
+  assert.deepEqual(duplicate, { posted: false, reason: 'not-due' });
+  assert.equal(env.posts.length, 1);
+  const nextDay = await processEconomyDailyPanel(env.client, store.db, new Date('2026-11-10T16:00:00.000Z'));
+  assert.equal(nextDay.posted, true);
+  assert.equal(env.posts.length, 2);
 });
 
 test('Delivery Rush respects cooldown, resolves once, and pays only through the existing wallet ledger', (t) => {

@@ -17,6 +17,7 @@ const {
   ensureManagement,
 } = require('./staff');
 const { applyPanelCustomization, ensurePanelHeader } = require('./panelEditor');
+const { getFormQuestion } = require('./forms');
 const {
   getConfigValue,
   makeEmbed,
@@ -95,23 +96,23 @@ function addTextInput(modal, id, label, style, maxLength, required, value = '', 
   modal.addComponents(new ActionRowBuilder().addComponents(input));
 }
 
-function applicationBasicModal() {
+function applicationBasicModal(db) {
   const modal = new ModalBuilder()
     .setCustomId('gv:vehicle:apply:basic')
     .setTitle('Vehicle Registration • 1 of 2');
-  addTextInput(modal, 'roblox', 'Roblox username', TextInputStyle.Short, 20, true, '', 'Enter your exact Roblox username.');
-  addTextInput(modal, 'vehicle', 'Vehicle make and model', TextInputStyle.Short, 100, true, '', 'Example: 2023 Chevrolet Tahoe.');
-  addTextInput(modal, 'plate', 'License plate', TextInputStyle.Short, 16, true, '', 'Example: GV 1234.');
-  addTextInput(modal, 'state', 'Registration state / province', TextInputStyle.Short, 32, true, '', 'Example: Wisconsin.');
-  addTextInput(modal, 'color', 'Vehicle color', TextInputStyle.Short, 40, true, '', 'Example: Midnight blue.');
+  for (const [key, id, maxLength] of [['roblox', 'roblox', 20], ['vehicle', 'vehicle', 100], ['plate', 'plate', 16], ['state', 'state', 32], ['color', 'color', 40]]) {
+    const question = getFormQuestion(db, 'vehicle_registration', key);
+    addTextInput(modal, id, question.label, TextInputStyle.Short, maxLength, true, '', question.placeholder);
+  }
   return modal;
 }
 
-function applicationDetailsModal(draftId) {
+function applicationDetailsModal(draftId, db) {
   const modal = new ModalBuilder()
     .setCustomId(`gv:vehicle:apply:details:${draftId}`)
     .setTitle('Vehicle Registration • 2 of 2');
-  addTextInput(modal, 'year', 'Vehicle year (YYYY)', TextInputStyle.Short, 4, true, '', 'Example: 2023.');
+  const year = getFormQuestion(db, 'vehicle_registration', 'year');
+  addTextInput(modal, 'year', year.label, TextInputStyle.Short, 4, true, '', year.placeholder);
   modal.addLabelComponents(new LabelBuilder()
     .setLabel('Vehicle picture (optional)')
     .setDescription('Upload one image, up to 8 MB.')
@@ -270,8 +271,8 @@ function getApplicationDraft(db, id, applicantId, now = new Date()) {
   return { ...row, data: JSON.parse(row.data_json) };
 }
 
-async function startApplication(interaction) {
-  return interaction.showModal(applicationBasicModal());
+async function startApplication(interaction, ctx) {
+  return interaction.showModal(applicationBasicModal(ctx.db));
 }
 
 async function submitBasicApplication(interaction, ctx) {
@@ -307,7 +308,7 @@ async function submitBasicApplication(interaction, ctx) {
 async function continueApplication(interaction, ctx, draftId) {
   const draft = getApplicationDraft(ctx.db, draftId, interaction.user.id);
   if (!draft) return interaction.reply({ content: 'This application form expired. Start a new registration from the panel.', ephemeral: true });
-  return interaction.showModal(applicationDetailsModal(draftId));
+  return interaction.showModal(applicationDetailsModal(draftId, ctx.db));
 }
 
 async function getReviewChannel(interaction, ctx) {
@@ -489,6 +490,57 @@ async function updateReviewMessage(client, application, embed) {
   }
 }
 
+
+async function publishApprovedVehicleToMedia(interaction, ctx, applicantId, vehicleId) {
+  const vehicle = ctx.db.prepare("SELECT * FROM vehicle_applications WHERE id = ? AND applicant_id = ? AND status = 'approved'")
+    .get(vehicleId, applicantId);
+  if (!vehicle) return interaction.reply({ content: 'Only this member’s approved registration can be published.', ephemeral: true });
+  if (!vehicle.image_url) return interaction.reply({ content: 'This registration has no vehicle photo. A photo is required before publishing to Media.', ephemeral: true });
+  if (vehicle.media_message_id) return interaction.reply({ content: 'This vehicle has already been published to Media.', ephemeral: true });
+  const channelId = getConfigValue(ctx.db, 'VEHICLE_MEDIA_CHANNEL_ID');
+  if (!validId(channelId)) return interaction.reply({ content: 'Configure the approved vehicle media channel with `/staffconfig channel` first.', ephemeral: true });
+  const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !channel.send || channel.guildId !== interaction.guild.id) {
+    return interaction.reply({ content: 'The configured vehicle media channel is unavailable.', ephemeral: true });
+  }
+  const permissions = channel.permissionsFor(interaction.guild.members.me);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel)
+    || !permissions.has(PermissionFlagsBits.SendMessages)
+    || !permissions.has(PermissionFlagsBits.EmbedLinks)) {
+    return interaction.reply({ content: 'The bot needs View Channel, Send Messages, and Embed Links in the media channel.', ephemeral: true });
+  }
+  const claimed = ctx.db.prepare(`
+    UPDATE vehicle_applications SET media_published_at = 'publishing'
+    WHERE id = ? AND applicant_id = ? AND status = 'approved' AND image_url IS NOT NULL
+      AND media_message_id IS NULL AND (media_published_at IS NULL OR media_published_at != 'publishing')
+  `).run(vehicleId, applicantId);
+  if (!claimed.changes) return interaction.reply({ content: 'This vehicle is already being published or has already been posted.', ephemeral: true });
+  try {
+    const embed = makeEmbed(config.EMBED_COLORS.active, `🚘 Approved Civilian Vehicle • ${applicationCode(vehicleId)}`,
+      `**Owner:** <@${applicantId}>\n**Vehicle:** ${vehicle.vehicle_year} ${vehicle.color} ${vehicle.make_model}\n**Status:** Approved civilian vehicle`)
+      .setImage(vehicle.image_url)
+      .setFooter({ text: 'GV GR • Approved Civilian Vehicle' });
+    const message = await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+    const publishedAt = new Date().toISOString();
+    ctx.db.transaction(() => {
+      ctx.db.prepare(`
+        UPDATE vehicle_applications SET media_channel_id = ?, media_message_id = ?, media_published_at = ?
+        WHERE id = ? AND applicant_id = ? AND status = 'approved' AND media_published_at = 'publishing'
+      `).run(channel.id, message.id, publishedAt, vehicleId, applicantId);
+      ctx.db.prepare(`
+        INSERT INTO vehicle_registration_history (application_id, actor_id, action, details_json, created_at)
+        VALUES (?, ?, 'media_published', ?, ?)
+      `).run(vehicleId, interaction.user.id, JSON.stringify({ channelId: channel.id, messageId: message.id }), publishedAt);
+    })();
+    const updated = ctx.db.prepare('SELECT * FROM vehicle_applications WHERE id = ?').get(vehicleId);
+    return interaction.update({ content: `Approved vehicle published to <#${channel.id}>.`, ...vehicleManagementDetailsPayload(updated, applicantId, 0) });
+  } catch (error) {
+    ctx.db.prepare("UPDATE vehicle_applications SET media_published_at = NULL WHERE id = ? AND media_message_id IS NULL AND media_published_at = 'publishing'")
+      .run(vehicleId);
+    console.error(`Could not publish vehicle ${applicationCode(vehicleId)} to Media:`, error.message);
+    return interaction.reply({ content: 'I could not publish this vehicle. Check the media channel and try again.', ephemeral: true });
+  }
+}
 async function handleDenialSubmit(interaction, ctx, applicationId, expectedApplicantId = null) {
   if (!await ensureManagement(interaction, ctx.db)) return;
   const current = ctx.db.prepare("SELECT * FROM vehicle_applications WHERE id = ? AND status = 'pending' AND (? IS NULL OR applicant_id = ?)")
@@ -623,6 +675,12 @@ function vehicleManagementDetailsPayload(vehicle, applicantId, page) {
     actions.push(new ButtonBuilder().setCustomId(`mgmt:vehicle:approve:${applicantId}:${vehicle.id}`).setLabel('Approve').setEmoji('✅').setStyle(ButtonStyle.Success));
     actions.push(new ButtonBuilder().setCustomId(`mgmt:vehicle:deny:${applicantId}:${vehicle.id}`).setLabel('Deny').setEmoji('⛔').setStyle(ButtonStyle.Danger));
   }
+  if (vehicle.status === 'approved' && vehicle.image_url) {
+    actions.push(new ButtonBuilder()
+      .setCustomId(`mgmt:vehicle:publish_media:${applicantId}:${vehicle.id}`)
+      .setLabel(vehicle.media_message_id ? 'Published in Media' : 'Publish to Media')
+      .setEmoji('🖼️').setStyle(ButtonStyle.Secondary).setDisabled(Boolean(vehicle.media_message_id || vehicle.media_published_at === 'publishing')));
+  }
   if (['pending', 'approved'].includes(vehicle.status)) {
     actions.push(new ButtonBuilder().setCustomId(`mgmt:vehicle:edit:${applicantId}:${vehicle.id}`).setLabel('Edit').setEmoji('✏️').setStyle(ButtonStyle.Primary));
     actions.push(new ButtonBuilder().setCustomId(`mgmt:vehicle:remove:${applicantId}:${vehicle.id}`).setLabel('Remove').setEmoji('🗑️').setStyle(ButtonStyle.Danger));
@@ -704,13 +762,14 @@ async function handleVehicleManagementButton(interaction, ctx) {
   if (pageMatch) return showMemberVehicles(interaction, ctx, pageMatch[1], Number(pageMatch[2]));
   const backMatch = interaction.customId.match(/^mgmt:vehicle:back:([^:]+):(\d+)$/);
   if (backMatch) return showMemberVehicles(interaction, ctx, backMatch[1], Number(backMatch[2]));
-  const actionMatch = interaction.customId.match(/^mgmt:vehicle:(edit|approve|deny|remove):([^:]+):(\d+)$/);
+  const actionMatch = interaction.customId.match(/^mgmt:vehicle:(edit|approve|deny|remove|publish_media):([^:]+):(\d+)$/);
   if (!actionMatch) return interaction.reply({ content: 'This vehicle management control is not recognized.', ephemeral: true });
   const [, action, applicantId, rawVehicleId] = actionMatch;
   const vehicleId = Number(rawVehicleId);
   const vehicle = ctx.db.prepare('SELECT * FROM vehicle_applications WHERE id = ? AND applicant_id = ?')
     .get(vehicleId, applicantId);
   if (!vehicle) return interaction.reply({ content: 'That registration does not belong to the selected member.', ephemeral: true });
+  if (action === 'publish_media') return publishApprovedVehicleToMedia(interaction, ctx, applicantId, vehicleId);
   if (action === 'approve') return handleApproval(interaction, ctx, vehicleId, applicantId);
   if (action === 'deny') {
     if (vehicle.status !== 'pending') return interaction.reply({ content: 'Only pending registrations can be denied.', ephemeral: true });
@@ -963,7 +1022,7 @@ async function handleVehicleCommand(interaction, ctx) {
 }
 
 async function handleVehicleButton(interaction, ctx) {
-  if (interaction.customId === 'gv:vehicle:register') return startApplication(interaction);
+  if (interaction.customId === 'gv:vehicle:register') return startApplication(interaction, ctx);
   if (interaction.customId === 'gv:vehicle:mine') return showMyVehicles(interaction, ctx);
   if (interaction.customId.startsWith('gv:vehicle:continue:')) {
     return continueApplication(interaction, ctx, interaction.customId.split(':').at(-1));

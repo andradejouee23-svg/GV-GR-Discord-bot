@@ -18,6 +18,9 @@ const {
   handValue,
   playCoinFlip,
   playRoulette,
+  playDiceDuel,
+  playScratchCard,
+  playSlots,
   resolveBlackjackAction,
   resolveChickenAction,
   startChickenRoad,
@@ -788,10 +791,7 @@ function economyPanelComponents() {
       new ButtonBuilder().setCustomId('gv:economy:leaderboard').setLabel('Leaderboard').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gv:economy:blackjack').setLabel('Blackjack').setEmoji('🃏').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('gv:economy:coinflip').setLabel('Coin Flip').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('gv:economy:roulette').setLabel('Roulette').setEmoji('🎡').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('gv:economy:chicken').setLabel('Chicken Road').setEmoji('🐔').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gv:economy:games').setLabel('Games Arcade').setEmoji('🎮').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gv:economy:transactions').setLabel('History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
@@ -800,6 +800,20 @@ function economyPanelComponents() {
       new ButtonBuilder().setCustomId('gv:economy:inventory').setLabel('Inventory').setEmoji('🎒').setStyle(ButtonStyle.Secondary),
     ),
   ];
+}
+
+function economyDailyPanelEmbed(settings) {
+  return makeEmbed(settings.panelColor, '💰 GV GR • DAILY ECONOMY',
+    'Your money, the shop, and the Games Arcade.')
+    .setFooter({ text: 'GV GR • Virtual currency' });
+}
+
+function economyDailyPanelComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gv:economy:wallet').setLabel('Wallet').setEmoji('💳').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('gv:economy:games').setLabel('Games').setEmoji('🎮').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('gv:economy:shop').setLabel('Shop').setEmoji('🛍️').setStyle(ButtonStyle.Success),
+  )];
 }
 
 const deliveryScenarios = [
@@ -1086,6 +1100,78 @@ async function publishEconomyPanel(interaction, ctx) {
   return interaction.reply({ content: `Economy Panel ${refreshed ? 'refreshed' : 'posted'} in <#${channel.id}>.`, ephemeral: true });
 }
 
+function easternClock(date) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) };
+}
+
+async function sendEconomyDailyPanel(client, db, now = new Date(), { force = false } = {}) {
+  const clock = easternClock(now);
+  if (!force && (clock.hour < 11 || getConfigValue(db, 'ECONOMY_DAILY_PANEL_LAST_DATE') === clock.date)) {
+    return { posted: false, reason: 'not-due' };
+  }
+  const settings = getEconomySettings(db);
+  if (!validId(settings.channelId)) return { posted: false, reason: 'channel' };
+  let channel;
+  try { channel = await client.channels.fetch(settings.channelId); }
+  catch (error) {
+    console.error('Could not fetch the daily Economy Panel channel:', error.message);
+    return { posted: false, reason: 'channel' };
+  }
+  if (!channel?.isTextBased() || !channel.send || channel.guildId !== config.SERVER_ID) {
+    return { posted: false, reason: 'channel' };
+  }
+  let guild;
+  try { guild = client.guilds?.cache?.get(config.SERVER_ID) ?? await client.guilds?.fetch(config.SERVER_ID); }
+  catch { guild = null; }
+  if (!guild?.members?.me) return { posted: false, reason: 'permissions' };
+  const permissions = channel.permissionsFor(guild.members.me);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel)
+    || !permissions.has(PermissionFlagsBits.SendMessages)
+    || !permissions.has(PermissionFlagsBits.EmbedLinks)) {
+    return { posted: false, reason: 'permissions' };
+  }
+  const customized = applyPanelCustomization(db, 'economy_daily', economyDailyPanelEmbed(settings), economyDailyPanelComponents());
+  try {
+    const message = await channel.send({
+      embeds: [customized.embed],
+      components: customized.components,
+      allowedMentions: { parse: [] },
+    });
+    setConfigValue(db, 'ECONOMY_DAILY_PANEL_LAST_DATE', clock.date);
+    setConfigValue(db, 'ECONOMY_DAILY_PANEL_MESSAGE_CHANNEL_ID', channel.id);
+    setConfigValue(db, 'ECONOMY_DAILY_PANEL_MESSAGE_ID', message.id);
+    return { posted: true, channelId: channel.id, messageId: message.id, date: clock.date };
+  } catch (error) {
+    console.error('Could not post the daily Economy Panel:', error.message);
+    return { posted: false, reason: 'send' };
+  }
+}
+
+async function processEconomyDailyPanel(client, db, now = new Date()) {
+  return sendEconomyDailyPanel(client, db, now);
+}
+
+async function publishEconomyDailyPanel(interaction, ctx) {
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const result = await sendEconomyDailyPanel(interaction.client, ctx.db, new Date(), { force: true });
+  const messages = {
+    channel: 'Configure the Economy Panel channel with `/economy configure channel:<channel>` first.',
+    permissions: 'The bot needs View Channel, Send Messages, and Embed Links in the Economy Panel channel.',
+    send: 'I could not publish the daily Economy Panel. Check the channel permissions and try again.',
+  };
+  return interaction.reply({ content: result.posted
+    ? `Daily Economy Panel posted in <#${result.channelId}>. The scheduled 11 AM Eastern post is now marked complete for today.`
+    : messages[result.reason] ?? 'The Daily Economy Panel could not be published.', ephemeral: true });
+}
+
 async function showWallet(interaction, ctx) {
   const settings = getEconomySettings(ctx.db);
   const account = getWallet(ctx.db, interaction.user.id);
@@ -1202,6 +1288,15 @@ async function handleDailyRewardCommand(interaction, ctx) {
   return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, '🎁 Daily Reward Claimed', `You claimed **${formatCurrency(result.amount, settings.currencyName)}**.\n**Wallet:** ${formatCurrency(result.walletAfter, settings.currencyName)}`)], ephemeral: true });
 }
 
+async function handleEconomyGameSelect(interaction) {
+  if (interaction.customId !== 'gv:economy:games:select') return null;
+  const gameType = interaction.values[0];
+  if (!['blackjack', 'coinflip', 'roulette', 'chicken', 'dice', 'scratch', 'slots'].includes(gameType)) {
+    return interaction.reply({ content: 'Choose a game from the available list.', ephemeral: true });
+  }
+  return interaction.showModal(gameBetModal(gameType));
+}
+
 function shopPagePayload(db, page = 0) {
   const settings = getEconomySettings(db);
   const items = listShopItems(db, false).filter((item) => item.stock > 0);
@@ -1290,19 +1385,87 @@ function economyTransactionsEmbed(db, userId, title = 'Your Transactions', page 
   return { embed, components, page: safePage, pageCount, total };
 }
 
+function economyGamesMenu() {
+  return [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+    .setCustomId('gv:economy:games:select')
+    .setPlaceholder('Choose a game')
+    .addOptions(
+      { label: 'Blackjack', value: 'blackjack', emoji: '🃏', description: 'Play your hand against the dealer.' },
+      { label: 'Coin Flip', value: 'coinflip', emoji: '🪙', description: 'Call heads or tails.' },
+      { label: 'Roulette', value: 'roulette', emoji: '🎡', description: 'Choose a wheel color.' },
+      { label: 'Chicken Road', value: 'chicken', emoji: '🐔', description: 'Risk another step or cash out.' },
+      { label: 'Dice Duel', value: 'dice', emoji: '🎲', description: 'Pick high or low.' },
+      { label: 'Scratch Card', value: 'scratch', emoji: '🎟️', description: 'Reveal a scratch-card prize.' },
+      { label: 'Lucky Slots', value: 'slots', emoji: '🎰', description: 'Try to match the reels.' },
+    ))];
+}
+
 function gameBetModal(gameType) {
-  const modal = new ModalBuilder().setCustomId(`gv:economy:modal:game:${gameType}`).setTitle(`${gameType === 'chicken' ? 'Chicken Road' : gameType[0].toUpperCase() + gameType.slice(1)} Wager`);
+  const gameNames = { blackjack: 'Blackjack', coinflip: 'Coin Flip', roulette: 'Roulette', chicken: 'Chicken Road', dice: 'Dice Duel', scratch: 'Scratch Card', slots: 'Lucky Slots' };
+  const modal = new ModalBuilder().setCustomId(`gv:economy:modal:game:${gameType}`).setTitle(`${gameNames[gameType] ?? 'Economy Game'} Wager`);
   modal.addComponents(new ActionRowBuilder().addComponents(
     new TextInputBuilder().setCustomId('bet').setLabel('Wager from your wallet').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12)
       .setPlaceholder('Whole dollars available in your wallet, e.g. 50.'),
   ));
-  if (gameType === 'coinflip' || gameType === 'roulette') {
+  if (['coinflip', 'roulette', 'dice'].includes(gameType)) {
     modal.addComponents(new ActionRowBuilder().addComponents(
-      new TextInputBuilder().setCustomId('choice').setLabel(gameType === 'coinflip' ? 'heads or tails' : 'red, black, or green').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)
-        .setPlaceholder(gameType === 'coinflip' ? 'Enter heads or tails.' : 'Enter red, black, or green.'),
+      new TextInputBuilder().setCustomId('choice').setLabel(gameType === 'coinflip' ? 'heads or tails' : gameType === 'roulette' ? 'red, black, or green' : 'high or low')
+        .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)
+        .setPlaceholder(gameType === 'coinflip' ? 'Enter heads or tails.' : gameType === 'roulette' ? 'Enter red, black, or green.' : 'High = 4–6. Low = 1–3.'),
     ));
   }
   return modal;
+}
+
+function createGamePublication(db, { userId, gameType, resultText, wager, payout, now = new Date() }) {
+  const publicationId = randomUUID();
+  const createdAt = now.toISOString();
+  db.prepare(`
+    INSERT INTO economy_game_publications (publication_id, user_id, game_type, result_text, wager, payout, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(publicationId, userId, gameType, resultText.slice(0, 900), wager, payout, createdAt, new Date(now.getTime() + 30 * 60_000).toISOString());
+  return publicationId;
+}
+
+function shareGameComponents(publicationId) {
+  return [new ActionRowBuilder().addComponents(new ButtonBuilder()
+    .setCustomId(`gv:economy:share:${publicationId}`).setLabel('Share Result in Chat').setEmoji('📣').setStyle(ButtonStyle.Secondary))];
+}
+
+function completedGamePayload(db, interaction, gameType, resultText, wager, payout, embed, components = []) {
+  const publicationId = createGamePublication(db, { userId: interaction.user.id, gameType, resultText, wager, payout });
+  return {
+    embeds: [embed],
+    components: [...components, ...shareGameComponents(publicationId)],
+    ephemeral: true,
+  };
+}
+
+async function shareGameResult(interaction, ctx, publicationId) {
+  const publication = ctx.db.prepare('SELECT * FROM economy_game_publications WHERE publication_id = ?').get(publicationId);
+  if (!publication) return interaction.reply({ content: 'This game result is no longer available to share.', ephemeral: true });
+  if (publication.user_id !== interaction.user.id) return interaction.reply({ content: 'Only the player who completed this game can share its result.', ephemeral: true });
+  if (publication.status === 'published') return interaction.reply({ content: 'This result has already been shared.', ephemeral: true });
+  if (publication.expires_at <= new Date().toISOString()) return interaction.reply({ content: 'This result-sharing option expired.', ephemeral: true });
+  const claimed = ctx.db.prepare("UPDATE economy_game_publications SET status = 'publishing' WHERE publication_id = ? AND status = 'pending'")
+    .run(publicationId);
+  if (!claimed.changes) return interaction.reply({ content: 'This result is already being shared or has already been posted.', ephemeral: true });
+  try {
+    const channel = interaction.channel ?? await interaction.client.channels.fetch(interaction.channelId);
+    if (!channel?.isTextBased() || !channel.send) throw new Error('The current channel cannot receive messages.');
+    const message = await channel.send({
+      embeds: [makeEmbed(getEconomySettings(ctx.db).panelColor, `🎮 ${publication.game_type.replaceAll('_', ' ').toUpperCase()} RESULT`,
+        `<@${publication.user_id}> ${publication.result_text}\n\n**Wager:** ${formatCurrency(publication.wager, getEconomySettings(ctx.db).currencyName)}\n**Payout:** ${formatCurrency(publication.payout, getEconomySettings(ctx.db).currencyName)}`)],
+      allowedMentions: { parse: [] },
+    });
+    ctx.db.prepare("UPDATE economy_game_publications SET status = 'published', channel_id = ?, message_id = ? WHERE publication_id = ? AND status = 'publishing'")
+      .run(channel.id, message.id, publicationId);
+    return interaction.update({ content: 'Your result was shared in this channel.', embeds: [], components: [] });
+  } catch (error) {
+    ctx.db.prepare("UPDATE economy_game_publications SET status = 'pending' WHERE publication_id = ? AND status = 'publishing'").run(publicationId);
+    console.error('Could not share economy game result:', error.message);
+    return interaction.reply({ content: 'I could not post your result here. Check channel permissions and try again.', ephemeral: true });
+  }
 }
 
 function blackjackComponents(gameId) {
@@ -1354,7 +1517,12 @@ async function startBlackjackInteraction(interaction, ctx, bet) {
   }
   if (!result.started) return interaction.reply({ content: gameStartFailure(result), ephemeral: true });
   const active = !result.status;
-  return interaction.reply({ embeds: [blackjackEmbed(result, settings)], components: active ? blackjackComponents(result.gameId) : [], ephemeral: true });
+  const embed = blackjackEmbed(result, settings);
+  if (!active) {
+    const outcome = result.status === 'won' ? 'won' : result.status === 'push' ? 'tied' : 'lost';
+    return interaction.reply(completedGamePayload(ctx.db, interaction, 'blackjack', `${outcome} a Blackjack hand.`, bet, result.payout ?? 0, embed));
+  }
+  return interaction.reply({ embeds: [embed], components: blackjackComponents(result.gameId), ephemeral: true });
 }
 
 async function startChickenInteraction(interaction, ctx, bet) {
@@ -1371,24 +1539,32 @@ async function startQuickGame(interaction, ctx, gameType, bet, choice) {
   const settings = getEconomySettings(ctx.db);
   let result;
   try {
-    result = gameType === 'coinflip'
-      ? playCoinFlip(ctx.db, interaction.user.id, bet, choice)
-      : playRoulette(ctx.db, interaction.user.id, bet, choice);
+    if (gameType === 'coinflip') result = playCoinFlip(ctx.db, interaction.user.id, bet, choice);
+    else if (gameType === 'roulette') result = playRoulette(ctx.db, interaction.user.id, bet, choice);
+    else if (gameType === 'dice') result = playDiceDuel(ctx.db, interaction.user.id, bet, choice);
+    else if (gameType === 'scratch') result = playScratchCard(ctx.db, interaction.user.id, bet);
+    else result = playSlots(ctx.db, interaction.user.id, bet);
   } catch (error) {
     return interaction.reply({ content: error.message, ephemeral: true });
   }
   if (!result.started) return interaction.reply({ content: gameStartFailure(result), ephemeral: true });
   const won = result.status === 'won';
-  const detail = gameType === 'coinflip'
-    ? `You chose **${result.state.choice}**. The coin landed on **${result.state.result}**.`
-    : `The wheel landed on **${result.state.pocket} (${result.state.result})**. You chose **${result.state.choice}**.`;
-  return interaction.reply({
-    embeds: [makeEmbed(won ? settings.panelColor : config.EMBED_COLORS.error, gameType === 'coinflip' ? '🪙 Coin Flip' : '🎡 Roulette', `${detail}\n**Wager:** ${formatCurrency(bet, settings.currencyName)}\n**Payout:** ${formatCurrency(result.payout, settings.currencyName)}${result.walletAfter === null ? '' : `\n**Wallet:** ${formatCurrency(result.walletAfter, settings.currencyName)}`}`)],
-    ephemeral: true,
-  });
+  const gameNames = { coinflip: '🪙 Coin Flip', roulette: '🎡 Roulette', dice: '🎲 Dice Duel', scratch: '🎟️ Scratch Card', slots: '🎰 Lucky Slots' };
+  const details = {
+    coinflip: `You chose **${result.state.choice}**. The coin landed on **${result.state.result}**.`,
+    roulette: `The wheel landed on **${result.state.pocket} (${result.state.result})**. You chose **${result.state.choice}**.`,
+    dice: `You chose **${result.state.choice}**. The die rolled **${result.state.die} (${result.state.result})**.`,
+    scratch: result.state.result === 'jackpot' ? '🎉 You uncovered the **jackpot**!' : result.state.result === 'small-win' ? 'You found a **small prize**.' : 'No matching symbols this time.',
+    slots: ({ triple: '🎉 **Triple match!**', pair: '**Pair match!**', single: 'One symbol matched.', miss: 'No matching symbols this time.' })[result.state.result],
+  };
+  const detail = `${details[gameType]}\n**Wager:** ${formatCurrency(bet, settings.currencyName)}\n**Payout:** ${formatCurrency(result.payout, settings.currencyName)}${result.walletAfter === null ? '' : `\n**Wallet:** ${formatCurrency(result.walletAfter, settings.currencyName)}`}`;
+  const embed = makeEmbed(won ? settings.panelColor : config.EMBED_COLORS.error, gameNames[gameType], detail);
+  return interaction.reply(completedGamePayload(ctx.db, interaction, gameType, details[gameType], bet, result.payout, embed));
 }
 
 async function handleGameButton(interaction, ctx) {
+  const shareMatch = interaction.customId.match(/^gv:economy:share:([a-f0-9-]{36})$/);
+  if (shareMatch) return shareGameResult(interaction, ctx, shareMatch[1]);
   const blackjack = interaction.customId.match(/^gv:economy:game:blackjack:([a-f0-9-]{36}):(hit|stand)$/);
   const chicken = interaction.customId.match(/^gv:economy:game:chicken:([a-f0-9-]{36}):(step|cashout)$/);
   if (!blackjack && !chicken) return null;
@@ -1406,8 +1582,20 @@ async function handleGameButton(interaction, ctx) {
     return interaction.reply({ content: messages[result.reason] ?? 'That game action is unavailable.', ephemeral: true });
   }
   const isBlackjack = Boolean(blackjack);
+  const embed = isBlackjack ? blackjackEmbed(result, settings) : chickenEmbed(result, settings);
+  if (result.completed) {
+    const gameType = isBlackjack ? 'blackjack' : 'chicken';
+    const outcome = result.status === 'won' ? 'won' : result.status === 'push' ? 'tied' : 'lost';
+    return interaction.update({ embeds: [embed], components: shareGameComponents(createGamePublication(ctx.db, {
+      userId: interaction.user.id,
+      gameType,
+      resultText: `${outcome} a ${gameType === 'blackjack' ? 'Blackjack hand' : 'Chicken Road run'}.`,
+      wager: result.bet,
+      payout: result.payout ?? 0,
+    })) });
+  }
   return interaction.update({
-    embeds: [isBlackjack ? blackjackEmbed(result, settings) : chickenEmbed(result, settings)],
+    embeds: [embed],
     components: result.active ? (isBlackjack ? blackjackComponents(blackjack[1]) : chickenComponents(chicken[1])) : [],
   });
 }
@@ -1684,7 +1872,7 @@ async function handleEconomyManagementButton(interaction, ctx) {
   if (interaction.customId !== 'mgmt:economy' && !interaction.customId.startsWith('gv:economy:staff:')) return null;
   if (!await ensureManagement(interaction, ctx.db)) return;
   if (interaction.customId === 'mgmt:economy') {
-    return interaction.update({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents() });
+    return interaction.reply({ embeds: [economyStaffEmbed(ctx.db)], components: economyStaffComponents(), ephemeral: true });
   }
   const productAction = interaction.customId.match(/^gv:economy:staff:product:(edit|toggle|remove|image):([a-f0-9-]{36})$/);
   if (productAction) {
@@ -1820,6 +2008,7 @@ async function handleEconomyCommand(interaction, ctx) {
   if (action === 'work') return work(interaction, ctx);
   if (action === 'configure') return configureEconomy(interaction, ctx);
   if (action === 'panel') return publishEconomyPanel(interaction, ctx);
+  if (action === 'daily-panel') return publishEconomyDailyPanel(interaction, ctx);
   if (action === 'daily') return handleDailyRewardCommand(interaction, ctx);
   if (action === 'deposit' || action === 'withdraw' || action === 'transfer') return handleBankCommand(interaction, ctx);
   if (action === 'shop' || action === 'inventory' || action === 'history' || action === 'purchase'
@@ -1831,6 +2020,8 @@ async function handleEconomyCommand(interaction, ctx) {
   if (action === 'coinflip' || action === 'roulette') {
     return startQuickGame(interaction, ctx, action, interaction.options.getInteger('bet', true), interaction.options.getString('choice', true));
   }
+  if (action === 'dice') return startQuickGame(interaction, ctx, 'dice', interaction.options.getInteger('bet', true), interaction.options.getString('choice', true));
+  if (action === 'scratch' || action === 'slots') return startQuickGame(interaction, ctx, action, interaction.options.getInteger('bet', true));
   if (action === 'chicken') return startChickenInteraction(interaction, ctx, interaction.options.getInteger('bet', true));
   return interaction.reply({ content: 'That economy command is not available yet.', ephemeral: true });
 }
@@ -2006,7 +2197,7 @@ async function handleEconomyModal(interaction, ctx) {
       return interaction.reply({ content: error.message, ephemeral: true });
     }
   }
-  const gameMatch = interaction.customId.match(/^gv:economy:modal:game:(blackjack|coinflip|roulette|chicken)$/);
+  const gameMatch = interaction.customId.match(/^gv:economy:modal:game:(blackjack|coinflip|roulette|chicken|dice|scratch|slots)$/);
   if (gameMatch) {
     const bet = Number(interaction.fields.getTextInputValue('bet'));
     const maximumBet = getEconomySettings(ctx.db).maximumBet;
@@ -2015,7 +2206,9 @@ async function handleEconomyModal(interaction, ctx) {
     }
     if (gameMatch[1] === 'blackjack') return startBlackjackInteraction(interaction, ctx, bet);
     if (gameMatch[1] === 'chicken') return startChickenInteraction(interaction, ctx, bet);
-    const choice = interaction.fields.getTextInputValue('choice').trim().toLowerCase();
+    const choice = ['coinflip', 'roulette', 'dice'].includes(gameMatch[1])
+      ? interaction.fields.getTextInputValue('choice').trim().toLowerCase()
+      : null;
     return startQuickGame(interaction, ctx, gameMatch[1], bet, choice);
   }
   const match = interaction.customId.match(/^gv:economy:modal:bank:(deposit|withdraw)$/);
@@ -2042,6 +2235,13 @@ async function handleEconomyButton(interaction, ctx) {
   if (gameAction) return gameAction;
   if (interaction.customId === 'gv:economy:wallet') return showWallet(interaction, ctx);
   if (interaction.customId === 'gv:economy:work') return work(interaction, ctx);
+  if (interaction.customId === 'gv:economy:games') {
+    return interaction.reply({
+      content: `🎮 **GV GR Games Arcade**\nChoose a game below. Wagers are limited to ${formatCurrency(getEconomySettings(ctx.db).maximumBet, getEconomySettings(ctx.db).currencyName)}. Completed results are private unless you choose to share them in this channel.`,
+      components: economyGamesMenu(),
+      ephemeral: true,
+    });
+  }
   if (interaction.customId === 'gv:economy:bank') return showBankPanel(interaction, ctx);
   if (interaction.customId === 'gv:economy:bank:deposit' || interaction.customId === 'gv:economy:bank:withdraw') {
     const action = interaction.customId.endsWith('deposit') ? 'deposit' : 'withdraw';
@@ -2071,7 +2271,7 @@ async function handleEconomyButton(interaction, ctx) {
     const result = economyTransactionsEmbed(ctx.db, targetId, targetId === viewerId ? 'Your Transactions' : 'Member Transactions', Number(rawPage), viewerId);
     return interaction.update({ embeds: [result.embed], components: result.components });
   }
-  if (['blackjack', 'coinflip', 'roulette', 'chicken'].some((game) => interaction.customId === `gv:economy:${game}`)) {
+  if (['blackjack', 'coinflip', 'roulette', 'chicken', 'dice', 'scratch', 'slots'].some((game) => interaction.customId === `gv:economy:${game}`)) {
     const game = interaction.customId.split(':').at(-1);
     return interaction.showModal(gameBetModal(game));
   }
@@ -2159,11 +2359,17 @@ module.exports = {
   editShopItem,
   economyPanelComponents,
   economyPanelEmbed,
+  economyDailyPanelComponents,
+  economyDailyPanelEmbed,
   ensureEconomyAccount,
   getEconomyLeaderboard,
   getEconomySettings,
   ensureEconomyManagement: ensureManagement,
   getEconomyTransactions,
+  processEconomyDailyPanel,
+  sendEconomyDailyPanel,
+  economyGamesMenu,
+  handleEconomyGameSelect,
   getPlayerInventory,
   getPlayerPurchaseHistory,
   getWallet,

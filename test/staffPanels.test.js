@@ -5,6 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
+const { commands } = require('../src/commands/definitions');
 const { canRefreshStaffPanel } = require('../src/commands/clock');
 const { isManagement, isOwner, isStaff } = require('../src/commands/staffCenter');
 const { handleManagementButton, handleOwnerButton } = require('../src/commands/staffManagement');
@@ -46,6 +47,39 @@ test('staff, management, and Owner access remain distinct', (t) => {
   assert.equal(canRefreshStaffPanel(configuredOwner, guild, db), true);
   assert.equal(canRefreshStaffPanel(regularStaff, guild, db), false);
   assert.equal(canRefreshStaffPanel(manager, guild, db), true);
+});
+
+test('Temporary Admin is no longer registered and staff can check out without a form', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-staff-checkout-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => { db.close(); rmSync(directory, { recursive: true, force: true }); });
+  assert.equal(commands.some((command) => command.name === 'tempadmin'), false);
+
+  const staffId = 'checkout-staff';
+  const staffRoleId = config.STAFF_ROLE_IDS[0];
+  const staffMember = member(staffId, [staffRoleId]);
+  const guild = { id: config.SERVER_ID, ownerId: 'owner' };
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_staff', JSON.stringify([staffRoleId]));
+  require('../src/services/staffRewards').checkInStaff(db, {
+    id: staffId, username: 'CheckoutStaff', roleName: 'Staff',
+  }, '2026-11-09T10:00:00.000Z');
+
+  let modalShown = false;
+  let response;
+  await handleButton({
+    customId: 'gv:center:checkout',
+    user: { id: staffId, username: 'CheckoutStaff' },
+    member: staffMember,
+    guild,
+    client: { channels: { fetch: async () => null } },
+    deferred: true,
+    deferReply: async () => {},
+    editReply: async (payload) => { response = payload; return payload; },
+    showModal: async () => { modalShown = true; },
+  }, { db });
+  assert.equal(modalShown, false);
+  assert.equal(db.prepare("SELECT status FROM shifts WHERE user_id = ? ORDER BY id DESC LIMIT 1").get(staffId).status, 'completed');
+  assert.match(response.embeds[0].data.title, /SHIFT COMPLETE/);
 });
 
 test('a suspended management-role member loses management access', (t) => {
@@ -139,7 +173,10 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
 
   const owner = member('configured-owner', config.OWNER_ROLE_IDS);
   const manager = member('manager-user', ['1556064708795306157']);
-  const server = { ownerId: 'discord-server-owner' };
+  const server = {
+    ownerId: 'discord-server-owner',
+    members: { fetch: async (id) => id === manager.id ? manager : null },
+  };
   function createInteraction(customId, interactingMember) {
     return {
       customId,
@@ -163,6 +200,11 @@ test('management and Owner dashboard buttons work; Owner toggles user-only delet
     reply: async (payload) => payload,
   }, { db });
   assert.ok(managementPanel.components.flatMap((row) => row.components).some((button) => button.data.custom_id === 'mgmt:economy'));
+  assert.ok(managementPanel.components.flatMap((row) => row.components).some((button) => button.data.custom_id === 'mgmt:forms' && button.data.label === 'Forms'));
+  const formsPanel = await handleManagementButton(createInteraction('mgmt:forms', manager), { db });
+  assert.equal(formsPanel.ephemeral, true);
+  assert.equal(formsPanel.components[0].components[0].toJSON().custom_id, 'mgmt:forms:select');
+  assert.ok(formsPanel.components[0].components[0].toJSON().options.some((option) => option.value === 'report'));
   for (const customId of ['owner:overview', 'owner:audit', 'owner:activity']) {
     const result = await handleOwnerButton(createInteraction(customId, owner), { db });
     assert.ok(result.embeds[0], `Owner button ${customId} should update the dashboard.`);

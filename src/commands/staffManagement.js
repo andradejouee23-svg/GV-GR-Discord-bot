@@ -76,6 +76,9 @@ function managementComponents() {
     new ActionRowBuilder().addComponents(
       new UserSelectMenuBuilder().setCustomId('mgmt:staff_history').setPlaceholder('View a staff member’s history'),
     ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('mgmt:forms').setLabel('Forms').setEmoji('📝').setStyle(ButtonStyle.Secondary),
+    ),
   ];
 }
 
@@ -201,6 +204,8 @@ async function handleManagementButton(interaction, ctx) {
     case 'mgmt:activity': return interaction.update({ embeds: [activityEmbed(ctx.db)], components: managementComponents() });
     case 'mgmt:leaderboard': return interaction.update({ embeds: [weeklyLeaderboardEmbed(ctx.db)], components: managementComponents() });
     case 'mgmt:vehicles': return interaction.update({ ...require('../commands/vehicles').vehicleMemberPickerPayload() });
+    case 'mgmt:clear-bots': return require('./clearBotMessages').openCleanupChannelPicker(interaction, ctx);
+    case 'mgmt:forms': return require('./forms').openFormsDashboard(interaction, ctx);
     default:
       if (interaction.customId.startsWith('mgmt:vehicle:')) {
         return require('./vehicles').handleVehicleManagementButton(interaction, ctx);

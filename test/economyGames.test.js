@@ -8,8 +8,11 @@ const { getWallet } = require('../src/commands/economy');
 const { setConfigValue } = require('../src/utils/discord');
 const {
   beginBlackjack,
+  playDiceDuel,
   playCoinFlip,
   playRoulette,
+  playScratchCard,
+  playSlots,
   resolveBlackjackAction,
   resolveChickenAction,
   startChickenRoad,
@@ -69,6 +72,37 @@ test('coin flip and roulette apply their documented payouts and standard wheel c
   assert.equal(getWallet(store.db, 'casino-player').wallet_balance, 4700);
 });
 
+test('Dice Duel, Scratch Card, and Slots settle through the shared wallet and transaction engine', (t) => {
+  const store = makeStore(t);
+  setWallet(store.db, 'new-games-player', 10_000);
+  const now = new Date('2026-11-09T13:00:00.000Z');
+
+  const diceWin = playDiceDuel(store.db, 'new-games-player', 100, 'high', now, () => 6);
+  assert.equal(diceWin.status, 'won');
+  assert.equal(diceWin.payout, 200);
+  const diceLoss = playDiceDuel(store.db, 'new-games-player', 100, 'low', now, () => 6);
+  assert.equal(diceLoss.status, 'lost');
+  assert.equal(diceLoss.payout, 0);
+
+  const scratchJackpot = playScratchCard(store.db, 'new-games-player', 100, now, () => 4);
+  assert.equal(scratchJackpot.state.result, 'jackpot');
+  assert.equal(scratchJackpot.payout, 800);
+  const scratchMiss = playScratchCard(store.db, 'new-games-player', 100, now, () => 99);
+  assert.equal(scratchMiss.state.result, 'no-match');
+  assert.equal(scratchMiss.payout, 0);
+
+  const slotTriple = playSlots(store.db, 'new-games-player', 100, now, () => 1);
+  assert.equal(slotTriple.state.result, 'triple');
+  assert.equal(slotTriple.payout, 1000);
+  const slotMiss = playSlots(store.db, 'new-games-player', 100, now, () => 99);
+  assert.equal(slotMiss.state.result, 'miss');
+  assert.equal(slotMiss.payout, 0);
+
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_games').get().count, 6);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_transactions WHERE type IN (?, ?, ?)').get('dice_bet', 'scratch_bet', 'slots_bet').count, 6);
+  assert.equal(getWallet(store.db, 'new-games-player').wallet_balance, 11_400);
+});
+
 test('configured maximum wager is enforced before game funds are moved', (t) => {
   const store = makeStore(t);
   setWallet(store.db, 'limited-player', 1000);
@@ -77,6 +111,42 @@ test('configured maximum wager is enforced before game funds are moved', (t) => 
   assert.equal(getWallet(store.db, 'limited-player').wallet_balance, 1000);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_games').get().count, 0);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM economy_transactions').get().count, 0);
+});
+
+test('new game types migrate old economy game records without losing them', (t) => {
+  const store = makeStore(t);
+  setWallet(store.db, 'legacy-game-player', 1000);
+  store.db.exec(`
+    DROP INDEX one_active_economy_game_per_player;
+    DROP INDEX economy_games_user_created;
+    ALTER TABLE economy_games RENAME TO economy_games_before_update;
+    CREATE TABLE economy_games (
+      game_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      game_type TEXT NOT NULL CHECK(game_type IN ('blackjack', 'coinflip', 'roulette', 'chicken')),
+      bet INTEGER NOT NULL CHECK(bet > 0),
+      status TEXT NOT NULL CHECK(status IN ('active', 'won', 'lost', 'push', 'expired')),
+      state_json TEXT NOT NULL DEFAULT '{}',
+      payout INTEGER NOT NULL DEFAULT 0 CHECK(payout >= 0),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    INSERT INTO economy_games SELECT * FROM economy_games_before_update;
+    INSERT INTO economy_games (game_id, user_id, game_type, bet, status, state_json, payout, created_at, expires_at, resolved_at)
+    VALUES ('legacy-blackjack', 'legacy-game-player', 'blackjack', 50, 'won', '{}', 100,
+      '2026-11-09T12:00:00.000Z', '2026-11-09T12:05:00.000Z', '2026-11-09T12:01:00.000Z');
+    DROP TABLE economy_games_before_update;
+    CREATE UNIQUE INDEX one_active_economy_game_per_player ON economy_games(user_id) WHERE status = 'active';
+    CREATE INDEX economy_games_user_created ON economy_games(user_id, created_at DESC);
+  `);
+
+  const reopened = store.reopen();
+  assert.equal(reopened.prepare('SELECT game_type FROM economy_games WHERE game_id = ?').get('legacy-blackjack').game_type, 'blackjack');
+  assert.deepEqual(reopened.pragma('foreign_key_check'), []);
+  const dice = playDiceDuel(reopened, 'legacy-game-player', 20, 'high', new Date('2026-11-09T13:00:00.000Z'), () => 6);
+  assert.equal(dice.status, 'won');
+  assert.equal(reopened.prepare("SELECT COUNT(*) AS count FROM economy_games WHERE game_type = 'dice'").get().count, 1);
 });
 
 test('Chicken Road supports progressive cashout, rejects repeat settlement, and expires old sessions', (t) => {

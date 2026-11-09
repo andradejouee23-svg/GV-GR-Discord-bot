@@ -23,6 +23,26 @@ const commands = [
     .setName('panel-editor')
     .setDescription('Customize existing GV GR panels (management).'),
   new SlashCommandBuilder()
+    .setName('forms')
+    .setDescription('Manage existing form question labels and placeholder examples (management).')
+    .addSubcommand((subcommand) => subcommand.setName('list').setDescription('List form questions or inspect one form.')
+      .addStringOption((option) => option.setName('form').setDescription('Form to inspect').addChoices(
+        { name: 'Player Report', value: 'report' },
+        { name: 'Blacklist Appeal', value: 'blacklist_appeal' },
+        { name: 'Vehicle Registration', value: 'vehicle_registration' },
+        { name: 'RP Session', value: 'session' },
+      )))
+    .addSubcommand((subcommand) => subcommand.setName('edit').setDescription('Edit a question label or placeholder example.')
+      .addStringOption((option) => option.setName('form').setDescription('Form to edit').setRequired(true).addChoices(
+        { name: 'Player Report', value: 'report' },
+        { name: 'Blacklist Appeal', value: 'blacklist_appeal' },
+        { name: 'Vehicle Registration', value: 'vehicle_registration' },
+        { name: 'RP Session', value: 'session' },
+      ))
+      .addStringOption((option) => option.setName('question').setDescription('Question key shown by /forms list').setRequired(true).setMaxLength(32))
+      .addStringOption((option) => option.setName('label').setDescription('New modal label').setMaxLength(45))
+      .addStringOption((option) => option.setName('placeholder').setDescription('New example or input hint').setMaxLength(100))),
+  new SlashCommandBuilder()
     .setName('owner-dashboard')
     .setDescription('Open the private owner control dashboard.'),
   new SlashCommandBuilder()
@@ -37,6 +57,15 @@ const commands = [
   new SlashCommandBuilder()
     .setName('session')
     .setDescription('Manage Greenville RP staff sessions.')
+    .addSubcommand((subcommand) => subcommand.setName('configure').setDescription('Edit the saved Quick Start Session announcement defaults (management).')
+      .addStringOption((option) => option.setName('name').setDescription('Default session name').setMaxLength(100))
+      .addStringOption((option) => option.setName('description').setDescription('Default announcement text').setMaxLength(1000))
+      .addStringOption((option) => option.setName('image-url').setDescription('HTTPS image URL').setMaxLength(500))
+      .addBooleanOption((option) => option.setName('remove-image').setDescription('Remove the saved image'))
+      .addStringOption((option) => option.setName('color').setDescription('Embed HEX color, such as #36A765').setMaxLength(7))
+      .addStringOption((option) => option.setName('footer').setDescription('Announcement footer text').setMaxLength(200))
+      .addStringOption((option) => option.setName('button-label').setDescription('Join button label').setMaxLength(80))
+      .addStringOption((option) => option.setName('button-emoji').setDescription('Join button emoji').setMaxLength(100)))
     .addSubcommand((subcommand) => subcommand.setName('start').setDescription('Start an RP session.')
       .addUserOption((option) => option.setName('host').setDescription('Staff member hosting the session').setRequired(true)))
     .addSubcommand((subcommand) => subcommand.setName('end').setDescription('End the active RP session.'))
@@ -106,6 +135,7 @@ const commands = [
           { name: 'Events', value: 'EVENT_CHANNEL_ID' },
           { name: 'Vehicle registration panel', value: 'VEHICLE_REGISTRATION_CHANNEL_ID' },
           { name: 'Vehicle application review', value: 'VEHICLE_REVIEW_CHANNEL_ID' },
+          { name: 'Approved vehicle media', value: 'VEHICLE_MEDIA_CHANNEL_ID' },
           { name: 'Welcome messages', value: 'WELCOME_CHANNEL_ID' },
           { name: 'How to Join channel', value: 'HOW_TO_JOIN_CHANNEL_ID' },
           { name: 'Server Rules channel', value: 'SERVER_RULES_CHANNEL_ID' },
@@ -149,79 +179,15 @@ const commands = [
       .addIntegerOption((option) => option.setName('id').setDescription('Application ID').setRequired(true).setMinValue(1))
       .addStringOption((option) => option.setName('expires-at').setDescription('Future ISO date/time; omit to clear').setMaxLength(40))),
   new SlashCommandBuilder()
-    .setName('tempadmin')
-    .setDescription('Apply for or manage temporary administration applications.')
-    .addSubcommand((subcommand) => subcommand.setName('panel').setDescription('Post or refresh the application panel.')
-      .addChannelOption((option) => option.setName('channel').setDescription('Public application channel').setRequired(true).addChannelTypes(ChannelType.GuildText)))
-    .addSubcommand((subcommand) => subcommand.setName('configure').setDescription('Configure the application form and temporary role (management).')
-      .addStringOption((option) => option.setName('title').setDescription('Application panel title').setMaxLength(256))
-      .addStringOption((option) => option.setName('description').setDescription('Application instructions').setMaxLength(4000))
-      .addRoleOption((option) => option.setName('role').setDescription('Role assigned when approved'))
-      .addChannelOption((option) => option.setName('review-channel').setDescription('Private staff review channel').addChannelTypes(ChannelType.GuildText))
-      .addIntegerOption((option) => option.setName('duration-hours').setDescription('Temporary role duration in hours').setMinValue(1).setMaxValue(8760))
-      .addIntegerOption((option) => option.setName('reminder-hours').setDescription('Hours before trial end to remind management').setMinValue(1).setMaxValue(168))
-      .addBooleanOption((option) => option.setName('enabled').setDescription('Allow new applications'))
-      .addStringOption((option) => option.setName('question-1').setDescription('First application question').setMaxLength(45))
-      .addStringOption((option) => option.setName('question-2').setDescription('Second application question').setMaxLength(45))
-      .addStringOption((option) => option.setName('question-3').setDescription('Third application question').setMaxLength(45))
-      .addStringOption((option) => option.setName('question-4').setDescription('Fourth application question').setMaxLength(45))
-      .addStringOption((option) => option.setName('question-5').setDescription('Fifth application question').setMaxLength(45)))
-    .addSubcommand((subcommand) => subcommand.setName('history').setDescription('View your application history, or a player’s history (management).')
-      .addUserOption((option) => option.setName('member').setDescription('Player; management only')))
-    .addSubcommand((subcommand) => subcommand.setName('preview').setDescription('Preview the current Temporary Admin form (management).'))
-    .addSubcommand((subcommand) => subcommand.setName('question-add').setDescription('Add an application question (management).')
-      .addStringOption((option) => option.setName('label').setDescription('Question shown to applicants').setRequired(true).setMaxLength(45))
-      .addStringOption((option) => option.setName('type').setDescription('Answer type').setRequired(true).addChoices(
-        { name: 'Short text', value: 'short' }, { name: 'Paragraph', value: 'paragraph' }, { name: 'Multiple choice', value: 'multiple_choice' }, { name: 'Dropdown', value: 'dropdown' }, { name: 'Yes or No', value: 'yes_no' },
-      ))
-      .addBooleanOption((option) => option.setName('required').setDescription('Require an answer').setRequired(true))
-      .addStringOption((option) => option.setName('options').setDescription('Choice options, one per line').setMaxLength(500)))
-    .addSubcommand((subcommand) => subcommand.setName('question-edit').setDescription('Edit an application question (management).')
-      .addIntegerOption((option) => option.setName('index').setDescription('Question number').setRequired(true).setMinValue(1).setMaxValue(20))
-      .addStringOption((option) => option.setName('label').setDescription('New question text').setMaxLength(45))
-      .addStringOption((option) => option.setName('type').setDescription('New answer type').addChoices(
-        { name: 'Short text', value: 'short' }, { name: 'Paragraph', value: 'paragraph' }, { name: 'Multiple choice', value: 'multiple_choice' }, { name: 'Dropdown', value: 'dropdown' }, { name: 'Yes or No', value: 'yes_no' },
-      ))
-      .addBooleanOption((option) => option.setName('required').setDescription('Require an answer'))
-      .addStringOption((option) => option.setName('options').setDescription('Replace choice options, one per line').setMaxLength(500)))
-    .addSubcommand((subcommand) => subcommand.setName('question-remove').setDescription('Remove an application question (management).')
-      .addIntegerOption((option) => option.setName('index').setDescription('Question number').setRequired(true).setMinValue(1).setMaxValue(20)))
-    .addSubcommand((subcommand) => subcommand.setName('question-move').setDescription('Change question order (management).')
-      .addIntegerOption((option) => option.setName('from').setDescription('Current question number').setRequired(true).setMinValue(1).setMaxValue(20))
-      .addIntegerOption((option) => option.setName('to').setDescription('New question number').setRequired(true).setMinValue(1).setMaxValue(20)))
-    .addSubcommand((subcommand) => subcommand.setName('question-list').setDescription('Preview configured application questions (management).'))
-    .addSubcommand((subcommand) => subcommand.setName('search').setDescription('Search previous Temporary Admin applications (management).')
-      .addStringOption((option) => option.setName('query').setDescription('Application ID, Discord ID/name, Roblox username, or status').setRequired(true).setMaxLength(100)))
-    .addSubcommand((subcommand) => subcommand.setName('respond').setDescription('Respond to a request for more information.')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('text').setDescription('Your response').setRequired(true).setMaxLength(1500)))
-    .addSubcommand((subcommand) => subcommand.setName('trial-start').setDescription('Start an approved Temporary Admin trial (management).')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1)))
-    .addSubcommand((subcommand) => subcommand.setName('trial-extend').setDescription('Extend a running Temporary Admin trial (management).')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1))
-      .addIntegerOption((option) => option.setName('hours').setDescription('Hours to add').setRequired(true).setMinValue(1).setMaxValue(8760))
-      .addStringOption((option) => option.setName('reason').setDescription('Reason for extension').setRequired(true).setMaxLength(500)))
-    .addSubcommand((subcommand) => subcommand.setName('trial-end').setDescription('End a Temporary Admin trial and remove its role (management).')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('reason').setDescription('Trial outcome').setRequired(true).setMaxLength(500)))
-    .addSubcommand((subcommand) => subcommand.setName('promote').setDescription('Approve a trial member for a regular staff role (management).')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1))
-      .addRoleOption((option) => option.setName('role').setDescription('Regular staff role').setRequired(true))
-      .addStringOption((option) => option.setName('reason').setDescription('Promotion decision').setRequired(true).setMaxLength(500)))
-    .addSubcommand((subcommand) => subcommand.setName('note').setDescription('Add a private management note to an application (management).')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('text').setDescription('Private note').setRequired(true).setMaxLength(1000)))
-    .addSubcommand((subcommand) => subcommand.setName('notes').setDescription('View private management notes (management).')
-      .addIntegerOption((option) => option.setName('application-id').setDescription('Application number').setRequired(true).setMinValue(1))),
-  new SlashCommandBuilder()
     .setName('blacklist')
-    .setDescription('Manage persistent GV GR blacklist records and appeals.')
+    .setDescription('Submit usernames and review the private blacklist list (management).')
     .addSubcommand((subcommand) => subcommand.setName('panel').setDescription('Post or refresh the blacklist management panel.')
       .addChannelOption((option) => option.setName('channel').setDescription('Panel channel').addChannelTypes(ChannelType.GuildText)))
     .addSubcommand((subcommand) => subcommand.setName('configure').setDescription('Set blacklist record and appeal channels (management).')
       .addChannelOption((option) => option.setName('panel-channel').setDescription('Blacklist management panel').addChannelTypes(ChannelType.GuildText))
-      .addChannelOption((option) => option.setName('record-channel').setDescription('Blacklist record announcements').addChannelTypes(ChannelType.GuildText))
+      .addChannelOption((option) => option.setName('record-channel').setDescription('Private admin username submission channel').addChannelTypes(ChannelType.GuildText))
       .addChannelOption((option) => option.setName('appeal-channel').setDescription('Private appeal review channel').addChannelTypes(ChannelType.GuildText)))
+    .addSubcommand((subcommand) => subcommand.setName('list').setDescription('View active blacklisted Roblox usernames (management).'))
     .addSubcommand((subcommand) => subcommand.setName('appeal').setDescription('Submit an appeal for a saved blacklist record.'))
     .addSubcommand((subcommand) => subcommand.setName('respond').setDescription('Respond to a request for more appeal information.')
       .addStringOption((option) => option.setName('appeal-id').setDescription('Appeal ID').setRequired(true).setMaxLength(32))
@@ -287,6 +253,7 @@ const commands = [
     .addSubcommand((subcommand) => subcommand.setName('access-role').setDescription('Set the one role allowed to manage the economy (management).')
       .addRoleOption((option) => option.setName('role').setDescription('Economy management role').setRequired(true)))
     .addSubcommand((subcommand) => subcommand.setName('panel').setDescription('Post or refresh the Economy Panel (management).'))
+    .addSubcommand((subcommand) => subcommand.setName('daily-panel').setDescription('Publish the compact daily Economy Panel now (management).'))
     .addSubcommand((subcommand) => subcommand.setName('configure').setDescription('Configure economy rewards, drops, and colors (management).')
       .addChannelOption((option) => option.setName('channel').setDescription('Economy panel channel'))
       .addChannelOption((option) => option.setName('drop-channel').setDescription('Automatic cash drop channel'))
@@ -369,6 +336,14 @@ const commands = [
       .addStringOption((option) => option.setName('choice').setDescription('Red/black pay 2x; zero pays 36x').setRequired(true)
         .addChoices({ name: 'Red', value: 'red' }, { name: 'Black', value: 'black' }, { name: 'Green (0)', value: 'green' })))
     .addSubcommand((subcommand) => subcommand.setName('chicken').setDescription('Play Chicken Road with dollar wagers.')
+      .addIntegerOption((option) => option.setName('bet').setDescription('Wager from your wallet').setRequired(true).setMinValue(1).setMaxValue(1000000000)))
+    .addSubcommand((subcommand) => subcommand.setName('dice').setDescription('Play Dice Duel for dollars.')
+      .addIntegerOption((option) => option.setName('bet').setDescription('Wager from your wallet').setRequired(true).setMinValue(1).setMaxValue(1000000000))
+      .addStringOption((option) => option.setName('choice').setDescription('Choose high (4–6) or low (1–3)').setRequired(true)
+        .addChoices({ name: 'High', value: 'high' }, { name: 'Low', value: 'low' })))
+    .addSubcommand((subcommand) => subcommand.setName('scratch').setDescription('Buy a Scratch Card with a dollar wager.')
+      .addIntegerOption((option) => option.setName('bet').setDescription('Wager from your wallet').setRequired(true).setMinValue(1).setMaxValue(1000000000)))
+    .addSubcommand((subcommand) => subcommand.setName('slots').setDescription('Play Lucky Slots for dollars.')
       .addIntegerOption((option) => option.setName('bet').setDescription('Wager from your wallet').setRequired(true).setMinValue(1).setMaxValue(1000000000))),
   new SlashCommandBuilder()
     .setName('salary')

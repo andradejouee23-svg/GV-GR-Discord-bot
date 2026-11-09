@@ -13,15 +13,15 @@ const { createDatabase } = require('./database');
 const { commands } = require('./commands/definitions');
 const { handleButton } = require('./buttons');
 const { handleClockCommand } = require('./commands/clock');
-const { handleClearBotMessagesButton, handleClearBotMessagesCommand } = require('./commands/clearBotMessages');
+const { handleClearBotMessagesButton, handleClearBotMessagesCommand, handleClearBotMessagesSelect } = require('./commands/clearBotMessages');
 const { handleOperationsCommand, handleSessionPanelModal, submitSessionModal } = require('./commands/operations');
 const { handleAnnouncementManagerInteraction } = require('./commands/announcementManager');
 const { handleVehicleCommand, handleVehicleModal, processVehicleExpirations } = require('./commands/vehicles');
-const { handleTempAdminCommand, handleTempAdminModal, handleTempAdminSelect, processTemporaryAdminExpirations } = require('./commands/tempAdmin');
 const { handleTownJobsCommand } = require('./commands/townJobs');
-const { handleEconomyCommand, handleEconomyManagementButton, handleEconomyManagementSelect, handleEconomyModal, processEconomyCashDrops } = require('./commands/economy');
+const { handleEconomyCommand, handleEconomyGameSelect, handleEconomyManagementButton, handleEconomyManagementSelect, handleEconomyModal, processEconomyCashDrops, processEconomyDailyPanel } = require('./commands/economy');
 const { handleBlacklistButton, handleBlacklistCommand, handleBlacklistModal, handleBlacklistSelect, processBlacklistExpirations } = require('./commands/blacklist');
 const { handlePanelEditorButton, handlePanelEditorCommand, handlePanelEditorModal, handlePanelEditorSelect } = require('./commands/panelEditor');
+const { handleFormsCommand, handleFormsModal, handleFormsSelect } = require('./commands/forms');
 const { handleSalaryCommand } = require('./commands/salaries');
 const { processTownJobsSalaries } = require('./services/economySalaries');
 const { handleSafetyCommand, submitReport } = require('./commands/safety');
@@ -73,9 +73,9 @@ if (requireSetup()) {
       await processWeeklyGoalReminders(client, db);
       await processStaffOfWeek(client, db);
       processVehicleExpirations(db);
-      await processTemporaryAdminExpirations(client, db);
       await processTownJobsSalaries(client, db);
       await processEconomyCashDrops(client, db);
+      await processEconomyDailyPanel(client, db);
       await processBlacklistExpirations(client, db);
     } catch (error) {
       console.error('Staff background task failed:', error);
@@ -90,6 +90,7 @@ if (requireSetup()) {
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.GuildPresences,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
     ],
     partials: [Partials.Message],
   });
@@ -130,6 +131,9 @@ if (requireSetup()) {
 
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
+      if (interaction.isButton() && interaction.customId.startsWith('gv:blacklist:username:')) {
+        return handleBlacklistButton(interaction, context);
+      }
       if (!interaction.inGuild()) {
         if (interaction.isRepliable()) {
           await interaction.reply({ content: 'This bot can only be used inside the Greenville RP server.', ephemeral: true });
@@ -138,7 +142,7 @@ if (requireSetup()) {
       }
 
       if (interaction.isChatInputCommand()) {
-        const handlers = [handleClockCommand, handleClearBotMessagesCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleTempAdminCommand, handleBlacklistCommand, handlePanelEditorCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
+        const handlers = [handleClockCommand, handleClearBotMessagesCommand, handleStaffCenterCommand, handleStaffCommand, handleOperationsCommand, handleVehicleCommand, handleBlacklistCommand, handleFormsCommand, handlePanelEditorCommand, handleTownJobsCommand, handleEconomyCommand, handleSalaryCommand, handleSafetyCommand];
         for (const handler of handlers) {
           const result = await handler(interaction, context);
           if (result !== null && result !== undefined) return;
@@ -175,14 +179,20 @@ if (requireSetup()) {
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:blacklist:select:')) {
         return handleBlacklistSelect(interaction, context);
       }
-      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:tempadmin:choice:')) {
-        return handleTempAdminSelect(interaction, context);
-      }
       if (interaction.isStringSelectMenu() && interaction.customId === 'gv:panel_editor:select') {
         return handlePanelEditorSelect(interaction, context);
       }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gv:economy:staff:')) {
         return handleEconomyManagementSelect(interaction, context);
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('mgmt:forms:')) {
+        return handleFormsSelect(interaction, context);
+      }
+      if (interaction.isChannelSelectMenu() && interaction.customId === 'mgmt:clear-bots:channel') {
+        return handleClearBotMessagesSelect(interaction, context);
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId === 'gv:economy:games:select') {
+        return handleEconomyGameSelect(interaction, context);
       }
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('mgmt:vehicle:')) {
         return require('./commands/vehicles').handleVehicleManagementSelect(interaction, context);
@@ -200,6 +210,7 @@ if (requireSetup()) {
       }
       if (interaction.isModalSubmit()) {
         if (interaction.customId.startsWith('gv:panel_editor:')) return handlePanelEditorModal(interaction, context);
+        if (interaction.customId.startsWith('mgmt:forms:')) return handleFormsModal(interaction, context);
         if (interaction.customId.startsWith('gv:blacklist:')) return handleBlacklistModal(interaction, context);
         if (interaction.customId.startsWith('gv:economy:')) return handleEconomyModal(interaction, context);
         if (interaction.customId === 'gv:report_submit') return submitReport(interaction, context);
@@ -207,7 +218,6 @@ if (requireSetup()) {
         if (interaction.customId.startsWith('gv:session_panel_start:')) return handleSessionPanelModal(interaction, context);
         if (interaction.customId.startsWith('gv:ann:')) return handleAnnouncementManagerInteraction(interaction, context);
         if (interaction.customId.startsWith('gv:vehicle:')) return handleVehicleModal(interaction, context);
-        if (interaction.customId.startsWith('gv:tempadmin:')) return handleTempAdminModal(interaction, context);
         if (interaction.customId.startsWith('owner:modal:')) return handleOwnerActionModal(interaction, context);
         if (interaction.customId.startsWith('mgmt:vehicle:')) return require('./commands/vehicles').handleVehicleManagementModal(interaction, context);
         if (interaction.customId.startsWith('mgmt:shift_modal:')) return handleManagementShiftModal(interaction, context);
@@ -221,6 +231,14 @@ if (requireSetup()) {
         return;
       }
       await interaction.reply({ content: 'Something went wrong while handling that request. The error has been logged.', ephemeral: true }).catch(() => {});
+    }
+  });
+
+  client.on(Events.MessageCreate, async (message) => {
+    try {
+      await require('./commands/blacklist').handleBlacklistSubmissionMessage(message, context);
+    } catch (error) {
+      console.error('Private blacklist username handling failed:', error);
     }
   });
 

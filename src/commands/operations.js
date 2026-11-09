@@ -15,44 +15,120 @@ const {
   hasRoleGroup,
   logStaffAction,
   makeEmbed,
+  setConfigValue,
   sendToChannel,
   unixTime,
 } = require('../utils/discord');
 const { ensureManagement } = require('./staff');
 const { openAnnouncementManager } = require('./announcementManager');
+const { getFormQuestion } = require('./forms');
 
-function makeSessionModal(host) {
+function makeSessionModal(host, db) {
+  const name = getFormQuestion(db, 'session', 'name');
+  const description = getFormQuestion(db, 'session', 'description');
   return new ModalBuilder()
     .setCustomId(`gv:session_start:${host.id}`)
     .setTitle('Start an RP Session')
     .addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder()
-        .setCustomId('name').setLabel('Session name').setStyle(TextInputStyle.Short)
-        .setMaxLength(100).setRequired(true).setPlaceholder('Example: Community Patrol.')),
+        .setCustomId('name').setLabel(name.label).setStyle(TextInputStyle.Short)
+        .setMaxLength(100).setRequired(true).setPlaceholder(name.placeholder)),
       new ActionRowBuilder().addComponents(new TextInputBuilder()
-        .setCustomId('description').setLabel('Optional description').setStyle(TextInputStyle.Paragraph)
-        .setMaxLength(1000).setRequired(false).setPlaceholder('Add the activity, meeting point, or schedule.')),
+        .setCustomId('description').setLabel(description.label).setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1000).setRequired(false).setPlaceholder(description.placeholder)),
     );
 }
 
-function makeSessionPanelModal(hostId) {
+function makeSessionPanelModal(hostId, db) {
+  const name = getFormQuestion(db, 'session', 'name');
+  const description = getFormQuestion(db, 'session', 'description');
   return new ModalBuilder()
     .setCustomId(`gv:session_panel_start:${hostId}`)
     .setTitle('GV GR • Start RP Session')
     .addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder()
-        .setCustomId('name').setLabel('Session name').setStyle(TextInputStyle.Short)
-        .setMaxLength(100).setRequired(true).setPlaceholder('Example: Community Patrol.')),
+        .setCustomId('name').setLabel(name.label).setStyle(TextInputStyle.Short)
+        .setMaxLength(100).setRequired(true).setPlaceholder(name.placeholder)),
       new ActionRowBuilder().addComponents(new TextInputBuilder()
-        .setCustomId('description').setLabel('Session details (optional)').setStyle(TextInputStyle.Paragraph)
-        .setMaxLength(1000).setRequired(false).setPlaceholder('Optional: activity, meeting point, or schedule.')),
+        .setCustomId('description').setLabel(description.label).setStyle(TextInputStyle.Paragraph)
+        .setMaxLength(1000).setRequired(false).setPlaceholder(description.placeholder)),
     );
 }
 
-function makeSessionButtons(sessionId) {
+function makeSessionButtons(sessionId, defaults = getSessionQuickStartDefaultsFromConfig()) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`gv:session_join:${sessionId}`).setLabel('Join Session').setEmoji('🎙️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`gv:session_join:${sessionId}`).setLabel(defaults.buttonLabel).setEmoji(defaults.buttonEmoji).setStyle(ButtonStyle.Primary),
   )];
+}
+
+function getSessionQuickStartDefaultsFromConfig() {
+  return {
+    name: config.SESSION_QUICK_START_NAME ?? 'Greenville RP Session',
+    description: config.SESSION_QUICK_START_DESCRIPTION ?? 'A new Greenville RP session is now live. Staff can join using the button below.',
+    imageUrl: null,
+    color: config.EMBED_COLORS.info,
+    footer: 'GREENVILLE ROLEPLAY • Staff can join this active session below',
+    buttonLabel: 'Join Session',
+    buttonEmoji: '🎙️',
+  };
+}
+
+function getSessionQuickStartDefaults(db) {
+  const defaults = getSessionQuickStartDefaultsFromConfig();
+  const saved = {
+    name: getConfigValue(db, 'SESSION_QUICK_START_NAME'),
+    description: getConfigValue(db, 'SESSION_QUICK_START_DESCRIPTION'),
+    imageUrl: getConfigValue(db, 'SESSION_QUICK_START_IMAGE_URL'),
+    colorHex: getConfigValue(db, 'SESSION_QUICK_START_COLOR'),
+    footer: getConfigValue(db, 'SESSION_QUICK_START_FOOTER'),
+    buttonLabel: getConfigValue(db, 'SESSION_QUICK_START_BUTTON_LABEL'),
+    buttonEmoji: getConfigValue(db, 'SESSION_QUICK_START_BUTTON_EMOJI'),
+  };
+  const colorHex = saved.colorHex ?? `#${defaults.color.toString(16).padStart(6, '0')}`;
+  const color = /^#?[0-9a-f]{6}$/i.test(colorHex) ? Number.parseInt(colorHex.replace(/^#/, ''), 16) : defaults.color;
+  return {
+    name: saved.name ?? defaults.name,
+    description: saved.description ?? defaults.description,
+    imageUrl: saved.imageUrl ?? defaults.imageUrl,
+    color,
+    colorHex,
+    footer: saved.footer ?? defaults.footer,
+    buttonLabel: saved.buttonLabel ?? defaults.buttonLabel,
+    buttonEmoji: saved.buttonEmoji ?? defaults.buttonEmoji,
+  };
+}
+
+async function configureSessionQuickStart(interaction, ctx) {
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const options = interaction.options;
+  const imageUrl = options.getString('image-url');
+  const removeImage = options.getBoolean('remove-image') === true;
+  if (imageUrl && removeImage) return interaction.reply({ content: 'Choose a new image URL or remove the saved image, not both.', ephemeral: true });
+  if (imageUrl && !/^https:\/\//i.test(imageUrl)) return interaction.reply({ content: 'The session image must use an HTTPS URL.', ephemeral: true });
+  const color = options.getString('color');
+  if (color && !/^#?[0-9a-f]{6}$/i.test(color)) return interaction.reply({ content: 'Enter a six-digit HEX color, such as #36A765.', ephemeral: true });
+  const buttonEmoji = options.getString('button-emoji');
+  if (buttonEmoji) {
+    try { new ButtonBuilder().setEmoji(buttonEmoji).toJSON(); }
+    catch { return interaction.reply({ content: 'Enter a valid Discord emoji for the join button.', ephemeral: true }); }
+  }
+  const changes = [];
+  for (const [option, key] of [
+    ['name', 'SESSION_QUICK_START_NAME'],
+    ['description', 'SESSION_QUICK_START_DESCRIPTION'],
+    ['footer', 'SESSION_QUICK_START_FOOTER'],
+    ['button-label', 'SESSION_QUICK_START_BUTTON_LABEL'],
+    ['button-emoji', 'SESSION_QUICK_START_BUTTON_EMOJI'],
+  ]) {
+    const value = options.getString(option);
+    if (value !== null) changes.push([key, value.trim()]);
+  }
+  if (color) changes.push(['SESSION_QUICK_START_COLOR', color.startsWith('#') ? color.toUpperCase() : `#${color.toUpperCase()}`]);
+  if (imageUrl) changes.push(['SESSION_QUICK_START_IMAGE_URL', imageUrl.trim()]);
+  if (removeImage) changes.push(['SESSION_QUICK_START_IMAGE_URL', null]);
+  if (!changes.length) return interaction.reply({ content: 'Provide at least one Quick Start default to change.', ephemeral: true });
+  for (const [key, value] of changes) setConfigValue(ctx.db, key, value);
+  return interaction.reply({ content: `Saved Quick Start Session defaults: ${changes.map(([key]) => `**${key.replace('SESSION_QUICK_START_', '').replaceAll('_', ' ').toLowerCase()}**`).join(', ')}.`, ephemeral: true });
 }
 
 async function startSessionCommand(interaction, ctx) {
@@ -84,7 +160,7 @@ async function submitSessionModal(interaction, ctx) {
   return publishSessionAnnouncement(interaction, ctx, host, name, description);
 }
 
-async function publishSessionAnnouncement(interaction, ctx, host, name, description) {
+async function publishSessionAnnouncement(interaction, ctx, host, name, description, defaults = getSessionQuickStartDefaults(ctx.db)) {
   const now = new Date().toISOString();
   const sessionId = ctx.db.transaction(() => {
     if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) return null;
@@ -99,17 +175,18 @@ async function publishSessionAnnouncement(interaction, ctx, host, name, descript
   })();
   if (!sessionId) return interaction.reply({ content: 'Another RP session is already active. End it before starting a new one.', ephemeral: true });
 
-  const embed = makeEmbed(config.EMBED_COLORS.info, `🎙️ GV GR • ${name}`,
+  const embed = makeEmbed(defaults.color, `🎙️ GV GR • ${name}`,
     `${description ? `${description}\n\n` : ''}**SESSION LIVE**\n\n👤 **Host**\n<@${host.id}>\n\n🕒 **Started**\n${unixTime(now)}\n\n🆔 **Session**\n#${sessionId}`)
-    .setFooter({ text: 'GREENVILLE ROLEPLAY • Staff can join this active session below' })
+    .setFooter({ text: defaults.footer || 'GV GR • RP Session' })
     .setTimestamp(new Date(now));
+  if (defaults.imageUrl) embed.setImage(defaults.imageUrl);
   if (interaction.guild?.iconURL()) embed.setAuthor({ name: 'GV GR • GREENVILLE ROLEPLAY', iconURL: interaction.guild.iconURL() });
   const channelId = getConfigValue(ctx.db, 'SESSION_CHANNEL_ID');
   let message;
   if (channelId) {
     try {
       const channel = await interaction.client.channels.fetch(channelId);
-      if (channel?.isTextBased() && channel.send) message = await channel.send({ embeds: [embed], components: makeSessionButtons(sessionId) });
+      if (channel?.isTextBased() && channel.send) message = await channel.send({ embeds: [embed], components: makeSessionButtons(sessionId, defaults) });
     } catch (error) {
       console.error('Could not announce the RP session:', error.message);
     }
@@ -137,8 +214,8 @@ async function handleSessionPanelButton(interaction, ctx) {
     if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) {
       return interaction.reply({ content: 'An RP session is already active. End it before starting another.', ephemeral: true });
     }
-    return publishSessionAnnouncement(interaction, ctx, host, 'Greenville RP Session',
-      'A new Greenville RP session is now live. Staff can join using the button below.');
+    const defaults = getSessionQuickStartDefaults(ctx.db);
+    return publishSessionAnnouncement(interaction, ctx, host, defaults.name, defaults.description, defaults);
   }
   if (interaction.customId === 'gv:session_panel:start') {
     const host = await fetchGuildMember(interaction.guild, interaction.user.id);
@@ -148,7 +225,7 @@ async function handleSessionPanelButton(interaction, ctx) {
     if (ctx.db.prepare("SELECT id FROM sessions WHERE status = 'active'").get()) {
       return interaction.reply({ content: 'An RP session is already active. End it before starting another.', ephemeral: true });
     }
-    return interaction.showModal(makeSessionPanelModal(interaction.user.id));
+    return interaction.showModal(makeSessionPanelModal(interaction.user.id, ctx.db));
   }
   if (interaction.customId === 'gv:session_panel:end') return endSession(interaction, ctx);
   return null;
@@ -271,6 +348,7 @@ async function cancelEvent(interaction, ctx) {
 async function handleOperationsCommand(interaction, ctx) {
   if (interaction.commandName === 'session') {
     const action = interaction.options.getSubcommand();
+    if (action === 'configure') return configureSessionQuickStart(interaction, ctx);
     if (action === 'start') return startSessionCommand(interaction, ctx);
     if (action === 'end') return endSession(interaction, ctx);
     return sessionStatus(interaction, ctx);
@@ -306,5 +384,8 @@ module.exports = {
   makeSessionModal,
   makeSessionButtons,
   makeSessionPanelModal,
+  getSessionQuickStartDefaults,
+  publishSessionAnnouncement,
+  configureSessionQuickStart,
   submitSessionModal,
 };

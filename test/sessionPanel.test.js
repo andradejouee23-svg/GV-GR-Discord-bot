@@ -7,7 +7,7 @@ const config = require('../config');
 const { createDatabase } = require('../src/database');
 const { handleButton } = require('../src/buttons');
 const { createPanelComponents } = require('../src/commands/clock');
-const { handleSessionPanelModal } = require('../src/commands/operations');
+const { getSessionQuickStartDefaults, handleOperationsCommand, handleSessionPanelModal, makeSessionButtons } = require('../src/commands/operations');
 const { setConfigValue } = require('../src/utils/discord');
 
 const sessionChannelId = '1666064708795306156';
@@ -143,4 +143,51 @@ test('staff panel starts and ends a branded RP session announcement through butt
     reply: async (payload) => payload,
   }, { db, client });
   assert.equal(db.prepare('SELECT status FROM sessions WHERE id = 2').get().status, 'completed');
+});
+
+test('management can edit Quick Start defaults and the saved image, style, and button persist after restart', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-session-defaults-'));
+  const databasePath = path.join(directory, 'session.sqlite');
+  let db = createDatabase(databasePath);
+  t.after(() => { db.close(); rmSync(directory, { recursive: true, force: true }); });
+  setConfigValue(db, 'role_management', [managerRoleId]);
+  const guild = {
+    id: config.SERVER_ID,
+    ownerId: 'owner',
+    members: { fetch: async (id) => id === managerId ? { id, roles: { cache: new Map([[managerRoleId, {}]]) } } : null },
+  };
+  const values = {
+    name: 'Friday Convoy',
+    description: 'Meet at the main dealership at 7 PM.',
+    'image-url': 'https://example.com/convoy.jpg',
+    color: '#36A765',
+    footer: 'GV GR • Friday Night',
+    'button-label': 'Join the convoy',
+    'button-emoji': '🚘',
+  };
+  let reply;
+  await handleOperationsCommand({
+    commandName: 'session',
+    guild,
+    user: { id: managerId },
+    options: {
+      getSubcommand: () => 'configure',
+      getString: (key) => values[key] ?? null,
+      getBoolean: () => false,
+    },
+    reply: async (payload) => { reply = payload; return payload; },
+  }, { db });
+  assert.match(reply.content, /Saved Quick Start Session defaults/);
+  db.close();
+  db = createDatabase(databasePath);
+  const defaults = getSessionQuickStartDefaults(db);
+  assert.equal(defaults.name, values.name);
+  assert.equal(defaults.description, values.description);
+  assert.equal(defaults.imageUrl, values['image-url']);
+  assert.equal(defaults.color, 0x36a765);
+  assert.equal(defaults.footer, values.footer);
+  const joinButton = makeSessionButtons(42, defaults)[0].components[0].toJSON();
+  assert.equal(joinButton.label, 'Join the convoy');
+  assert.equal(joinButton.emoji.name, '🚘');
+  assert.equal(joinButton.custom_id, 'gv:session_join:42');
 });

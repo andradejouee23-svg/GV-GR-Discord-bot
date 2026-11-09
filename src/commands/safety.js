@@ -19,21 +19,27 @@ const {
   unixTime,
 } = require('../utils/discord');
 const { ensureManagement } = require('./staff');
+const { getFormQuestion } = require('./forms');
 
-function reportModal() {
+function reportModal(db) {
+  const q = (key) => getFormQuestion(db, 'report', key);
+  const player = q('player');
+  const reason = q('reason');
+  const description = q('description');
+  const evidence = q('evidence');
   return new ModalBuilder().setCustomId('gv:report_submit').setTitle('Submit a Player Report').addComponents(
     new ActionRowBuilder().addComponents(new TextInputBuilder()
-      .setCustomId('player').setLabel('Player being reported').setStyle(TextInputStyle.Short)
-      .setMaxLength(100).setRequired(true).setPlaceholder('Exact Discord or Roblox username.')),
+      .setCustomId('player').setLabel(player.label).setStyle(TextInputStyle.Short)
+      .setMaxLength(100).setRequired(true).setPlaceholder(player.placeholder)),
     new ActionRowBuilder().addComponents(new TextInputBuilder()
-      .setCustomId('reason').setLabel('Reason for the report').setStyle(TextInputStyle.Short)
-      .setMaxLength(200).setRequired(true).setPlaceholder('Example: harassment or exploiting.')),
+      .setCustomId('reason').setLabel(reason.label).setStyle(TextInputStyle.Short)
+      .setMaxLength(200).setRequired(true).setPlaceholder(reason.placeholder)),
     new ActionRowBuilder().addComponents(new TextInputBuilder()
-      .setCustomId('description').setLabel('What happened?').setStyle(TextInputStyle.Paragraph)
-      .setMaxLength(1500).setRequired(true).setPlaceholder('Describe what happened and when.')),
+      .setCustomId('description').setLabel(description.label).setStyle(TextInputStyle.Paragraph)
+      .setMaxLength(1500).setRequired(true).setPlaceholder(description.placeholder)),
     new ActionRowBuilder().addComponents(new TextInputBuilder()
-      .setCustomId('evidence').setLabel('Evidence link (optional)').setStyle(TextInputStyle.Short)
-      .setMaxLength(500).setRequired(false).setPlaceholder('Link a screenshot, clip, or other evidence.')),
+      .setCustomId('evidence').setLabel(evidence.label).setStyle(TextInputStyle.Short)
+      .setMaxLength(500).setRequired(false).setPlaceholder(evidence.placeholder)),
   );
 }
 
@@ -45,8 +51,8 @@ function reportButtons(reportId, disabled = false) {
   )];
 }
 
-async function handleReportCommand(interaction) {
-  return interaction.showModal(reportModal());
+async function handleReportCommand(interaction, ctx) {
+  return interaction.showModal(reportModal(ctx.db));
 }
 
 async function submitReport(interaction, ctx) {
@@ -165,7 +171,7 @@ async function moderationCommand(interaction, ctx) {
 }
 
 async function handleSafetyCommand(interaction, ctx) {
-  if (interaction.commandName === 'report') return handleReportCommand(interaction);
+  if (interaction.commandName === 'report') return handleReportCommand(interaction, ctx);
   if (interaction.commandName === 'mod') return moderationCommand(interaction, ctx);
   return null;
 }

@@ -6,7 +6,13 @@ const test = require('node:test');
 const { Collection } = require('discord.js');
 const config = require('../config');
 const { createDatabase } = require('../src/database');
-const { handleClearBotMessagesButton, handleClearBotMessagesCommand } = require('../src/commands/clearBotMessages');
+const {
+  handleClearBotMessagesButton,
+  handleClearBotMessagesCommand,
+  handleClearBotMessagesSelect,
+  openCleanupChannelPicker,
+} = require('../src/commands/clearBotMessages');
+const { createPanelComponents } = require('../src/commands/clock');
 
 const managerRoleId = '1556064708795306157';
 const managerId = 'clear-manager';
@@ -79,4 +85,82 @@ test('confirmed bot cleanup deletes only the bot’s unpinned non-record message
   }, { db });
   assert.match(result.content, /Removed \*\*2\*\* bot messages/);
   assert.deepEqual(new Set(deleted), new Set(['recent-bot', 'old-bot']));
+});
+
+test('Staff Panel full cleanup paginates history and deletes every own-bot message only after confirmation', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'gv-gr-clear-all-'));
+  const db = createDatabase(path.join(directory, 'test.sqlite'));
+  t.after(() => { db.close(); rmSync(directory, { recursive: true, force: true }); });
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('role_management', JSON.stringify([managerRoleId]));
+
+  const channelId = '1666064708795306156';
+  const messages = [];
+  const deleted = [];
+  const now = Date.now();
+  for (let index = 0; index < 230; index += 1) {
+    const ownBot = index % 10 < 8;
+    const id = `full-${index}`;
+    messages.push({
+      id,
+      author: { id: ownBot ? botId : index % 2 ? 'another-bot' : 'regular-player' },
+      createdTimestamp: index % 40 === 0 ? now - 20 * 86400_000 : now - index,
+      pinned: ownBot && index % 32 === 0,
+      content: ownBot && index === 8 ? 'ECONOMY PANEL' : 'ordinary message',
+      embeds: [],
+      delete: async () => { deleted.push(id); },
+    });
+  }
+  const channel = {
+    id: channelId,
+    guildId: config.SERVER_ID,
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    messages: {
+      fetch: async ({ limit, before } = {}) => {
+        const start = before ? messages.findIndex((message) => message.id === before) + 1 : 0;
+        return new Collection(messages.slice(start, start + limit).map((message) => [message.id, message]));
+      },
+    },
+    bulkDelete: async (collection) => {
+      for (const message of collection.values()) deleted.push(message.id);
+      return collection;
+    },
+  };
+  const manager = { id: managerId, roles: { cache: new Map([[managerRoleId, {}]]) } };
+  const guild = {
+    id: config.SERVER_ID,
+    ownerId: 'owner',
+    members: { me: {}, fetch: async (id) => id === managerId ? manager : { id, roles: { cache: new Map() } } },
+  };
+  const client = { user: { id: botId }, channels: { fetch: async () => channel } };
+  assert.ok(createPanelComponents().flatMap((row) => row.components).some((button) => button.data.custom_id === 'mgmt:clear-bots'));
+
+  let picker;
+  await openCleanupChannelPicker({ guild, user: { id: managerId }, reply: async (payload) => { picker = payload; return payload; } }, { db });
+  assert.equal(picker.components[0].components[0].data.custom_id, 'mgmt:clear-bots:channel');
+  let confirmation;
+  await handleClearBotMessagesSelect({
+    customId: 'mgmt:clear-bots:channel',
+    values: [channelId],
+    guild,
+    client,
+    user: { id: managerId },
+    update: async (payload) => { confirmation = payload; return payload; },
+  }, { db });
+  assert.match(confirmation.embeds[0].data.description, /entire history/i);
+  assert.match(confirmation.embeds[0].data.description, /pinned messages, panels, and record announcements/i);
+
+  let result;
+  await handleClearBotMessagesButton({
+    customId: confirmation.components[0].components[0].data.custom_id,
+    guild,
+    client,
+    user: { id: managerId },
+    deferUpdate: async () => {},
+    followUp: async (payload) => { result = payload; return payload; },
+  }, { db });
+  const ownBotCount = messages.filter((message) => message.author.id === botId).length;
+  assert.equal(deleted.length, ownBotCount);
+  assert.match(result.content, new RegExp(`Removed \\*\\*${ownBotCount}\\*\\* bot messages`));
+  assert.ok(messages.filter((message) => message.author.id !== botId).every((message) => !deleted.includes(message.id)));
 });

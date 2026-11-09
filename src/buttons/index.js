@@ -3,7 +3,6 @@ const { handleSessionJoin } = require('../commands/operations');
 const { handleSessionPanelButton } = require('../commands/operations');
 const { handleAnnouncementManagerInteraction } = require('../commands/announcementManager');
 const { handleVehicleButton } = require('../commands/vehicles');
-const { handleTempAdminButton } = require('../commands/tempAdmin');
 const { handleTownJobButton } = require('../commands/townJobs');
 const { handleEconomyButton } = require('../commands/economy');
 const { handleBlacklistButton } = require('../commands/blacklist');
@@ -24,10 +23,6 @@ async function handleButton(interaction, ctx) {
 
   if (interaction.customId.startsWith('gv:townjobs:')) {
     return handleTownJobButton(interaction, ctx);
-  }
-
-  if (interaction.customId.startsWith('gv:tempadmin:')) {
-    return handleTempAdminButton(interaction, ctx);
   }
 
   if (interaction.customId.startsWith('gv:vehicle:')) {

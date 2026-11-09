@@ -37,7 +37,7 @@ Create text channels for staff activity/logs, reports, sessions, events, and ann
 
 For vehicle registration, create a public registration-panel channel and a staff-only vehicle-review channel. Set both with `/staffconfig channel`, then use `/vehicle panel` to post or refresh the registration panel. The bot needs View Channel, Send Messages, and Embed Links permissions in both channels.
 
-For Temporary Admin applications, management runs `/tempadmin configure` to set the application role, private review channel, duration, title, description, and up to five questions. Then run `/tempadmin panel channel:<text-channel>` to post or refresh the public application panel. The bot needs Manage Roles, View Channel, Send Messages, and Embed Links permissions in the review channel, and its highest role must be above the temporary role. Applicants can privately review decisions with `/tempadmin history`.
+For forms, management can use the **Forms** button in the Staff Dashboard or `/forms list` to browse the Player Report, Blacklist Appeal, Vehicle Registration, and RP Session questions. `/forms edit` saves question labels and placeholder examples in SQLite without changing required fields or submission processing.
 
 For Town Jobs, management configures the panel with `/townjobs configure`, adds arbitrary role buttons with `/townjobs add`, and publishes or refreshes it with `/townjobs panel`. Configure the bot with Manage Roles and place its highest role above every selectable job role. Jobs are not hardcoded; the salary system can pay any currently configured Town Job role.
 
@@ -53,12 +53,12 @@ After first setup, a configured Owner or Co-Owner can update channels and role g
 
 ## 3. Enable Intents and Invite the Bot
 
-In the Developer Portal, open **Bot → Privileged Gateway Intents** and enable **Server Members Intent** and **Presence Intent**. These are used for staff role checks and the online-staff count. Message content intent is not needed.
+In the Developer Portal, open **Bot → Privileged Gateway Intents** and enable **Server Members Intent**, **Presence Intent**, and **Message Content Intent**. These are used for staff role checks, the online-staff count, and private handling of admin username submissions in the configured blacklist channel.
 
 Invite the bot from **OAuth2 → URL Generator**. Select the `bot` and `applications.commands` scopes, then grant these bot permissions:
 
 - View Channels, Send Messages, Embed Links, and Read Message History
-- Manage Roles for Temporary Admin approvals; the bot's highest role must be above the configured temporary role
+- Manage Roles for Town Jobs reaction-role assignment; the bot's highest role must be above the configured job roles
 - View Audit Log, for identifying who deleted a message
 - Kick Members, Ban Members, and Moderate Members, for `/mod kick`, `/mod ban`, and `/mod timeout`
 
@@ -129,7 +129,7 @@ Run the bot as a single long-lived worker with `npm start` (it does not serve an
 - `/staffannounce` posts to the configured announcement channel.
 - `/staffconfig channel` and `/staffconfig role` configure channels/role groups (Owner/Co-Owner only).
 - `/vehicle panel` posts the registration panel. Players use its buttons or `/vehicle mine`; management can search, review, update, revoke, set expiration, and inspect registration history.
-- `/tempadmin panel` posts the application panel; `/tempadmin configure` sets the application questions, review channel, assigned role, and role duration. `/tempadmin history` shows private application history.
+- `/forms list` and `/forms edit` manage question labels and placeholder examples for existing forms.
 - `/townjobs configure`, `/townjobs add`, `/townjobs edit`, `/townjobs remove`, `/townjobs list`, and `/townjobs panel` manage the customizable Town Jobs role panel.
 - `/economy configure`, `/economy panel`, `/economy wallet`, `/economy work`, `/economy daily`, bank transfers, shop, inventory, history, transactions, leaderboard, and staff product/balance commands manage the persistent virtual economy.
 - **Delivery Rush**, Blackjack, Coin Flip, Roulette, and Chicken Road use the shared economy wallet and transaction ledger; buttons and game sessions persist through restarts.
@@ -147,7 +147,7 @@ Run the bot as a single long-lived worker with `npm start` (it does not serve an
 - `src/commands/staff.js`: Warnings, private notes/history, announcements, and owner configuration.
 - `src/commands/operations.js`: RP sessions and scheduled events.
 - `src/commands/vehicles.js`: Vehicle applications, staff review, and registration management.
-- `src/commands/tempAdmin.js`: Temporary Admin application configuration, review, role assignment, history, and expiration.
+- `src/commands/forms.js`: Management dashboard and persistent question-label/placeholder editor for existing forms.
 - `src/commands/townJobs.js`: Configurable Town Jobs panel and shared job-role catalog.
 - `src/commands/economy.js`: Persistent economy accounts, banking, shop, cash drops, player/staff interactions, history, and panel.
 - `src/services/economyGames.js`: Persisted Blackjack, Coin Flip, Roulette, and Chicken Road wager/payout state machines.

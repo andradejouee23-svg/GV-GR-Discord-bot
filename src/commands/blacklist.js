@@ -12,8 +12,10 @@ const {
 } = require('discord.js');
 const config = require('../../config');
 const { ensureManagement } = require('./staff');
-const { getConfigValue, makeEmbed, setConfigValue, validId } = require('../utils/discord');
+const { fetchGuildMember, getConfigValue, hasRoleGroup, makeEmbed, setConfigValue, validId } = require('../utils/discord');
 const { applyPanelCustomization, ensurePanelHeader } = require('./panelEditor');
+const { isManagement } = require('./staffCenter');
+const { getFormQuestion } = require('./forms');
 
 const draftLifetimeMs = 30 * 60_000;
 const durations = new Map([
@@ -59,7 +61,7 @@ function updateDraft(db, draftId, actorId, { stage, data }) {
     .run(stage, JSON.stringify(data), draftId, actorId).changes > 0;
 }
 
-function textInput(id, label, { required = false, style = TextInputStyle.Short, value, maxLength = 1000 } = {}) {
+function textInput(id, label, { required = false, style = TextInputStyle.Short, value, maxLength = 1000, placeholder } = {}) {
   const input = new TextInputBuilder().setCustomId(id).setLabel(label.slice(0, 45)).setStyle(style).setRequired(required).setMaxLength(maxLength);
   if (value) input.setValue(String(value).slice(0, maxLength));
   const placeholders = {
@@ -82,35 +84,17 @@ function textInput(id, label, { required = false, style = TextInputStyle.Short, 
     expiration: 'ISO date/time with timezone, or permanent.',
     status: 'Choose active, expired, or removed.',
   };
-  if (placeholders[id]) input.setPlaceholder(placeholders[id]);
+  if (placeholder ?? placeholders[id]) input.setPlaceholder(placeholder ?? placeholders[id]);
   return new ActionRowBuilder().addComponents(input);
 }
 
-function blacklistCreateModal(draftId) {
-  return new ModalBuilder().setCustomId(`gv:blacklist:modal:create:${draftId}:1`).setTitle('GV GR • Blacklist Player')
-    .addComponents(
-      textInput('roblox_name', 'Roblox Username', { required: true, maxLength: 50 }),
-      textInput('roblox_id', 'Roblox User ID', { required: true, maxLength: 32 }),
-      textInput('discord_name', 'Discord Username', { required: true, maxLength: 100 }),
-      textInput('discord_id', 'Discord User ID', { required: true, maxLength: 20 }),
-      textInput('reason', 'Reason for Blacklist', { required: true, style: TextInputStyle.Paragraph, maxLength: 1000 }),
-    );
-}
-
-function blacklistDetailsModal(draftId, data = {}) {
-  return new ModalBuilder().setCustomId(`gv:blacklist:modal:create:${draftId}:2`).setTitle('GV GR • Evidence & Duration')
-    .addComponents(
-      textInput('evidence', 'Evidence or Evidence Link', { value: data.evidence, style: TextInputStyle.Paragraph, maxLength: 1000 }),
-      textInput('duration', 'Duration: 1d, 3d, 7d, 14d, 30d, permanent', { required: true, value: data.duration ?? '7d', maxLength: 20 }),
-      textInput('staff_notes', 'Additional Staff Notes', { value: data.staff_notes, style: TextInputStyle.Paragraph, maxLength: 1000 }),
-    );
-}
-
-function appealModalOne(draftId) {
+function appealModalOne(db, draftId) {
+  const username = getFormQuestion(db, 'blacklist_appeal', 'roblox_name');
+  const reason = getFormQuestion(db, 'blacklist_appeal', 'reconsideration');
   return new ModalBuilder().setCustomId(`gv:blacklist:modal:appeal:${draftId}`).setTitle('GV GR • Blacklist Appeal')
     .addComponents(
-      textInput('roblox_name', 'Roblox Username', { required: true, maxLength: 50 }),
-      textInput('reconsideration', 'Reason for appealing', { required: true, style: TextInputStyle.Paragraph, maxLength: 1000 }),
+      textInput('roblox_name', username.label, { required: true, maxLength: 50, placeholder: username.placeholder }),
+      textInput('reconsideration', reason.label, { required: true, style: TextInputStyle.Paragraph, maxLength: 1000, placeholder: reason.placeholder }),
     );
 }
 
@@ -125,11 +109,8 @@ function panelEmbed(db) {
   const active = db.prepare("SELECT COUNT(*) AS count FROM blacklist_records WHERE status = 'active'").get().count;
   const pending = db.prepare("SELECT COUNT(*) AS count FROM blacklist_appeals WHERE status IN ('pending', 'info_requested')").get().count;
   return makeEmbed(config.EMBED_COLORS.management, '🛡️ GV GR • BLACKLIST MANAGEMENT',
-    'Protect the Greenville RP community with traceable, reviewable moderation records.\n\n'
-    + '⛔ **Blacklist Player**\nCreate a timed or permanent record with evidence and staff notes.\n\n'
-    + '📝 **Appeal Blacklist**\nSubmit a review request linked to a saved record.\n\n'
-    + '🛠️ **Edit Blacklist**\nUpdate a record through preview and confirmation.\n\n'
-    + '🔎 **Search Records**\nSearch saved records and appeals by ID, player, or status.')
+    'Admins submit one Roblox username in the private submission channel. The bot asks for confirmation by DM and saves it only after **Yes**.\n\n'
+    + 'Use **View Blacklist** for the active username list. Existing records and appeals remain in the database.')
     .addFields(
       { name: 'ACTIVE RECORDS', value: String(active), inline: true },
       { name: 'APPEALS TO REVIEW', value: String(pending), inline: true },
@@ -139,9 +120,8 @@ function panelEmbed(db) {
 
 function panelComponents() {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('gv:blacklist:blacklist').setLabel('Blacklist Player').setEmoji('⛔').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('gv:blacklist:appeal').setLabel('Appeal Blacklist').setEmoji('📝').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('gv:blacklist:edit').setLabel('Edit Blacklist').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('gv:blacklist:list').setLabel('View Blacklist').setEmoji('📋').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('gv:blacklist:appeal').setLabel('Appeal Blacklist').setEmoji('📝').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('gv:blacklist:search').setLabel('Search Records').setEmoji('🔎').setStyle(ButtonStyle.Secondary),
   )];
 }
@@ -166,24 +146,9 @@ function makeRecordIdUnique(db) {
   return id;
 }
 
-async function postRecord(client, db, record) {
-  const channelId = getConfigValue(db, 'BLACKLIST_CHANNEL_ID');
-  if (!validId(channelId)) return false;
-  try {
-    const channel = await client.channels.fetch(channelId);
-    if (!channel?.isTextBased() || !channel.send) return false;
-    const message = await channel.send({ embeds: [recordEmbed(record)], allowedMentions: { parse: [] } });
-    db.prepare('UPDATE blacklist_records SET channel_id = ?, message_id = ? WHERE record_id = ?')
-      .run(channel.id, message.id, record.record_id);
-    return true;
-  } catch (error) {
-    console.error(`Could not post blacklist record ${record.record_id}:`, error.message);
-    return false;
-  }
-}
-
-async function updateRecordMessage(client, record) {
+async function updateRecordMessage(client, db, record) {
   if (!record.channel_id || !record.message_id) return false;
+  if (record.channel_id === getConfigValue(db, 'BLACKLIST_CHANNEL_ID')) return false;
   try {
     const channel = await client.channels.fetch(record.channel_id);
     const message = channel?.isTextBased() ? await channel.messages.fetch(record.message_id) : null;
@@ -200,6 +165,9 @@ async function publishPanel(interaction, ctx) {
   if (!await ensureManagement(interaction, ctx.db)) return;
   const channel = interaction.options.getChannel('channel') ?? await interaction.client.channels.fetch(getConfigValue(ctx.db, 'BLACKLIST_PANEL_CHANNEL_ID')).catch(() => null);
   if (!channel?.isTextBased() || !channel.send) return interaction.reply({ content: 'Choose a text channel for the blacklist management panel.', ephemeral: true });
+  if (channel.id === getConfigValue(ctx.db, 'BLACKLIST_CHANNEL_ID')) {
+    return interaction.reply({ content: 'The blacklist submission channel is reserved for admin usernames and cannot host bot panels.', ephemeral: true });
+  }
   const permissions = channel.permissionsFor(interaction.guild.members.me);
   if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions.has(PermissionFlagsBits.SendMessages) || !permissions.has(PermissionFlagsBits.EmbedLinks)) {
     return interaction.reply({ content: 'The bot needs View Channel, Send Messages, and Embed Links in the panel channel.', ephemeral: true });
@@ -242,88 +210,102 @@ async function configureBlacklist(interaction, ctx) {
   return interaction.reply({ content: `Saved blacklist channel settings: ${changes.map(([key]) => `**${key}**`).join(', ')}.`, ephemeral: true });
 }
 
-async function startBlacklistDraft(interaction, ctx) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
-  const id = createDraft(ctx.db, interaction.user.id, 'blacklist');
-  return interaction.showModal(blacklistCreateModal(id));
+function validRobloxUsername(username) {
+  return /^(?!_)(?!.*__)[A-Za-z0-9_]{3,20}(?<!_)$/.test(username);
 }
 
-async function completeBlacklistCreate(interaction, ctx, draftId) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
-  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'blacklist');
-  if (!draft || draft.stage !== 1) return interaction.reply({ content: 'This blacklist form expired. Start again from the panel.', ephemeral: true });
-  const data = Object.fromEntries(['roblox_name', 'roblox_id', 'discord_name', 'discord_id', 'reason'].map((key) => [key, interaction.fields.getTextInputValue(key).trim()]));
-  if (Object.values(data).some((value) => !value)) return interaction.reply({ content: 'Complete every required blacklist field.', ephemeral: true });
-  updateDraft(ctx.db, draftId, interaction.user.id, { stage: 2, data });
-  return interaction.reply({
-    content: 'Player details saved. Continue to enter evidence, duration, and private staff notes.',
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
-      .setCustomId(`gv:blacklist:continue:create:${draftId}`).setLabel('Continue Blacklist Form').setStyle(ButtonStyle.Primary))],
-    ephemeral: true,
+function usernameDecisionComponents(draftId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gv:blacklist:username:${draftId}:yes`).setLabel('Yes').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`gv:blacklist:username:${draftId}:no`).setLabel('No').setStyle(ButtonStyle.Secondary),
+  )];
+}
+
+async function handleBlacklistSubmissionMessage(message, ctx) {
+  const channelId = getConfigValue(ctx.db, 'BLACKLIST_CHANNEL_ID');
+  if (!channelId || message.channelId !== channelId || !message.guild || message.author?.bot) return null;
+  const username = String(message.content ?? '').trim();
+  if (!validRobloxUsername(username)) return null;
+  const member = await fetchGuildMember(message.guild, message.author.id);
+  if (!member || !isManagement(member, message.guild, ctx.db)) return null;
+  const draftId = createDraft(ctx.db, message.author.id, 'blacklist', null, {
+    flow: 'username_submission',
+    roblox_username: username,
   });
-}
-
-async function continueBlacklistCreate(interaction, ctx, draftId) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
-  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'blacklist');
-  if (!draft || draft.stage !== 2) return interaction.reply({ content: 'This blacklist form expired. Start again from the panel.', ephemeral: true });
-  return interaction.showModal(blacklistDetailsModal(draftId, draft.data));
-}
-
-async function saveBlacklistCreate(interaction, ctx, draftId) {
-  if (!await ensureManagement(interaction, ctx.db)) return;
-  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'blacklist');
-  if (!draft || draft.stage !== 2) return interaction.reply({ content: 'This blacklist form expired. Start again from the panel.', ephemeral: true });
-  const evidence = interaction.fields.getTextInputValue('evidence').trim();
-  const durationHours = parseDuration(interaction.fields.getTextInputValue('duration'));
-  const staffNotes = interaction.fields.getTextInputValue('staff_notes').trim();
-  if (durationHours === undefined) return interaction.reply({ content: 'Choose 1d, 3d, 7d, 14d, 30d, or permanent.', ephemeral: true });
-  const data = draft.data;
-  const createdAt = new Date().toISOString();
-  const recordId = makeRecordIdUnique(ctx.db);
-  const expiresAt = expirationFromDuration(durationHours);
   try {
-    ctx.db.transaction(() => {
-      const existing = ctx.db.prepare(`
-        SELECT record_id FROM blacklist_records WHERE status = 'active'
-          AND ((roblox_user_id = ? AND ? != '') OR (discord_user_id = ? AND ? != '')
-          OR lower(roblox_username) = lower(?) OR lower(discord_username) = lower(?)) LIMIT 1
-      `).get(data.roblox_id, data.roblox_id, data.discord_id, data.discord_id, data.roblox_name, data.discord_name);
-      if (existing) throw new Error(`This player already has active blacklist record ${existing.record_id}.`);
-      ctx.db.prepare(`
-        INSERT INTO blacklist_records (record_id, roblox_username, roblox_user_id, discord_username, discord_user_id,
-          reason, evidence, duration_hours, status, staff_notes, created_by, created_at, expires_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
-      `).run(recordId, data.roblox_name, data.roblox_id, data.discord_name, data.discord_id, data.reason, evidence,
-        durationHours, staffNotes, interaction.user.id, createdAt, expiresAt, createdAt);
-      writeRecordHistory(ctx.db, recordId, interaction.user.id, 'created', data, createdAt);
-      ctx.db.prepare('DELETE FROM blacklist_form_drafts WHERE draft_id = ?').run(draftId);
-    })();
-  } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE' || /already has active blacklist/.test(error.message)) {
-      return interaction.reply({ content: error.message, ephemeral: true });
-    }
-    console.error('Could not save blacklist record:', error);
-    return interaction.reply({ content: 'The blacklist record could not be saved. No record was announced; check the bot logs and try again.', ephemeral: true });
+    const user = await message.client.users.fetch(message.author.id);
+    await user.send({
+      content: `Do you want to blacklist this user?\n\n**Roblox username:** ${username}`,
+      components: usernameDecisionComponents(draftId),
+      allowedMentions: { parse: [] },
+    });
+  } catch {
+    ctx.db.prepare('DELETE FROM blacklist_form_drafts WHERE draft_id = ? AND actor_id = ?').run(draftId, message.author.id);
   }
-  const record = ctx.db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(recordId);
-  const posted = await postRecord(interaction.client, ctx.db, record);
-  return interaction.reply({
-    content: posted ? `Player was blacklisted. Record **${recordId}** was saved and posted.` : `Player was blacklisted. Record **${recordId}** was saved. Configure the record channel to publish its announcement.`,
-    embeds: [recordEmbed(record)],
-    ephemeral: true,
-  });
+  return null;
+}
+
+async function decideBlacklistUsername(interaction, ctx, draftId, decision) {
+  let guild;
+  try {
+    guild = interaction.client.guilds.cache.get(config.SERVER_ID) ?? await interaction.client.guilds.fetch(config.SERVER_ID);
+  } catch {
+    return interaction.update({ content: 'This confirmation is unavailable.', components: [] });
+  }
+  const member = await fetchGuildMember(guild, interaction.user.id);
+  if (!member || !isManagement(member, guild, ctx.db)) {
+    return interaction.update({ content: 'Current management access is required to confirm this request.', components: [] });
+  }
+  const draft = getDraft(ctx.db, draftId, interaction.user.id, 'blacklist');
+  if (!draft || draft.data.flow !== 'username_submission') {
+    return interaction.update({ content: 'This username confirmation expired. Nothing was saved.', components: [] });
+  }
+  if (decision === 'no') {
+    ctx.db.prepare('DELETE FROM blacklist_form_drafts WHERE draft_id = ? AND actor_id = ?').run(draftId, interaction.user.id);
+    return interaction.update({ content: 'Cancelled. Nothing was added to the blacklist.', components: [] });
+  }
+
+  const now = new Date().toISOString();
+  const result = ctx.db.transaction(() => {
+    const existing = ctx.db.prepare("SELECT record_id FROM blacklist_records WHERE status = 'active' AND lower(roblox_username) = lower(?) LIMIT 1")
+      .get(draft.data.roblox_username);
+    if (existing) {
+      ctx.db.prepare('DELETE FROM blacklist_form_drafts WHERE draft_id = ? AND actor_id = ?').run(draftId, interaction.user.id);
+      return { duplicate: true, recordId: existing.record_id };
+    }
+    const recordId = makeRecordIdUnique(ctx.db);
+    ctx.db.prepare(`
+      INSERT INTO blacklist_records (record_id, roblox_username, roblox_user_id, discord_username, discord_user_id,
+        reason, evidence, duration_hours, status, staff_notes, created_by, created_at, expires_at, updated_at)
+      VALUES (?, ?, NULL, '', NULL, 'Admin-confirmed username submission', '', NULL, 'active', '', ?, ?, NULL, ?)
+    `).run(recordId, draft.data.roblox_username, interaction.user.id, now, now);
+    writeRecordHistory(ctx.db, recordId, interaction.user.id, 'username_confirmed', { robloxUsername: draft.data.roblox_username }, now);
+    ctx.db.prepare('DELETE FROM blacklist_form_drafts WHERE draft_id = ? AND actor_id = ?').run(draftId, interaction.user.id);
+    return { duplicate: false, recordId };
+  })();
+  return interaction.update({ content: result.duplicate
+    ? `**${draft.data.roblox_username}** is already on the active blacklist. No duplicate was added.`
+    : `**${draft.data.roblox_username}** was added to the blacklist. Record: ${result.recordId}.`, components: [] });
+}
+
+async function showBlacklistList(interaction, ctx) {
+  if (!await ensureManagement(interaction, ctx.db)) return;
+  const rows = ctx.db.prepare("SELECT record_id, roblox_username, created_at FROM blacklist_records WHERE status = 'active' ORDER BY lower(roblox_username), created_at DESC").all();
+  const description = rows.length
+    ? rows.map((row) => `• **${row.roblox_username}** • ${row.record_id} • added <t:${Math.floor(new Date(row.created_at).getTime() / 1000)}:d>`).join('\n').slice(0, 3900)
+    : 'No usernames are currently blacklisted.';
+  return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.management, `📋 Active Blacklist • ${rows.length}`, description)], ephemeral: true });
 }
 
 async function startAppeal(interaction, ctx) {
   if (interaction.user.bot) return interaction.reply({ content: 'Bot accounts cannot submit blacklist appeals.', ephemeral: true });
   const id = createDraft(ctx.db, interaction.user.id, 'appeal', null, { discord_id: interaction.user.id });
-  return interaction.showModal(appealModalOne(id));
+  return interaction.showModal(appealModalOne(ctx.db, id));
 }
 
 async function postAppeal(client, db, appeal) {
   const channelId = getConfigValue(db, 'BLACKLIST_APPEAL_REVIEW_CHANNEL_ID');
-  if (!validId(channelId)) return false;
+  if (!validId(channelId) || channelId === getConfigValue(db, 'BLACKLIST_CHANNEL_ID')) return false;
   try {
     const channel = await client.channels.fetch(channelId);
     if (!channel?.isTextBased() || !channel.send) return false;
@@ -430,7 +412,7 @@ async function submitAppealEdit(interaction, ctx, appealId) {
     writeAppealHistory(ctx.db, appealId, interaction.user.id, 'appeal_edited', changes, now);
   })();
   const updated = ctx.db.prepare('SELECT * FROM blacklist_appeals WHERE appeal_id = ?').get(appealId);
-  await updateAppealMessage(interaction.client, updated);
+  await updateAppealMessage(interaction.client, ctx.db, updated);
   return interaction.reply({ content: `Appeal ${appealId} was updated and added to its history.`, ephemeral: true });
 }
 
@@ -468,7 +450,7 @@ async function reviewAppeal(interaction, ctx, action, appealId, values) {
       })();
     } catch (error) { return interaction.reply({ content: error.message, ephemeral: true }); }
     const updatedRecord = ctx.db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(record.record_id);
-    await updateRecordMessage(interaction.client, updatedRecord);
+    await updateRecordMessage(interaction.client, ctx.db, updatedRecord);
     return finishAppealReview(interaction, ctx, appealId, 'approved', `Your appeal was approved. ${removed ? 'The blacklist record was removed.' : `The record duration is now ${durationLabel(durationHours)}.`}`);
   }
   if (action === 'deny' || action === 'info') {
@@ -482,7 +464,7 @@ async function reviewAppeal(interaction, ctx, action, appealId, values) {
     if (action === 'info') {
       await notifyAppealApplicant(interaction.client, appeal, `Management requests more information for appeal ${appealId}: ${values.message}\nRespond with /blacklist respond appeal-id:${appealId} text:<your response>.`);
       const updated = ctx.db.prepare('SELECT * FROM blacklist_appeals WHERE appeal_id = ?').get(appealId);
-      await updateAppealMessage(interaction.client, updated);
+      await updateAppealMessage(interaction.client, ctx.db, updated);
       return interaction.reply({ content: 'A request for more information was sent to the applicant.', ephemeral: true });
     }
     return finishAppealReview(interaction, ctx, appealId, 'denied', `Your appeal was denied: ${values.message}`);
@@ -503,13 +485,14 @@ async function notifyAppealApplicant(client, appeal, message) {
 
 async function finishAppealReview(interaction, ctx, appealId, status, message) {
   const appeal = ctx.db.prepare('SELECT * FROM blacklist_appeals WHERE appeal_id = ?').get(appealId);
-  await updateAppealMessage(interaction.client, appeal);
+  await updateAppealMessage(interaction.client, ctx.db, appeal);
   const sent = await notifyAppealApplicant(interaction.client, appeal, `GV GR blacklist appeal ${appealId}: ${message}`);
   return interaction.reply({ content: `Appeal ${appealId} ${status}.${sent ? ' The applicant was notified by DM.' : ' The applicant DMs are unavailable.'}`, ephemeral: true });
 }
 
-async function updateAppealMessage(client, appeal) {
+async function updateAppealMessage(client, db, appeal) {
   if (!appeal.review_channel_id || !appeal.review_message_id) return false;
+  if (appeal.review_channel_id === getConfigValue(db, 'BLACKLIST_CHANNEL_ID')) return false;
   try {
     const channel = await client.channels.fetch(appeal.review_channel_id);
     const msg = channel?.isTextBased() ? await channel.messages.fetch(appeal.review_message_id) : null;
@@ -706,7 +689,7 @@ async function saveEdit(interaction, ctx, draftId) {
     return interaction.reply({ content: error.message, ephemeral: true });
   }
   const record = ctx.db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(draft.record_id);
-  await updateRecordMessage(interaction.client, record);
+  await updateRecordMessage(interaction.client, ctx.db, record);
   return interaction.reply({ embeds: [makeEmbed(config.EMBED_COLORS.active, 'Blacklist Record Updated', `Record **${record.record_id}** was updated and added to edit history.`)], ephemeral: true });
 }
 
@@ -721,7 +704,7 @@ async function removeRecord(interaction, ctx, recordId) {
     writeRecordHistory(ctx.db, recordId, interaction.user.id, 'removed', { previousStatus: record.status }, now);
   })();
   const updated = ctx.db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(recordId);
-  await updateRecordMessage(interaction.client, updated);
+  await updateRecordMessage(interaction.client, ctx.db, updated);
   return interaction.reply({ content: `Blacklist record ${recordId} was removed from active status. Its history remains saved.`, ephemeral: true });
 }
 
@@ -761,7 +744,7 @@ async function processBlacklistExpirations(client, db, now = new Date()) {
     if (!didExpire) continue;
     changed += 1;
     const updated = db.prepare('SELECT * FROM blacklist_records WHERE record_id = ?').get(record.record_id);
-    await updateRecordMessage(client, updated);
+    await updateRecordMessage(client, db, updated);
   }
   return changed;
 }
@@ -783,7 +766,7 @@ async function respondToAppeal(interaction, ctx) {
   })();
   if (!changed) return interaction.reply({ content: 'This appeal changed while you were responding. Contact management if it still needs attention.', ephemeral: true });
   const updated = ctx.db.prepare('SELECT * FROM blacklist_appeals WHERE appeal_id = ?').get(appealId);
-  await updateAppealMessage(interaction.client, updated);
+  await updateAppealMessage(interaction.client, ctx.db, updated);
   return interaction.reply({ content: `Your response was added to appeal ${appealId} and returned to the management review queue.`, ephemeral: true });
 }
 
@@ -792,6 +775,7 @@ async function handleBlacklistCommand(interaction, ctx) {
   const action = interaction.options.getSubcommand();
   if (action === 'panel') return publishPanel(interaction, ctx);
   if (action === 'configure') return configureBlacklist(interaction, ctx);
+  if (action === 'list') return showBlacklistList(interaction, ctx);
   if (action === 'appeal') return startAppeal(interaction, ctx);
   if (action === 'respond') return respondToAppeal(interaction, ctx);
   if (action === 'search') return showSearch(interaction, ctx, interaction.options.getString('query', true));
@@ -809,10 +793,14 @@ async function handleBlacklistCommand(interaction, ctx) {
 
 async function handleBlacklistButton(interaction, ctx) {
   const customId = interaction.customId;
-  if (customId === 'gv:blacklist:blacklist') return startBlacklistDraft(interaction, ctx);
+  const usernameDecision = customId.match(/^gv:blacklist:username:([a-f0-9]{32}):(yes|no)$/);
+  if (usernameDecision) return decideBlacklistUsername(interaction, ctx, usernameDecision[1], usernameDecision[2]);
+  if (customId === 'gv:blacklist:blacklist') {
+    if (!await ensureManagement(interaction, ctx.db)) return;
+    return interaction.reply({ content: 'Submit one Roblox username in the configured blacklist channel. Confirmation is handled privately by DM.', ephemeral: true });
+  }
+  if (customId === 'gv:blacklist:list') return showBlacklistList(interaction, ctx);
   if (customId === 'gv:blacklist:appeal') return startAppeal(interaction, ctx);
-  const createContinue = customId.match(/^gv:blacklist:continue:create:([a-f0-9]{32})$/);
-  if (createContinue) return continueBlacklistCreate(interaction, ctx, createContinue[1]);
   const editContinue = customId.match(/^gv:blacklist:continue:edit:([a-f0-9]{32})$/);
   if (editContinue) return continueRecordEdit(interaction, ctx, editContinue[1]);
   if (customId === 'gv:blacklist:edit') {
@@ -872,7 +860,7 @@ async function handleBlacklistSelect(interaction, ctx) {
 
 async function handleBlacklistModal(interaction, ctx) {
   const create = interaction.customId.match(/^gv:blacklist:modal:create:([a-f0-9]{32}):(1|2)$/);
-  if (create) return create[2] === '1' ? completeBlacklistCreate(interaction, ctx, create[1]) : saveBlacklistCreate(interaction, ctx, create[1]);
+  if (create) return interaction.reply({ content: 'Blacklist usernames are submitted in the configured channel and confirmed privately by DM. Nothing was saved.', ephemeral: true });
   const appeal = interaction.customId.match(/^gv:blacklist:modal:appeal:([a-f0-9]{32})$/);
   if (appeal) return submitAppeal(interaction, ctx, appeal[1]);
   const search = interaction.customId.match(/^gv:blacklist:modal:search:(search|edit)$/);
@@ -896,11 +884,10 @@ async function handleBlacklistModal(interaction, ctx) {
 }
 
 module.exports = {
-  blacklistCreateModal,
-  blacklistDetailsModal,
   handleBlacklistButton,
   handleBlacklistCommand,
   handleBlacklistModal,
+  handleBlacklistSubmissionMessage,
   handleBlacklistSelect,
   panelComponents,
   panelEmbed,

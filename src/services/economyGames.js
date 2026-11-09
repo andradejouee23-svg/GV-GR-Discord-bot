@@ -185,6 +185,47 @@ function playRoulette(db, userId, bet, choice, now = new Date(), roll = () => ra
   }
 }
 
+function settleInstantGame(db, userId, gameType, bet, state, payout, nowDate) {
+  const game = beginGame(db, userId, gameType, bet, state, nowDate);
+  if (!game.started) return game;
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM economy_games WHERE game_id = ?').get(game.gameId);
+    return { ...game, ...settleGame(db, row, payout > 0 ? 'won' : 'lost', payout, state, nowDate.toISOString()) };
+  })();
+}
+
+function playDiceDuel(db, userId, bet, choice, now = new Date(), roll = () => randomInt(1, 7)) {
+  if (!['high', 'low'].includes(choice)) throw new Error('Choose high (4–6) or low (1–3).');
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Game time is invalid.');
+  const die = roll();
+  if (!Number.isInteger(die) || die < 1 || die > 6) throw new Error('Dice result is invalid.');
+  const result = die >= 4 ? 'high' : 'low';
+  const state = { choice, die, result };
+  return settleInstantGame(db, userId, 'dice', bet, state, result === choice ? bet * 2 : 0, nowDate);
+}
+
+function playScratchCard(db, userId, bet, now = new Date(), roll = () => randomInt(100)) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Game time is invalid.');
+  const outcome = roll();
+  if (!Number.isInteger(outcome) || outcome < 0 || outcome > 99) throw new Error('Scratch card result is invalid.');
+  const result = outcome < 5 ? 'jackpot' : outcome < 25 ? 'small-win' : 'no-match';
+  const payout = result === 'jackpot' ? bet * 8 : result === 'small-win' ? bet * 2 : 0;
+  return settleInstantGame(db, userId, 'scratch', bet, { outcome, result }, payout, nowDate);
+}
+
+function playSlots(db, userId, bet, now = new Date(), roll = () => randomInt(100)) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Game time is invalid.');
+  const outcome = roll();
+  if (!Number.isInteger(outcome) || outcome < 0 || outcome > 99) throw new Error('Slot result is invalid.');
+  const result = outcome < 2 ? 'triple' : outcome < 12 ? 'pair' : outcome < 37 ? 'single' : 'miss';
+  const multipliers = { triple: 10, pair: 3, single: 1.5, miss: 0 };
+  const payout = Math.floor(bet * multipliers[result]);
+  return settleInstantGame(db, userId, 'slots', bet, { outcome, result, multiplier: multipliers[result] }, payout, nowDate);
+}
+
 function startChickenRoad(db, userId, bet, now = new Date()) {
   const nowDate = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(nowDate.getTime())) throw new Error('Game start time is invalid.');
@@ -232,8 +273,11 @@ module.exports = {
   beginBlackjack,
   cardLabel,
   handValue,
+  playDiceDuel,
   playCoinFlip,
   playRoulette,
+  playScratchCard,
+  playSlots,
   resolveBlackjackAction,
   resolveChickenAction,
   startChickenRoad,

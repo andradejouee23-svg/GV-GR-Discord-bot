@@ -164,7 +164,10 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
       registration_code TEXT UNIQUE,
       expires_at TEXT,
       review_channel_id TEXT,
-      review_message_id TEXT
+      review_message_id TEXT,
+      media_channel_id TEXT,
+      media_message_id TEXT,
+      media_published_at TEXT
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS one_pending_vehicle_per_applicant
@@ -399,7 +402,7 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
     CREATE TABLE IF NOT EXISTS economy_games (
       game_id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
-      game_type TEXT NOT NULL CHECK(game_type IN ('blackjack', 'coinflip', 'roulette', 'chicken')),
+      game_type TEXT NOT NULL CHECK(game_type IN ('blackjack', 'coinflip', 'roulette', 'chicken', 'dice', 'scratch', 'slots')),
       bet INTEGER NOT NULL CHECK(bet > 0),
       status TEXT NOT NULL CHECK(status IN ('active', 'won', 'lost', 'push', 'expired')),
       state_json TEXT NOT NULL DEFAULT '{}',
@@ -701,6 +704,52 @@ function createDatabase(databasePath = config.DATABASE_PATH) {
   if (!panelEditorColumns.has('header_image_position')) db.exec("ALTER TABLE panel_editor_configs ADD COLUMN header_image_position TEXT NOT NULL DEFAULT 'top'");
   const appealColumns = new Set(db.pragma('table_info(blacklist_appeals)').map((column) => column.name));
   if (!appealColumns.has('applicant_response')) db.exec("ALTER TABLE blacklist_appeals ADD COLUMN applicant_response TEXT NOT NULL DEFAULT ''");
+  const vehicleColumns = new Set(db.pragma('table_info(vehicle_applications)').map((column) => column.name));
+  if (!vehicleColumns.has('media_channel_id')) db.exec('ALTER TABLE vehicle_applications ADD COLUMN media_channel_id TEXT');
+  if (!vehicleColumns.has('media_message_id')) db.exec('ALTER TABLE vehicle_applications ADD COLUMN media_message_id TEXT');
+  if (!vehicleColumns.has('media_published_at')) db.exec('ALTER TABLE vehicle_applications ADD COLUMN media_published_at TEXT');
+  const gameTableSql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'economy_games'").get()?.sql ?? '';
+  if (!gameTableSql.includes("'scratch'")) {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE economy_games_new (
+        game_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+        game_type TEXT NOT NULL CHECK(game_type IN ('blackjack', 'coinflip', 'roulette', 'chicken', 'dice', 'scratch', 'slots')),
+        bet INTEGER NOT NULL CHECK(bet > 0),
+        status TEXT NOT NULL CHECK(status IN ('active', 'won', 'lost', 'push', 'expired')),
+        state_json TEXT NOT NULL DEFAULT '{}',
+        payout INTEGER NOT NULL DEFAULT 0 CHECK(payout >= 0),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+      INSERT INTO economy_games_new SELECT * FROM economy_games;
+      DROP TABLE economy_games;
+      ALTER TABLE economy_games_new RENAME TO economy_games;
+      CREATE UNIQUE INDEX one_active_economy_game_per_player
+        ON economy_games(user_id) WHERE status = 'active';
+      CREATE INDEX economy_games_user_created ON economy_games(user_id, created_at DESC);
+      COMMIT;
+    `);
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS economy_game_publications (
+      publication_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES economy_accounts(user_id),
+      game_type TEXT NOT NULL,
+      result_text TEXT NOT NULL,
+      wager INTEGER NOT NULL CHECK(wager > 0),
+      payout INTEGER NOT NULL CHECK(payout >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'publishing', 'published')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      channel_id TEXT,
+      message_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS economy_game_publications_expiry
+      ON economy_game_publications(status, expires_at);
+  `);
   db.exec(`
     CREATE INDEX IF NOT EXISTS temporary_admin_trial_expiration
       ON temporary_admin_applications(status, expires_at, trial_reminder_sent_at);
